@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:collection';
 import 'dart:convert';
+import 'dart:io';
 
 import 'package:flutter/cupertino.dart';
 import 'package:flutter_webview_bridge/flutter_webview_bridge.dart';
@@ -58,18 +59,20 @@ class WebViewBridgeController {
     );
   }
 
-  Future<void> runJavaScriptSetPushToken(String token) async {
+  Future<void> runJavaScriptSetPushToken(
+    String token, {
+    required bool isRefresh,
+  }) async {
     return _executeOrQueue(
       operation: () async {
-        // navigator.deviceToken 셋팅
-        await _channel!.runJavaScriptSetPushToken(token);
-
-        // WebViewBridge 푸시 토큰 전달
         Map<String, Object?> sendData = {
           'type': WebViewBridgeFeatureType.pushToken.value,
-          'data': {'token': token},
+          'data': {
+            'token': token,
+            'platform': Platform.isIOS ? 'ios' : 'android',
+            'isRefresh': isRefresh,
+          },
         };
-        // 직접 채널 호출 (큐 우회)
         await _channel!.runJavaScriptReturningResultPostMessage(
           jsonEncode(sendData),
         );

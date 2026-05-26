@@ -189,10 +189,6 @@ class FlutterWebViewBridgeJavaScriptChannel {
     }
   }
 
-  Future<void> runJavaScriptSetPushToken(String token) async {
-    await webViewController.runJavaScript('navigator.deviceToken="$token"');
-  }
-
   Future<Object> runJavaScriptReturningResultAppState(String jsonData) async {
     // JSON 문자열에서 특수문자 이스케이프 처리
     final escapedData = jsonData.replaceAll("'", "\\'").replaceAll('\n', '\\n');

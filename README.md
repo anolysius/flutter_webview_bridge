@@ -4,7 +4,7 @@ Flutter 앱과 웹뷰 간 브릿지 통신을 위한 JavaScript API
 
 ## 💡 주요 특징
 
-- **자동 FCM 토큰 관리**: Firebase 이벤트 발생 시 `navigator.deviceToken` 자동 설정
+- **자동 FCM 토큰 관리**: Firebase 이벤트 (초기 발급 / 갱신) 발생 시 `PUSH_TOKEN` postMessage 자동 발화. 자세한 contract: [`docs/push-token-contract.md`](./docs/push-token-contract.md)
 - **실시간 앱 상태 감지**: 앱이 백그라운드/포그라운드로 전환될 때 자동 알림
 - **크로스 플랫폼**: iOS/Android 모두 지원
 - **Base64 이미지**: 카메라/갤러리에서 선택한 이미지를 Base64로 반환
@@ -248,20 +248,35 @@ sendToNative({ type: "REFRESH_TOKEN_DELETE", data: null });
 
 ### 푸시 알림
 
-**요청:**
+`PUSH_TOKEN` 이벤트는 두 방향:
+- **Flutter → Web (push)**: 초기 발급 / 갱신 시 자동 발화
+- **Web → Flutter (query) → Web (response)**: 웹이 캐시 조회 호출 시 응답
+
+**Web → Flutter 조회 요청:**
 ```typescript
-// FCM 토큰 조회
+// FCM 토큰 조회 (캐시 기반)
 sendToNative({ type: "PUSH_TOKEN", data: null });
 ```
-**응답:**
+
+**모든 PUSH_TOKEN 메시지의 응답/push 형태:**
 ```json
 {
   "type": "PUSH_TOKEN",
   "data": {
-    "token": "fcm_token_value_here"
+    "token": "fcm_token_value_here",
+    "platform": "ios",
+    "isRefresh": false
   }
 }
 ```
+
+| 필드 | 타입 | 의미 |
+|---|---|---|
+| `token` | `string \| null` | FCM token. 발급 전·권한 거부 시 `null` |
+| `platform` | `'ios' \| 'android'` | 송신 측 플랫폼 |
+| `isRefresh` | `boolean` | `true` = onTokenRefresh 발화, `false` = 초기/조회 응답 |
+
+전체 contract (송신 시점 5 시나리오 + null 응답 처리 + 웹 측 구현 가이드): [`docs/push-token-contract.md`](./docs/push-token-contract.md)
 
 ### 디바이스 정보
 
