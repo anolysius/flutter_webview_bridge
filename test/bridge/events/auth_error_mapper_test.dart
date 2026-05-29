@@ -1,3 +1,6 @@
+import 'dart:async' show TimeoutException;
+import 'dart:io' show SocketException;
+
 import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:flutter_webview_bridge/src/bridge/events/auth_error_mapper.dart';
@@ -37,6 +40,13 @@ void main() {
       expect(mapKakaoError(e), AuthErrorCode.providerError);
     });
 
+    test('SocketException → NETWORK_ERROR', () {
+      expect(
+        mapKakaoError(const SocketException('no route')),
+        AuthErrorCode.networkError,
+      );
+    });
+
     test('generic Exception → UNKNOWN', () {
       expect(mapKakaoError(Exception('???')), AuthErrorCode.unknown);
     });
@@ -70,6 +80,13 @@ void main() {
         code: GoogleSignInExceptionCode.interrupted,
       );
       expect(mapGoogleError(e), AuthErrorCode.unknown);
+    });
+
+    test('TimeoutException → NETWORK_ERROR', () {
+      expect(
+        mapGoogleError(TimeoutException('timeout')),
+        AuthErrorCode.networkError,
+      );
     });
 
     test('generic Exception → UNKNOWN', () {
@@ -125,6 +142,13 @@ void main() {
         message: 'unknown',
       );
       expect(mapAppleError(e), AuthErrorCode.unknown);
+    });
+
+    test('SocketException → NETWORK_ERROR', () {
+      expect(
+        mapAppleError(const SocketException('no route')),
+        AuthErrorCode.networkError,
+      );
     });
 
     test('generic Exception → UNKNOWN', () {

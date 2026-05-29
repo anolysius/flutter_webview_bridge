@@ -1,3 +1,6 @@
+import 'dart:async' show TimeoutException;
+import 'dart:io' show SocketException;
+
 import 'package:flutter/services.dart' show PlatformException;
 import 'package:google_sign_in/google_sign_in.dart'
     show GoogleSignInException, GoogleSignInExceptionCode;
@@ -11,6 +14,11 @@ import 'package:kakao_flutter_sdk/kakao_flutter_sdk.dart'
         KakaoClientException;
 import 'package:sign_in_with_apple/sign_in_with_apple.dart'
     show AuthorizationErrorCode, SignInWithAppleAuthorizationException;
+
+/// SDK 내부 IO 실패는 표준 SocketException/TimeoutException 으로 표면화.
+/// 3 SDK 공통 fallback — helper 들의 마지막 분기 전에 호출.
+bool _isNetworkError(Object e) =>
+    e is SocketException || e is TimeoutException;
 
 /// AUTH_ERROR contract 의 표준 code 상수.
 /// webview 측 Sentry 그룹화 / dedup 의 SOT.
@@ -57,6 +65,7 @@ String mapKakaoError(Object e) {
   if (e is KakaoApiException || e is KakaoAppsException) {
     return AuthErrorCode.providerError;
   }
+  if (_isNetworkError(e)) return AuthErrorCode.networkError;
   return AuthErrorCode.unknown;
 }
 
@@ -77,6 +86,7 @@ String mapGoogleError(Object e) {
         return AuthErrorCode.unknown;
     }
   }
+  if (_isNetworkError(e)) return AuthErrorCode.networkError;
   return AuthErrorCode.unknown;
 }
 
@@ -100,5 +110,6 @@ String mapAppleError(Object e) {
         return AuthErrorCode.unknown;
     }
   }
+  if (_isNetworkError(e)) return AuthErrorCode.networkError;
   return AuthErrorCode.unknown;
 }
