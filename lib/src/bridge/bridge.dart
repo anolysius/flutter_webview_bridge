@@ -6,6 +6,7 @@ import 'package:webview_flutter/webview_flutter.dart';
 
 import '../models/types.dart';
 import 'events/app_state_change.dart';
+import 'events/auth_error.dart';
 import 'events/camera_access.dart';
 import 'events/channel_talk.dart';
 import 'events/device_info.dart';
@@ -187,9 +188,27 @@ class FlutterWebViewBridgeJavaScriptChannel {
             case WebViewBridgeFeatureType.channelTalkShutdown:
               sendData = await ChannelTalkEvent().processShutdown(context);
               break;
+            case WebViewBridgeFeatureType.authError:
+              // native 측 단방향 발화 only — webview 가 request 로 보내는 type 아님.
+              // 도달 시 silent skip (early return) 으로 의도하지 않은 echo 회피.
+              return;
           }
         } catch (e) {
-          // silent drop 방지: webview 측이 응답을 기다리고 있으므로 error payload 1건 전송 시도
+          // OAuth 실패 (sign_in_*.dart 의 throw AuthError) 는 단일 surface:
+          // AUTH_ERROR payload 송신 + native SnackBar skip.
+          // (사용자 toast 는 webview 측이 단독 표시 — 중복 회피)
+          if (e is AuthError) {
+            try {
+              await runJavaScriptReturningResultPostMessage(
+                jsonEncode({
+                  'type': WebViewBridgeFeatureType.authError.value,
+                  'data': {'code': e.code, 'message': e.message},
+                }),
+              );
+            } catch (_) {}
+            return;
+          }
+          // 일반 exception — silent drop 방지: webview 측이 응답을 기다리고 있으므로 error payload 1건 전송 시도
           try {
             await runJavaScriptReturningResultPostMessage(
               jsonEncode({

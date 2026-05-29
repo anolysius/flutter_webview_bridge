@@ -4,6 +4,8 @@ import 'package:flutter/material.dart';
 import 'package:google_sign_in/google_sign_in.dart';
 
 import '../../models/types.dart';
+import 'auth_error.dart';
+import 'auth_error_mapper.dart';
 
 class SignInGoogle {
   static final SignInGoogle _instance = SignInGoogle._internal();
@@ -41,34 +43,32 @@ class SignInGoogle {
 
     if (action == 'login') {
       sendData['type'] = WebViewBridgeFeatureType.googleSignInLogin.value;
-      if (GoogleSignIn.instance.supportsAuthenticate()) {
-        try {
-          // _loginCompleter = Completer<GoogleSignInAccount?>();
+      if (!GoogleSignIn.instance.supportsAuthenticate()) {
+        // 이전엔 빈 {} return → webview silent fail. SDK 가용 불가 명시 통보.
+        throw AuthError(
+          AuthErrorCode.sdkInitFailed,
+          'Google sign-in not supported on this platform',
+        );
+      }
+      try {
+        final user = await GoogleSignIn.instance.authenticate(scopeHint: scopes);
 
-          final user = await GoogleSignIn.instance.authenticate(
-            scopeHint: scopes,
-          );
+        final GoogleSignInAuthentication authentication = user.authentication;
+        final String? idToken = authentication.idToken;
 
-          final GoogleSignInAuthentication authentication = user.authentication;
-          final String? idToken = authentication.idToken;
-
-          // final user = await _loginCompleter!.future;
-
-          sendData['data'] = {
-            'id': user.id,
-            'displayName': user.displayName,
-            'email': user.email,
-            'photoUrl': user.photoUrl,
-            'idToken': idToken ?? '',
-          };
-        } catch (e) {
-          String errorMessage = e is GoogleSignInException
-              ? _errorMessageFromSignInException(e)
-              : 'Unknown error: $e';
-          sendData['error'] = errorMessage;
-        } finally {
-          // _loginCompleter = null;
-        }
+        sendData['data'] = {
+          'id': user.id,
+          'displayName': user.displayName,
+          'email': user.email,
+          'photoUrl': user.photoUrl,
+          'idToken': idToken ?? '',
+        };
+      } catch (e) {
+        if (e is AuthError) rethrow;
+        final message = e is GoogleSignInException
+            ? _errorMessageFromSignInException(e)
+            : 'Unknown error: $e';
+        throw AuthError(mapGoogleError(e), message);
       }
     }
 

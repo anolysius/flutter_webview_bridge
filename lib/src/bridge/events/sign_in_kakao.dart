@@ -5,6 +5,8 @@ import 'package:flutter/services.dart';
 import 'package:kakao_flutter_sdk/kakao_flutter_sdk.dart';
 
 import '../../models/types.dart';
+import 'auth_error.dart';
+import 'auth_error_mapper.dart';
 
 class SignInKakao {
   static final SignInKakao _instance = SignInKakao._internal();
@@ -116,7 +118,8 @@ class SignInKakao {
           'idToken': idToken,
         };
       } catch (e) {
-        sendData['error'] = e.toString();
+        // bridge.dart catch 의 `e is AuthError` 분기에서 AUTH_ERROR payload 발화.
+        throw AuthError(mapKakaoError(e), e.toString());
       }
     }
 

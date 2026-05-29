@@ -206,6 +206,39 @@ sendToNative({ type: "KAKAO_SIGN_IN_LOGOUT", data: null });
 }
 ```
 
+### OAuth 실패 — AUTH_ERROR 자동 발화
+
+`KAKAO_SIGN_IN_LOGIN` / `GOOGLE_SIGN_IN_LOGIN` / `APPLE_SIGN_IN_LOGIN` 호출이 실패하면 native 가 webview 로 `AUTH_ERROR` 단일 surface 로 통보. 각 OAuth 응답 type 의 `error` 필드는 보내지 않음.
+
+**Payload:**
+```json
+{
+  "type": "AUTH_ERROR",
+  "data": {
+    "code": "USER_CANCELLED",
+    "message": "PlatformException(CANCELED, ..., null, null)"
+  }
+}
+```
+
+| 필드 | 타입 | 의미 |
+|---|---|---|
+| `code` | `string` enum | 표준 분류 — Sentry 그룹화 / dedup 용 |
+| `message` | `string` | 디버깅용 raw — 사용자 노출 X |
+
+**`code` enum:**
+
+| code | 의미 | trigger 예시 |
+|---|---|---|
+| `USER_CANCELLED` | 사용자 명시 취소 | OAuth 화면 뒤로가기 / 카카오톡 권한 거부 / Google account picker 취소 |
+| `NETWORK_ERROR` | 네트워크 실패 | timeout / DNS / TLS |
+| `SDK_INIT_FAILED` | SDK 초기화 / 가용성 실패 | bundle id 누락 / 키 만료 / `supportsAuthenticate=false` |
+| `INVALID_RESPONSE` | OAuth 서버 응답 파싱 실패 | malformed token / unexpected schema (주로 Apple) |
+| `PROVIDER_ERROR` | provider 측 에러 | server 5xx / rate limit / Kakao misconfigured |
+| `UNKNOWN` | 위 분류 미해당 | 기본 fallback |
+
+raw SDK exception 의 code mapping 은 [`lib/src/bridge/events/auth_error_mapper.dart`](./lib/src/bridge/events/auth_error_mapper.dart) 참조.
+
 ### RefreshToken
 
 **요청:**

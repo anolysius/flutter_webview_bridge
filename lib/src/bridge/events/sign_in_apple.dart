@@ -4,6 +4,8 @@ import 'package:flutter/material.dart';
 import 'package:sign_in_with_apple/sign_in_with_apple.dart';
 
 import '../../models/types.dart';
+import 'auth_error.dart';
+import 'auth_error_mapper.dart';
 
 class SignInApple {
   static final SignInApple _instance = SignInApple._internal();
@@ -48,7 +50,7 @@ class SignInApple {
           'idToken': appleCredential.identityToken,
         };
       } catch (e) {
-        sendData['error'] = e.toString();
+        throw AuthError(mapAppleError(e), e.toString());
       }
     }
 
