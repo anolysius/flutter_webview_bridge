@@ -36,11 +36,15 @@ class SignInKakao {
       try {
         String? idToken;
 
+        debugPrint('[SignInKakao] START — isKakaoTalkInstalled check');
         if (await isKakaoTalkInstalled()) {
+          debugPrint('[SignInKakao] STEP loginWithKakaoTalk');
           try {
             OAuthToken token = await UserApi.instance.loginWithKakaoTalk();
             idToken = token.idToken;
+            debugPrint('[SignInKakao] loginWithKakaoTalk OK');
           } catch (error) {
+            debugPrint('[SignInKakao] loginWithKakaoTalk FAIL: $error');
             // 사용자가 카카오톡 설치 후 디바이스 권한 요청 화면에서 로그인을 취소한 경우,
             // 의도적인 로그인 취소로 보고 카카오계정으로 로그인 시도 없이 로그인 취소로 처리 (예: 뒤로 가기)
             if (error is PlatformException && error.code == 'CANCELED') {
@@ -55,6 +59,7 @@ class SignInKakao {
             }
           }
         } else {
+          debugPrint('[SignInKakao] STEP loginWithKakaoAccount (no KakaoTalk)');
           try {
             OAuthToken token = await UserApi.instance.loginWithKakaoAccount();
             idToken = token.idToken;
@@ -63,11 +68,26 @@ class SignInKakao {
           }
         }
 
+        // SDK first-call race 회피 — KakaoSdk 내부 token 적용 비동기.
+        // 첫 시도에서 me() 가 'token not found' 등으로 즉시 fail 하는 회귀 차단.
+        debugPrint('[SignInKakao] STEP me() — pre-warm 100ms');
+        await Future.delayed(const Duration(milliseconds: 100));
+
         User? user;
         try {
           user = await UserApi.instance.me();
+          debugPrint('[SignInKakao] me() OK first attempt');
         } catch (error) {
-          rethrow;
+          debugPrint('[SignInKakao] me() FAIL first attempt: $error — retry');
+          // 1회 retry — SDK token 적용 추가 대기 후
+          await Future.delayed(const Duration(milliseconds: 500));
+          try {
+            user = await UserApi.instance.me();
+            debugPrint('[SignInKakao] me() OK retry');
+          } catch (error2) {
+            debugPrint('[SignInKakao] me() FAIL retry: $error2');
+            rethrow;
+          }
         }
 
         // 사용자의 추가 동의가 필요한 사용자 정보 동의항목 확인
