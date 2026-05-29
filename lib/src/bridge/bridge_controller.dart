@@ -18,13 +18,22 @@ class WebViewBridgeController {
     required String? googleServerClientId,
     required String? kakaoNativeAppKey,
   }) {
-    _channel ??= FlutterWebViewBridgeJavaScriptChannel(
+    if (_channel != null) {
+      // WebView 재생성 시 channel handler 는 유지, controller 만 swap.
+      // addJavaScriptChannel 중복 호출은 stale handler 위험만 키우므로 회피.
+      _channel!.updateWebViewController(webViewController, newContext: context);
+      _initCompleter?.complete();
+      _processQueue();
+      return;
+    }
+
+    _channel = FlutterWebViewBridgeJavaScriptChannel(
       context: context,
       webViewController: webViewController,
       googleServerClientId: googleServerClientId,
       kakaoNativeAppKey: kakaoNativeAppKey,
     );
-    _channel?.addJavaScriptChannel();
+    _channel!.addJavaScriptChannel();
 
     _initCompleter?.complete();
 
@@ -115,13 +124,21 @@ class WebViewBridgeController {
   bool get isInitialized => _channel != null;
   int get queueLength => _requestQueue.length;
 
-  void dispose() {
-    while (_requestQueue.isNotEmpty) {
-      _requestQueue.removeFirst().completer.completeError(
-        Exception(
-          'WebViewBridgeController disposed before request could be processed',
-        ),
-      );
+  /// MainScreen rebuild 시 호출되는 default dispose. 큐는 보존하여
+  /// 다음 [initFlutterWebViewBridgeJavaScriptChannel] 호출에서
+  /// 새 [WebViewController] 로 in-flight 요청이 dispatch 되도록 한다.
+  ///
+  /// 앱 종료/MainScreen 영구 teardown 같이 다시 init 되지 않는 시점에는
+  /// [forceTerminate]=true 를 명시해 큐의 Completer 들을 error 로 종결할 것.
+  void dispose({bool forceTerminate = false}) {
+    if (forceTerminate) {
+      while (_requestQueue.isNotEmpty) {
+        _requestQueue.removeFirst().completer.completeError(
+          Exception(
+            'WebViewBridgeController disposed before request could be processed',
+          ),
+        );
+      }
     }
     _channel = null;
     _initCompleter = null;

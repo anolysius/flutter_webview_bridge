@@ -24,8 +24,8 @@ import 'events/sign_in_google.dart';
 import 'events/sign_in_kakao.dart';
 
 class FlutterWebViewBridgeJavaScriptChannel {
-  final BuildContext context;
-  final WebViewController webViewController;
+  BuildContext context;
+  WebViewController webViewController;
   final String channelName;
   final String? googleServerClientId;
   final String? kakaoNativeAppKey;
@@ -56,6 +56,18 @@ class FlutterWebViewBridgeJavaScriptChannel {
 
   Future<void> removeJavaScriptChannel() {
     return webViewController.removeJavaScriptChannel(channelName);
+  }
+
+  /// MainScreen rebuild 등으로 새 [WebViewController] 가 들어올 때 호출.
+  /// 기존 channel handler 는 유지하고 응답 전송 대상만 최신 controller 로 교체.
+  void updateWebViewController(
+    WebViewController controller, {
+    BuildContext? newContext,
+  }) {
+    webViewController = controller;
+    if (newContext != null) {
+      context = newContext;
+    }
   }
 
   Future<void> onMessageReceived(JavaScriptMessage message) async {
@@ -177,6 +189,17 @@ class FlutterWebViewBridgeJavaScriptChannel {
               break;
           }
         } catch (e) {
+          // silent drop 방지: webview 측이 응답을 기다리고 있으므로 error payload 1건 전송 시도
+          try {
+            await runJavaScriptReturningResultPostMessage(
+              jsonEncode({
+                'type': webViewBridgeFeatureType.value,
+                'error': e.toString(),
+              }),
+            );
+          } catch (_) {
+            // controller stale / channel teardown 등 응답 전송 자체 실패는 무시
+          }
           if (context.mounted) {
             WebViewUtils.showErrorSnackBar(context, e.toString());
           }
