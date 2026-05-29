@@ -48,12 +48,15 @@ void main() {
       expect(mapGoogleError(e), AuthErrorCode.userCancelled);
     });
 
-    test('GoogleSignInException(clientConfigurationError) → SDK_INIT_FAILED', () {
-      const e = GoogleSignInException(
-        code: GoogleSignInExceptionCode.clientConfigurationError,
-      );
-      expect(mapGoogleError(e), AuthErrorCode.sdkInitFailed);
-    });
+    test(
+      'GoogleSignInException(clientConfigurationError) → SDK_INIT_FAILED',
+      () {
+        const e = GoogleSignInException(
+          code: GoogleSignInExceptionCode.clientConfigurationError,
+        );
+        expect(mapGoogleError(e), AuthErrorCode.sdkInitFailed);
+      },
+    );
 
     test('GoogleSignInException(unknownError) → PROVIDER_ERROR', () {
       const e = GoogleSignInException(
@@ -75,21 +78,27 @@ void main() {
   });
 
   group('mapAppleError', () {
-    test('SignInWithAppleAuthorizationException(canceled) → USER_CANCELLED', () {
-      const e = SignInWithAppleAuthorizationException(
-        code: AuthorizationErrorCode.canceled,
-        message: 'user x',
-      );
-      expect(mapAppleError(e), AuthErrorCode.userCancelled);
-    });
+    test(
+      'SignInWithAppleAuthorizationException(canceled) → USER_CANCELLED',
+      () {
+        const e = SignInWithAppleAuthorizationException(
+          code: AuthorizationErrorCode.canceled,
+          message: 'user x',
+        );
+        expect(mapAppleError(e), AuthErrorCode.userCancelled);
+      },
+    );
 
-    test('SignInWithAppleAuthorizationException(invalidResponse) → INVALID_RESPONSE', () {
-      const e = SignInWithAppleAuthorizationException(
-        code: AuthorizationErrorCode.invalidResponse,
-        message: 'bad',
-      );
-      expect(mapAppleError(e), AuthErrorCode.invalidResponse);
-    });
+    test(
+      'SignInWithAppleAuthorizationException(invalidResponse) → INVALID_RESPONSE',
+      () {
+        const e = SignInWithAppleAuthorizationException(
+          code: AuthorizationErrorCode.invalidResponse,
+          message: 'bad',
+        );
+        expect(mapAppleError(e), AuthErrorCode.invalidResponse);
+      },
+    );
 
     test('SignInWithAppleAuthorizationException(failed) → PROVIDER_ERROR', () {
       const e = SignInWithAppleAuthorizationException(
@@ -99,13 +108,16 @@ void main() {
       expect(mapAppleError(e), AuthErrorCode.providerError);
     });
 
-    test('SignInWithAppleAuthorizationException(notHandled) → SDK_INIT_FAILED', () {
-      const e = SignInWithAppleAuthorizationException(
-        code: AuthorizationErrorCode.notHandled,
-        message: 'not handled',
-      );
-      expect(mapAppleError(e), AuthErrorCode.sdkInitFailed);
-    });
+    test(
+      'SignInWithAppleAuthorizationException(notHandled) → SDK_INIT_FAILED',
+      () {
+        const e = SignInWithAppleAuthorizationException(
+          code: AuthorizationErrorCode.notHandled,
+          message: 'not handled',
+        );
+        expect(mapAppleError(e), AuthErrorCode.sdkInitFailed);
+      },
+    );
 
     test('SignInWithAppleAuthorizationException(unknown) → UNKNOWN', () {
       const e = SignInWithAppleAuthorizationException(

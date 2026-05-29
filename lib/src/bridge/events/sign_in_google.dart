@@ -51,7 +51,9 @@ class SignInGoogle {
         );
       }
       try {
-        final user = await GoogleSignIn.instance.authenticate(scopeHint: scopes);
+        final user = await GoogleSignIn.instance.authenticate(
+          scopeHint: scopes,
+        );
 
         final GoogleSignInAuthentication authentication = user.authentication;
         final String? idToken = authentication.idToken;
