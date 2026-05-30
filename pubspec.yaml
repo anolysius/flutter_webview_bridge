@@ -24,6 +24,7 @@ dependencies:
   kakao_flutter_sdk: ^1.9.7+3
   shared_preferences: ^2.5.3
   channel_talk_flutter: ^4.0.0
+  http: ^1.2.0 # B2: 네이티브 SSO 토큰 교환 (WKWebView throttling 우회)
 
   firebase_core: ^3.13.1
   firebase_analytics: ^11.4.6

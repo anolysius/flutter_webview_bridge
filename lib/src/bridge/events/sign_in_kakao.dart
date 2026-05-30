@@ -137,8 +137,12 @@ class SignInKakao {
           'photoUrl': user.kakaoAccount?.profile?.profileImageUrl,
           'idToken': idToken,
         };
+        debugPrint(
+          '[SignInKakao] SUCCESS sendData ready (idToken=${idToken == null ? "null" : "${idToken.substring(0, idToken.length < 20 ? idToken.length : 20)}..."})',
+        );
       } catch (e) {
         // bridge.dart catch 의 `e is AuthError` 분기에서 AUTH_ERROR payload 발화.
+        debugPrint('[SignInKakao] OUTER CATCH — throw AuthError: $e');
         throw AuthError(mapKakaoError(e), e.toString());
       }
     }

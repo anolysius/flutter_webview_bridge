@@ -1,9 +1,12 @@
+import 'dart:async';
 import 'dart:convert';
 
 import 'package:flutter/material.dart';
 import 'package:flutter_webview_bridge/src/utils/utils.dart';
 import 'package:webview_flutter/webview_flutter.dart';
 
+import '../auth/sso_exchange.dart';
+import '../device/device_info.dart';
 import '../models/types.dart';
 import 'events/app_state_change.dart';
 import 'events/auth_error.dart';
@@ -31,12 +34,18 @@ class FlutterWebViewBridgeJavaScriptChannel {
   final String? googleServerClientId;
   final String? kakaoNativeAppKey;
 
+  /// B2: 네이티브 SSO 토큰 교환 API base (flavor 별, 예 https://qa.api.sazo.kr).
+  /// 주입 시 SSO 로그인 교환을 네이티브가 수행(AUTH_TOKENS_READY) — WKWebView throttling 우회.
+  /// 미주입(null) 시 기존 경로(SIGN_IN_LOGIN → web 교환 + watchdog) fallback.
+  final String? apiBaseUrl;
+
   FlutterWebViewBridgeJavaScriptChannel({
     required this.context,
     required this.webViewController,
     this.channelName = 'IN_APP_WEBVIEW_BRIDGE_CHANNEL',
     required this.googleServerClientId,
     required this.kakaoNativeAppKey,
+    this.apiBaseUrl,
   }) {
     if (googleServerClientId != null) {
       SignInGoogle.shared.initialize(
@@ -70,6 +79,83 @@ class FlutterWebViewBridgeJavaScriptChannel {
       context = newContext;
     }
   }
+
+  // ── SSO hang watchdog ──────────────────────────────────────────────────────
+  // 카카오 로그인은 loginWithKakaoTalk() 로 카카오톡 앱 전환(paused→resumed)이 일어나고,
+  // 복귀 후 iOS 가 WKWebView WebContent 프로세스를 suspend → web 의 JS setTimeout 이 동결되어
+  // web 자체 복구(timeout/retry)가 발동 못 하는 케이스가 있다 (실기기 진단 2026-05-30).
+  // Dart Timer 는 WKWebView suspend 와 무관하게(앱 foreground 시) 동작하므로, 카카오 결과 송신
+  // 후 watchdog 을 걸고, web 가 성공 신호(REFRESH_TOKEN_WRITE)를 7초 내 보내지 못하면 native 가
+  // webViewController.reload() 로 fresh connection 을 강제 → 기존 web sso-pending resume 이 재개.
+  //
+  // loop-guard 는 구조적: watchdog 은 native 가 받은 KAKAO_SIGN_IN_LOGIN 에만 arm 된다.
+  // reload 후 web 의 resume 은 내부 fake postMessage(window.callbackPostMessage)라 native 로
+  // 다시 오지 않으므로 재-arm 되지 않는다 → 한 번의 카카오 로그인당 reload 최대 1회.
+  static const Duration _ssoWatchdogTimeout = Duration(seconds: 7);
+  Timer? _ssoWatchdog;
+  int _ssoReloadCount = 0;
+  // reload 복구: native 메모리에 마지막 카카오 결과 보관 (WebContent jettison 무관).
+  // reload 후 sessionStorage 가 소실되어 web 의 sso-pending resume 이 불가함이 실기기로
+  // 확인됨(2026-05-30) → fresh page mount 시 native 가 이 payload 를 재전송해 교환을 재개.
+  Map<String, Object?>? _lastKakaoSendData;
+  bool _resendKakaoAfterReload = false;
+
+  void _armSsoWatchdog() {
+    _ssoWatchdog?.cancel();
+    _ssoWatchdog = Timer(_ssoWatchdogTimeout, _onSsoWatchdogTimeout);
+    // release 빌드에서도 보이도록 native print (debugPrint 는 release no-op).
+    // watchdog 동작은 release syslog 검증 대상이라 의도적 print.
+    // ignore: avoid_print
+    print(
+      '[Watchdog] arm ${_ssoWatchdogTimeout.inSeconds}s (kakaoSignInLogin)',
+    );
+  }
+
+  /// web 가 SSO 성공(REFRESH_TOKEN_WRITE) 또는 종결 실패(REFRESH_TOKEN_DELETE)를 알리면 해제.
+  /// dispose 시에도 호출 (stale controller reload 방지).
+  void cancelSsoWatchdog(String reason) {
+    if (_ssoWatchdog?.isActive ?? false) {
+      // ignore: avoid_print
+      print('[Watchdog] cancel ($reason)');
+    }
+    _ssoWatchdog?.cancel();
+    _ssoWatchdog = null;
+  }
+
+  void _onSsoWatchdogTimeout() {
+    _ssoWatchdog = null;
+    _ssoReloadCount += 1;
+    // reload 후 fresh page 가 올라오면 카카오 payload 재전송 (sessionStorage resume 대체).
+    _resendKakaoAfterReload = true;
+    // ignore: avoid_print
+    print(
+      '[Watchdog] reload $_ssoReloadCount — SSO hang '
+      '(REFRESH_TOKEN_WRITE ${_ssoWatchdogTimeout.inSeconds}s 미수신)',
+    );
+    try {
+      webViewController.reload();
+    } catch (e) {
+      // ignore: avoid_print
+      print('[Watchdog] reload FAIL: $e');
+    }
+  }
+
+  /// watchdog reload 후 fresh page 에 카카오 결과를 재전송한다.
+  /// 재-arm 하지 않음 → reload 는 카카오 로그인당 최대 1회 (구조적 loop-guard).
+  /// 재전송 후의 hang 은 fresh page(타이머 살아있음)의 web timeout/retry 가 흡수.
+  Future<void> _resendKakaoLogin() async {
+    final data = _lastKakaoSendData;
+    if (data == null) return;
+    // ignore: avoid_print
+    print('[Watchdog] resend KAKAO_SIGN_IN_LOGIN (reload 후 fresh page 재전송)');
+    try {
+      await runJavaScriptReturningResultPostMessage(jsonEncode(data));
+    } catch (e) {
+      // ignore: avoid_print
+      print('[Watchdog] resend FAIL: $e');
+    }
+  }
+  // ───────────────────────────────────────────────────────────────────────────
 
   Future<void> onMessageReceived(JavaScriptMessage message) async {
     final json = jsonDecode(message.message);
@@ -167,6 +253,8 @@ class FlutterWebViewBridgeJavaScriptChannel {
               );
               break;
             case WebViewBridgeFeatureType.refreshTokenWrite:
+              // web SSO 교환 성공 신호 — watchdog 해제 (reload 불필요).
+              cancelSsoWatchdog('refreshTokenWrite');
               sendData = await RefreshTokenEvent().process(
                 context,
                 action: 'write',
@@ -174,6 +262,9 @@ class FlutterWebViewBridgeJavaScriptChannel {
               );
               break;
             case WebViewBridgeFeatureType.refreshTokenDelete:
+              // web 가 종결 실패/로그아웃으로 token 삭제 — 타이머 살아있는 실제 실패이므로
+              // reload 무의미. watchdog 해제 (frozen 케이스는 애초에 아무 메시지도 안 옴).
+              cancelSsoWatchdog('refreshTokenDelete');
               sendData = await RefreshTokenEvent().process(
                 context,
                 action: 'delete',
@@ -191,6 +282,9 @@ class FlutterWebViewBridgeJavaScriptChannel {
             case WebViewBridgeFeatureType.authError:
               // native 측 단방향 발화 only — webview 가 request 로 보내는 type 아님.
               // 도달 시 silent skip (early return) 으로 의도하지 않은 echo 회피.
+              return;
+            case WebViewBridgeFeatureType.authTokensReady:
+              // B2: native → web 단방향. webview 가 request 로 보내는 type 아님. silent skip.
               return;
           }
         } catch (e) {
@@ -225,11 +319,135 @@ class FlutterWebViewBridgeJavaScriptChannel {
           return;
         }
 
+        // ── B2: 카카오 로그인만 네이티브가 토큰 교환 후 AUTH_TOKENS_READY 로 변환 ──
+        // WKWebView throttling(카카오 앱 전환) 우회. 구글/애플은 앱 전환이 없어 문제 없고
+        // 검증된 web 교환 경로 유지(회귀 안전). 필요 시 _isSsoLogin 으로 확장 가능.
+        if (apiBaseUrl != null &&
+            webViewBridgeFeatureType ==
+                WebViewBridgeFeatureType.kakaoSignInLogin) {
+          sendData = await _ssoExchangeToTokensReady(
+            webViewBridgeFeatureType,
+            sendData,
+            data,
+          );
+        }
+
         // Send Data to WebView
-        await runJavaScriptReturningResultPostMessage(jsonEncode(sendData));
+        final encoded = jsonEncode(sendData);
+        debugPrint(
+          '[Bridge] postMessage type=${webViewBridgeFeatureType.value} len=${encoded.length}',
+        );
+        try {
+          final r = await runJavaScriptReturningResultPostMessage(encoded);
+          debugPrint(
+            '[Bridge] postMessage OK type=${webViewBridgeFeatureType.value} result=$r',
+          );
+          // 카카오 로그인 결과 송신 성공 → SSO hang watchdog arm.
+          // ⚠ B2(apiBaseUrl 주입) 활성 시엔 네이티브 교환이라 watchdog 불필요 + AUTH_TOKENS_READY
+          // 는 REFRESH_TOKEN_WRITE 를 안 보내 cancel 안 되므로 반드시 arm 회피.
+          if (apiBaseUrl == null &&
+              webViewBridgeFeatureType ==
+                  WebViewBridgeFeatureType.kakaoSignInLogin) {
+            // reload 복구용으로 payload 보관 후 watchdog arm.
+            _lastKakaoSendData = sendData;
+            _armSsoWatchdog();
+          }
+        } catch (e) {
+          debugPrint(
+            '[Bridge] postMessage FAIL type=${webViewBridgeFeatureType.value}: $e',
+          );
+        }
+
+        // watchdog reload 후 fresh page 가 mount 완료(REFRESH_TOKEN_READ — 이 시점에
+        // device headers 준비됨)되면 native 가 카카오 payload 재전송 → 교환 재개.
+        // (reload 가 sessionStorage 를 날려 web sso-pending resume 이 불가한 것의 대체)
+        // flag 1회 clear → reload(최대 1회)와 함께 구조적 loop-guard.
+        if (_resendKakaoAfterReload &&
+            webViewBridgeFeatureType ==
+                WebViewBridgeFeatureType.refreshTokenRead) {
+          _resendKakaoAfterReload = false;
+          await _resendKakaoLogin();
+        }
       }
     }
   }
+
+  // ── B2: 네이티브 SSO 토큰 교환 (현재 카카오 한정) ────────────────────────────
+  // 구글/애플 확장 시: 호출 조건에 googleSignInLogin/appleSignInLogin 추가 + 실기기 검증.
+  SsoProvider _providerOf(WebViewBridgeFeatureType t) {
+    if (t == WebViewBridgeFeatureType.googleSignInLogin) {
+      return SsoProvider.google;
+    }
+    if (t == WebViewBridgeFeatureType.appleSignInLogin) {
+      return SsoProvider.apple;
+    }
+    return SsoProvider.kakao;
+  }
+
+  Future<Map<String, String>> _deviceHeaders() async {
+    final info = await WebViewDeviceInfo.fromData();
+    return {
+      if (info?.bundleId != null) 'x-sazo-app-id': info!.bundleId!,
+      if (info?.systemName != null)
+        'x-sazo-app-os': info!.systemName!.toLowerCase(),
+      if (info?.version != null) 'x-sazo-app-version': info!.version!,
+      if (info?.deviceId != null) 'x-sazo-device-id': info!.deviceId!,
+    };
+  }
+
+  /// SSO SignIn 결과(idToken 포함 sendData)를 네이티브 교환 후 AUTH_TOKENS_READY payload 로
+  /// 변환. 실패 시 AUTH_ERROR payload. web 은 결과로 토큰 persist 만 (HTTP 교환 0).
+  Future<Map<String, Object?>> _ssoExchangeToTokensReady(
+    WebViewBridgeFeatureType type,
+    Map<String, Object?> sendData,
+    dynamic requestData,
+  ) async {
+    final data = sendData['data'];
+    final idToken = data is Map ? data['idToken'] as String? : null;
+    if (idToken == null || idToken.isEmpty) return sendData;
+    final profile = <String, Object?>{
+      'email': data is Map ? data['email'] : null,
+      'name': data is Map ? data['displayName'] : null,
+      'picture': data is Map ? data['photoUrl'] : null,
+    };
+    final persist =
+        (requestData is Map ? requestData['persist'] : null) == true;
+    try {
+      final result = await SsoExchange(apiBaseUrl: apiBaseUrl!).exchange(
+        provider: _providerOf(type),
+        idToken: idToken,
+        profile: profile,
+        persist: persist,
+        deviceHeaders: await _deviceHeaders(),
+      );
+      // 자동로그인용 refresh 네이티브 저장. (RefreshTokenEvent 는 context 를 SharedPreferences
+      // 용으로만 받고 UI 미사용 → async gap 안전)
+      await RefreshTokenEvent().process(
+        // ignore: use_build_context_synchronously
+        context,
+        action: 'write',
+        data: result.refreshToken,
+      );
+      // ignore: avoid_print
+      print('[SsoExchange] OK ${type.value} → AUTH_TOKENS_READY');
+      return {
+        'type': WebViewBridgeFeatureType.authTokensReady.value,
+        'data': {
+          'accessToken': result.accessToken,
+          'refreshToken': result.refreshToken,
+          'profile': profile,
+        },
+      };
+    } catch (e) {
+      // ignore: avoid_print
+      print('[SsoExchange] FAIL ${type.value}: $e');
+      return {
+        'type': WebViewBridgeFeatureType.authError.value,
+        'data': {'code': 'SSO_EXCHANGE_FAILED', 'message': e.toString()},
+      };
+    }
+  }
+  // ───────────────────────────────────────────────────────────────────────────
 
   Future<Object> runJavaScriptReturningResultAppState(String jsonData) async {
     // JSON 문자열에서 특수문자 이스케이프 처리

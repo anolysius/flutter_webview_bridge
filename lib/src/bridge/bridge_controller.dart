@@ -17,6 +17,7 @@ class WebViewBridgeController {
     WebViewController webViewController, {
     required String? googleServerClientId,
     required String? kakaoNativeAppKey,
+    String? apiBaseUrl,
   }) {
     if (_channel != null) {
       // WebView 재생성 시 channel handler 는 유지, controller 만 swap.
@@ -32,6 +33,7 @@ class WebViewBridgeController {
       webViewController: webViewController,
       googleServerClientId: googleServerClientId,
       kakaoNativeAppKey: kakaoNativeAppKey,
+      apiBaseUrl: apiBaseUrl,
     );
     _channel!.addJavaScriptChannel();
 
@@ -131,6 +133,8 @@ class WebViewBridgeController {
   /// 앱 종료/MainScreen 영구 teardown 같이 다시 init 되지 않는 시점에는
   /// [forceTerminate]=true 를 명시해 큐의 Completer 들을 error 로 종결할 것.
   void dispose({bool forceTerminate = false}) {
+    // SSO hang watchdog 정리 — 채널 teardown 후 stale controller reload 방지.
+    _channel?.cancelSsoWatchdog('controller-dispose');
     if (forceTerminate) {
       while (_requestQueue.isNotEmpty) {
         _requestQueue.removeFirst().completer.completeError(

@@ -25,6 +25,7 @@ enum WebViewBridgeFeatureType {
   channelTalkShowMessenger,
   channelTalkShutdown,
   authError,
+  authTokensReady,
 }
 
 extension WebViewBridgeFeatureTypeValue on WebViewBridgeFeatureType {
@@ -82,6 +83,8 @@ extension WebViewBridgeFeatureTypeValue on WebViewBridgeFeatureType {
         return 'CHANNEL_TALK_SHUTDOWN';
       case WebViewBridgeFeatureType.authError:
         return 'AUTH_ERROR';
+      case WebViewBridgeFeatureType.authTokensReady:
+        return 'AUTH_TOKENS_READY';
     }
   }
 }
