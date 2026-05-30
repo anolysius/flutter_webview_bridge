@@ -413,12 +413,14 @@ class FlutterWebViewBridgeJavaScriptChannel {
     final persist =
         (requestData is Map ? requestData['persist'] : null) == true;
     try {
-      final result = await SsoExchange(apiBaseUrl: apiBaseUrl!).exchange(
+      final sso = SsoExchange(apiBaseUrl: apiBaseUrl!);
+      final deviceHeaders = await _deviceHeaders();
+      final result = await sso.exchange(
         provider: _providerOf(type),
         idToken: idToken,
         profile: profile,
         persist: persist,
-        deviceHeaders: await _deviceHeaders(),
+        deviceHeaders: deviceHeaders,
       );
       // 자동로그인용 refresh 네이티브 저장. (RefreshTokenEvent 는 context 를 SharedPreferences
       // 용으로만 받고 UI 미사용 → async gap 안전)
@@ -428,14 +430,24 @@ class FlutterWebViewBridgeJavaScriptChannel {
         action: 'write',
         data: result.refreshToken,
       );
+      // me 도 네이티브 fetch — web me fetch 가 카카오 throttle 로 hang 하는 것 우회.
+      // 실패는 non-fatal(me 생략 → web 이 기존 fetch 로 fallback).
+      final me = await sso.fetchMe(
+        accessToken: result.accessToken,
+        deviceHeaders: deviceHeaders,
+      );
       // ignore: avoid_print
-      print('[SsoExchange] OK ${type.value} → AUTH_TOKENS_READY');
+      print(
+        '[SsoExchange] OK ${type.value} → AUTH_TOKENS_READY '
+        '(me ${me == null ? "SKIP" : "OK"})',
+      );
       return {
         'type': WebViewBridgeFeatureType.authTokensReady.value,
         'data': {
           'accessToken': result.accessToken,
           'refreshToken': result.refreshToken,
           'profile': profile,
+          if (me != null) 'me': me,
         },
       };
     } catch (e) {

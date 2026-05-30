@@ -121,6 +121,41 @@ class SsoExchange {
     );
   }
 
+  /// 로그인 직후 me(내정보)를 네이티브에서 직접 GET 한다.
+  /// web 의 me fetch(`/api/user/user-me`)가 카카오 앱전환 복귀 throttle 로 hang 하여 홈이
+  /// 간헐적 로그아웃 UI 로 보이는 것을 우회 — Dart HTTP 는 WKWebView throttle 무관.
+  ///
+  /// 실패는 **non-fatal** — null 반환 시 web 이 기존 me fetch 로 fallback (회귀 안전).
+  /// [accessToken] 은 `X-SAZO-Authorization` 헤더에 **raw**(Bearer prefix 없음 — web koAxios 동일).
+  /// 응답은 top-level `UserUserResponseDto`({id,email,names,...}) — 그대로 web me 캐시에 주입.
+  Future<Map<String, dynamic>?> fetchMe({
+    required String accessToken,
+    required Map<String, String> deviceHeaders,
+  }) async {
+    try {
+      final res = await http.get(
+        Uri.parse('$apiBaseUrl/api/user/user-me'),
+        headers: {
+          ..._baseHeaders(),
+          // me 는 web koAxios 경로 — domain 헤더명이 x-sazo-domain-type. 호환 위해 둘 다 전송.
+          'x-sazo-domain-type': domainType,
+          // raw access token (web koAxios: config.headers['X-SAZO-Authorization'] = token)
+          'X-SAZO-Authorization': accessToken,
+          ...deviceHeaders,
+        },
+      );
+      if (res.statusCode < 200 || res.statusCode >= 300) return null;
+      final body = _decode(res.body);
+      // 정상 me 는 top-level id 보유. 일부 게이트의 {data:{...}} 래핑도 방어적으로 처리.
+      if (body['id'] != null) return body;
+      final data = body['data'];
+      if (data is Map<String, dynamic> && data['id'] != null) return data;
+      return null;
+    } catch (_) {
+      return null;
+    }
+  }
+
   Map<String, dynamic> _decode(String body) {
     final decoded = jsonDecode(body);
     if (decoded is Map<String, dynamic>) return decoded;
