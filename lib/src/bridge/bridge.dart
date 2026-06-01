@@ -100,6 +100,19 @@ class FlutterWebViewBridgeJavaScriptChannel {
   Map<String, Object?>? _lastKakaoSendData;
   bool _resendKakaoAfterReload = false;
 
+  // ── SSO session replay (근본 fix: WebContent 프로세스 jettison 대응) ──────────
+  // 카카오 앱 전환 복귀 시 iOS 가 WKWebView WebContent 프로세스를 jettison/restart 하면 "/" 가
+  // 새 document 로 재로드되고 web 의 sessionStorage 가 휘발한다(실기기 확인 2026-06-01:
+  // 새 home 문서 auth_token=null). 로그인 결과(AUTH_TOKENS_READY)는 evaluateJavaScript 로 송신
+  // 시점의 active 문서 1곳에만 가므로(broadcast 없음) 새 home 문서는 이를 못 받아 로그아웃 고착.
+  // bridge(Dart) 는 Flutter 프로세스에 살아 있어(WebContent 자식만 restart) 마지막 성공 SSO 세션
+  // payload 를 메모리에 보관할 수 있다 → 새 문서가 REFRESH_TOKEN_READ 로 물어오면 그대로 replay 해
+  // 재교환/throttle/race 없이 결정론적 로그인. recency(TTL) 게이트로 reboot(캐시 없음)·일반 자동
+  // 로그인은 기존 baseline(raw refresh token → web 교환) 유지 → PC/모바일웹·기존 흐름 무영향.
+  static const Duration _sessionReplayTtl = Duration(seconds: 120);
+  Map<String, Object?>? _cachedSessionPayload;
+  DateTime? _cachedSessionAt;
+
   void _armSsoWatchdog() {
     _ssoWatchdog?.cancel();
     _ssoWatchdog = Timer(_ssoWatchdogTimeout, _onSsoWatchdogTimeout);
@@ -265,6 +278,9 @@ class FlutterWebViewBridgeJavaScriptChannel {
               // web 가 종결 실패/로그아웃으로 token 삭제 — 타이머 살아있는 실제 실패이므로
               // reload 무의미. watchdog 해제 (frozen 케이스는 애초에 아무 메시지도 안 옴).
               cancelSsoWatchdog('refreshTokenDelete');
+              // 로그아웃/실패 → 세션 replay 캐시 무효화 (stale 토큰 replay 방지).
+              _cachedSessionPayload = null;
+              _cachedSessionAt = null;
               sendData = await RefreshTokenEvent().process(
                 context,
                 action: 'delete',
@@ -332,15 +348,17 @@ class FlutterWebViewBridgeJavaScriptChannel {
           );
         }
 
-        // ── Fix A: 자동로그인 / 401 갱신도 네이티브 교환 (throttle-immune) ──
-        // throttle 로 Next hard-nav fallback 이 새 home document 를 만들면 그 document 의 자동로그인
-        // (REFRESH_TOKEN_READ → web HTTP refresh 교환)이 WKWebView throttle 로 hang → 로그아웃 고착.
-        // 저장된 refresh token 으로 네이티브가 refresh→access 교환 후 AUTH_TOKENS_READY 로 변환한다.
-        // 토큰 부재 → 원본(empty) 유지(=정상 로그아웃). 교환 실패 → 원본(raw token) 유지(web 교환 fallback).
+        // ── 근본 fix: WebContent jettison 후 새 document 의 세션 replay ──
+        // 새 home 문서가 자동로그인용 REFRESH_TOKEN_READ 를 보낼 때, 최근(TTL 내) 성공 SSO 세션
+        // 캐시가 있으면 그 AUTH_TOKENS_READY payload 를 그대로 replay 한다. 재교환이 아니라 캐시
+        // 재전송이므로 throttle/race 가 없고, 로그인 때 통한 동일 payload(accessToken+me)라 콘텐츠도
+        // 정상. 캐시 없음(reboot·TTL 경과·로그아웃) → 원본(raw refresh token) 유지 → 기존 web 교환
+        // 자동로그인 경로 그대로(회귀 없음, B 무영향).
         if (apiBaseUrl != null &&
             webViewBridgeFeatureType ==
                 WebViewBridgeFeatureType.refreshTokenRead) {
-          sendData = await _autoLoginToTokensReady(sendData);
+          final replay = _replayRecentSession();
+          if (replay != null) sendData = replay;
         }
 
         // Send Data to WebView
@@ -452,7 +470,7 @@ class FlutterWebViewBridgeJavaScriptChannel {
         '[SsoExchange] OK ${type.value} → AUTH_TOKENS_READY '
         '(me ${me == null ? "SKIP" : "OK"})',
       );
-      return {
+      final payload = <String, Object?>{
         'type': WebViewBridgeFeatureType.authTokensReady.value,
         'data': {
           'accessToken': result.accessToken,
@@ -461,6 +479,11 @@ class FlutterWebViewBridgeJavaScriptChannel {
           if (me != null) 'me': me,
         },
       };
+      // 세션 replay 캐시 — WebContent jettison 후 새 document 가 REFRESH_TOKEN_READ 로
+      // 물어오면 이 payload 를 그대로 재전송(재교환 없음). TTL 내에서만 유효.
+      _cachedSessionPayload = payload;
+      _cachedSessionAt = DateTime.now();
+      return payload;
     } catch (e) {
       // ignore: avoid_print
       print('[SsoExchange] FAIL ${type.value}: $e');
@@ -471,54 +494,24 @@ class FlutterWebViewBridgeJavaScriptChannel {
     }
   }
 
-  /// Fix A: REFRESH_TOKEN_READ 결과(저장 refresh token)를 네이티브 refresh→access 교환 후
-  /// AUTH_TOKENS_READY payload 로 변환. web 의 HTTP refresh 교환(throttle 대상)을 우회한다.
+  /// 최근(TTL 내) 성공 SSO 세션 payload(AUTH_TOKENS_READY)를 replay 용으로 반환. 없거나 만료면 null.
   ///
-  /// - 저장 토큰 부재(sendData['data'] 없음) → 원본 유지: web REFRESH_TOKEN_READ 핸들러가
-  ///   정상 로그아웃 처리 (콜드스타트 로그인 전 첫 호출 등).
-  /// - 네이티브 교환 실패 → 원본(raw refresh token) 유지: web 이 기존 HTTP 교환으로 fallback
-  ///   (회귀 안전). me 는 non-fatal — 실패 시 생략(web 이 기존 fetch 로 fallback).
-  Future<Map<String, Object?>> _autoLoginToTokensReady(
-    Map<String, Object?> sendData,
-  ) async {
-    final refreshToken = sendData['data'] as String?;
-    if (refreshToken == null || refreshToken.isEmpty) return sendData;
-    try {
-      final sso = SsoExchange(apiBaseUrl: apiBaseUrl!);
-      final deviceHeaders = await _deviceHeaders();
-      final result = await sso.refreshToAccess(
-        refreshToken: refreshToken,
-        deviceHeaders: deviceHeaders,
-      );
-      // rotation 대응 — 갱신된 refresh token 네이티브 재저장.
-      await RefreshTokenEvent().process(
-        // ignore: use_build_context_synchronously
-        context,
-        action: 'write',
-        data: result.refreshToken,
-      );
-      final me = await sso.fetchMe(
-        accessToken: result.accessToken,
-        deviceHeaders: deviceHeaders,
-      );
-      // ignore: avoid_print
-      print(
-        '[SsoExchange] auto-login OK → AUTH_TOKENS_READY '
-        '(me ${me == null ? "SKIP" : "OK"})',
-      );
-      return {
-        'type': WebViewBridgeFeatureType.authTokensReady.value,
-        'data': {
-          'accessToken': result.accessToken,
-          'refreshToken': result.refreshToken,
-          if (me != null) 'me': me,
-        },
-      };
-    } catch (e) {
-      // ignore: avoid_print
-      print('[SsoExchange] auto-login FAIL (web 교환 fallback): $e');
-      return sendData;
+  /// 근본 fix: 카카오 복귀 시 WebContent 프로세스 jettison 으로 web 의 sessionStorage 가 휘발해
+  /// 새 home 문서가 로그인 결과를 못 받는 경우, 그 문서의 REFRESH_TOKEN_READ 에 이 캐시를 그대로
+  /// 재전송한다. 재교환이 아니라 캐시 replay 이므로 throttle/race 가 없고, 로그인 때 통한 동일
+  /// payload 라 콘텐츠도 정상. TTL 게이트로 reboot·일반 자동로그인(캐시 없음)은 baseline 유지.
+  Map<String, Object?>? _replayRecentSession() {
+    final at = _cachedSessionAt;
+    final payload = _cachedSessionPayload;
+    if (payload == null || at == null) return null;
+    if (DateTime.now().difference(at) > _sessionReplayTtl) {
+      _cachedSessionPayload = null;
+      _cachedSessionAt = null;
+      return null;
     }
+    // ignore: avoid_print
+    print('[SsoExchange] session replay → AUTH_TOKENS_READY (새 document 로그인 복원)');
+    return payload;
   }
   // ───────────────────────────────────────────────────────────────────────────
 
