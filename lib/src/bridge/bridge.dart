@@ -332,6 +332,17 @@ class FlutterWebViewBridgeJavaScriptChannel {
           );
         }
 
+        // ── Fix A: 자동로그인 / 401 갱신도 네이티브 교환 (throttle-immune) ──
+        // throttle 로 Next hard-nav fallback 이 새 home document 를 만들면 그 document 의 자동로그인
+        // (REFRESH_TOKEN_READ → web HTTP refresh 교환)이 WKWebView throttle 로 hang → 로그아웃 고착.
+        // 저장된 refresh token 으로 네이티브가 refresh→access 교환 후 AUTH_TOKENS_READY 로 변환한다.
+        // 토큰 부재 → 원본(empty) 유지(=정상 로그아웃). 교환 실패 → 원본(raw token) 유지(web 교환 fallback).
+        if (apiBaseUrl != null &&
+            webViewBridgeFeatureType ==
+                WebViewBridgeFeatureType.refreshTokenRead) {
+          sendData = await _autoLoginToTokensReady(sendData);
+        }
+
         // Send Data to WebView
         final encoded = jsonEncode(sendData);
         debugPrint(
@@ -457,6 +468,56 @@ class FlutterWebViewBridgeJavaScriptChannel {
         'type': WebViewBridgeFeatureType.authError.value,
         'data': {'code': 'SSO_EXCHANGE_FAILED', 'message': e.toString()},
       };
+    }
+  }
+
+  /// Fix A: REFRESH_TOKEN_READ 결과(저장 refresh token)를 네이티브 refresh→access 교환 후
+  /// AUTH_TOKENS_READY payload 로 변환. web 의 HTTP refresh 교환(throttle 대상)을 우회한다.
+  ///
+  /// - 저장 토큰 부재(sendData['data'] 없음) → 원본 유지: web REFRESH_TOKEN_READ 핸들러가
+  ///   정상 로그아웃 처리 (콜드스타트 로그인 전 첫 호출 등).
+  /// - 네이티브 교환 실패 → 원본(raw refresh token) 유지: web 이 기존 HTTP 교환으로 fallback
+  ///   (회귀 안전). me 는 non-fatal — 실패 시 생략(web 이 기존 fetch 로 fallback).
+  Future<Map<String, Object?>> _autoLoginToTokensReady(
+    Map<String, Object?> sendData,
+  ) async {
+    final refreshToken = sendData['data'] as String?;
+    if (refreshToken == null || refreshToken.isEmpty) return sendData;
+    try {
+      final sso = SsoExchange(apiBaseUrl: apiBaseUrl!);
+      final deviceHeaders = await _deviceHeaders();
+      final result = await sso.refreshToAccess(
+        refreshToken: refreshToken,
+        deviceHeaders: deviceHeaders,
+      );
+      // rotation 대응 — 갱신된 refresh token 네이티브 재저장.
+      await RefreshTokenEvent().process(
+        // ignore: use_build_context_synchronously
+        context,
+        action: 'write',
+        data: result.refreshToken,
+      );
+      final me = await sso.fetchMe(
+        accessToken: result.accessToken,
+        deviceHeaders: deviceHeaders,
+      );
+      // ignore: avoid_print
+      print(
+        '[SsoExchange] auto-login OK → AUTH_TOKENS_READY '
+        '(me ${me == null ? "SKIP" : "OK"})',
+      );
+      return {
+        'type': WebViewBridgeFeatureType.authTokensReady.value,
+        'data': {
+          'accessToken': result.accessToken,
+          'refreshToken': result.refreshToken,
+          if (me != null) 'me': me,
+        },
+      };
+    } catch (e) {
+      // ignore: avoid_print
+      print('[SsoExchange] auto-login FAIL (web 교환 fallback): $e');
+      return sendData;
     }
   }
   // ───────────────────────────────────────────────────────────────────────────

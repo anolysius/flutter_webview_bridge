@@ -95,6 +95,22 @@ class SsoExchange {
     }
 
     // 2) refresh 교환 → device-bound accessToken (+ 갱신 refreshToken)
+    return refreshToAccess(
+      refreshToken: refreshToken,
+      deviceHeaders: deviceHeaders,
+    );
+  }
+
+  /// 자동로그인 / 401 갱신 전용 — 저장된 refreshToken 으로 device-bound accessToken 발급.
+  /// SSO 교환 2-step 중 step 2 (`POST /api/user/auth/token/refresh`) 단독 수행.
+  ///
+  /// 배경(Fix A): 새 home document(throttle 로 Next hard-nav fallback 생성)의 자동로그인이
+  /// web HTTP refresh 교환에 의존해 throttle 로 hang → 로그아웃. Dart HTTP 는 throttle 무관이라
+  /// 교환을 네이티브로 이전한다. 응답 `data.refreshToken` 이 갱신되면 그 값을, 없으면 입력 토큰 유지.
+  Future<SsoExchangeResult> refreshToAccess({
+    required String refreshToken,
+    required Map<String, String> deviceHeaders,
+  }) async {
     final rfRes = await http.post(
       Uri.parse('$apiBaseUrl/api/user/auth/token/refresh'),
       headers: {..._baseHeaders(), ...deviceHeaders},
