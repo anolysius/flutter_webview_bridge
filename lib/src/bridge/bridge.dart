@@ -370,19 +370,19 @@ class FlutterWebViewBridgeJavaScriptChannel {
               );
               break;
             case WebViewBridgeFeatureType.refreshTokenWrite:
-              // web SSO 교환 성공 신호. B2 카카오 로그인 중에는 signin 문서의
-              // confirm 만으로 home 문서 로그인 보장을 할 수 없으므로 home document
-              // confirm 일 때만 watchdog 을 해제한다.
+              // web SSO 교환 성공 신호. B2 카카오 로그인 중에는 signin/home 문서의
+              // confirm 만으로 "사용자가 보고 있는" home 문서 로그인 보장을 할 수 없다.
+              // 두 WebContent/document 가 동시에 살아있을 수 있으므로 B2 watchdog 은
+              // confirm 으로 취소하지 않고 timeout 까지 유지해 home load 를 한 번 더 수렴시킨다.
               if (_ssoWatchdogB2 && (_ssoWatchdog?.isActive ?? false)) {
-                if (_isHomeDocumentConfirm(data)) {
-                  cancelSsoWatchdog('refreshTokenWrite:home');
-                } else {
-                  // ignore: avoid_print
-                  print(
-                    '[Watchdog] keep B2 watchdog — non-home confirm '
-                    '${_confirmDebugOf(data)}',
-                  );
-                }
+                final confirmKind = _isHomeDocumentConfirm(data)
+                    ? 'home'
+                    : 'non-home';
+                // ignore: avoid_print
+                print(
+                  '[Watchdog] keep B2 watchdog — $confirmKind confirm; '
+                  'wait forced home convergence ${_confirmDebugOf(data)}',
+                );
               } else {
                 cancelSsoWatchdog('refreshTokenWrite');
               }
