@@ -97,6 +97,7 @@ class FlutterWebViewBridgeJavaScriptChannel {
   static const Duration _ssoWatchdogTimeoutB2 = Duration(seconds: 8);
   Timer? _ssoWatchdog;
   int _ssoReloadCount = 0;
+  Future<void> _messageQueue = Future.value();
   // B2 watchdog 여부 — timeout 시 raw 재전송(B1) 대신 reload→세션 replay(B2) 로 복구.
   bool _ssoWatchdogB2 = false;
   // reload 복구: native 메모리에 마지막 카카오 결과 보관 (WebContent jettison 무관).
@@ -273,7 +274,16 @@ class FlutterWebViewBridgeJavaScriptChannel {
   }
   // ───────────────────────────────────────────────────────────────────────────
 
-  Future<void> onMessageReceived(JavaScriptMessage message) async {
+  Future<void> onMessageReceived(JavaScriptMessage message) {
+    final next = _messageQueue.then((_) => _handleMessageReceived(message));
+    _messageQueue = next.catchError((Object e, StackTrace st) {
+      // ignore: avoid_print
+      print('[Bridge] message queue error: $e');
+    });
+    return next;
+  }
+
+  Future<void> _handleMessageReceived(JavaScriptMessage message) async {
     final json = jsonDecode(message.message);
     final type = json['type'] as String?;
     final data = json['data'];
