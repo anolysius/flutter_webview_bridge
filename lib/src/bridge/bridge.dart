@@ -471,25 +471,30 @@ class FlutterWebViewBridgeJavaScriptChannel {
   }
 
   Future<void> _navigateHome(dynamic data) async {
-    final rawUrl = data is Map ? data['url'] as String? : null;
     final authSessionId = _authSessionIdOf(data);
-    if (rawUrl == null || rawUrl.isEmpty) {
+    final rawCurrentUrl = await webViewController.currentUrl();
+    if (rawCurrentUrl == null || rawCurrentUrl.isEmpty) {
       // ignore: avoid_print
-      print('[Bridge] NAVIGATE_HOME skipped — url missing');
+      print('[Bridge] NAVIGATE_HOME skipped — currentUrl missing');
       return;
     }
-    final uri = Uri.tryParse(rawUrl);
-    if (uri == null || (uri.scheme != 'https' && uri.scheme != 'http')) {
+    final currentUri = Uri.tryParse(rawCurrentUrl);
+    if (currentUri == null ||
+        (currentUri.scheme != 'https' && currentUri.scheme != 'http') ||
+        currentUri.host.isEmpty) {
       // ignore: avoid_print
-      print('[Bridge] NAVIGATE_HOME skipped — invalid url: $rawUrl');
+      print(
+        '[Bridge] NAVIGATE_HOME skipped — invalid currentUrl: $rawCurrentUrl',
+      );
       return;
     }
+    final homeUri = Uri.parse('${currentUri.origin}/');
     // ignore: avoid_print
     print(
       '[Bridge] NAVIGATE_HOME loadRequest '
-      'authSessionId=${authSessionId ?? "null"} url=$uri',
+      'authSessionId=${authSessionId ?? "null"} url=$homeUri',
     );
-    await webViewController.loadRequest(uri);
+    await webViewController.loadRequest(homeUri);
   }
 
   Future<Map<String, String>> _deviceHeaders() async {
