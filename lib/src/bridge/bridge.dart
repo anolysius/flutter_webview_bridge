@@ -94,7 +94,7 @@ class FlutterWebViewBridgeJavaScriptChannel {
   static const Duration _ssoWatchdogTimeout = Duration(seconds: 7);
   // B2(네이티브 교환) 경로 watchdog timeout — signin 문서 confirm 이후 native home load 와
   // fresh home document replay confirm 까지 허용하되, home 이 끝내 갱신되지 않으면 복구.
-  static const Duration _ssoWatchdogTimeoutB2 = Duration(seconds: 4);
+  static const Duration _ssoWatchdogTimeoutB2 = Duration(seconds: 8);
   Timer? _ssoWatchdog;
   int _ssoReloadCount = 0;
   // B2 watchdog 여부 — timeout 시 raw 재전송(B1) 대신 reload→세션 replay(B2) 로 복구.
