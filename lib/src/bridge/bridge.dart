@@ -92,8 +92,13 @@ class FlutterWebViewBridgeJavaScriptChannel {
   // reload 후 web 의 resume 은 내부 fake postMessage(window.callbackPostMessage)라 native 로
   // 다시 오지 않으므로 재-arm 되지 않는다 → 한 번의 카카오 로그인당 reload 최대 1회.
   static const Duration _ssoWatchdogTimeout = Duration(seconds: 7);
+  // B2(네이티브 교환) 경로 watchdog timeout — web 로그인 확정(REFRESH_TOKEN_WRITE)은 보통 ~1s 내
+  // 도착하므로 2s 면 충분. jettison 으로 새 문서가 AUTH_TOKENS_READY 를 놓친 경우만 미수신 → reload.
+  static const Duration _ssoWatchdogTimeoutB2 = Duration(seconds: 2);
   Timer? _ssoWatchdog;
   int _ssoReloadCount = 0;
+  // B2 watchdog 여부 — timeout 시 raw 재전송(B1) 대신 reload→세션 replay(B2) 로 복구.
+  bool _ssoWatchdogB2 = false;
   // reload 복구: native 메모리에 마지막 카카오 결과 보관 (WebContent jettison 무관).
   // reload 후 sessionStorage 가 소실되어 web 의 sso-pending resume 이 불가함이 실기기로
   // 확인됨(2026-05-30) → fresh page mount 시 native 가 이 payload 를 재전송해 교환을 재개.
@@ -113,14 +118,16 @@ class FlutterWebViewBridgeJavaScriptChannel {
   Map<String, Object?>? _cachedSessionPayload;
   DateTime? _cachedSessionAt;
 
-  void _armSsoWatchdog() {
+  void _armSsoWatchdog({bool isB2 = false}) {
     _ssoWatchdog?.cancel();
-    _ssoWatchdog = Timer(_ssoWatchdogTimeout, _onSsoWatchdogTimeout);
+    _ssoWatchdogB2 = isB2;
+    final timeout = isB2 ? _ssoWatchdogTimeoutB2 : _ssoWatchdogTimeout;
+    _ssoWatchdog = Timer(timeout, _onSsoWatchdogTimeout);
     // release 빌드에서도 보이도록 native print (debugPrint 는 release no-op).
     // watchdog 동작은 release syslog 검증 대상이라 의도적 print.
     // ignore: avoid_print
     print(
-      '[Watchdog] arm ${_ssoWatchdogTimeout.inSeconds}s (kakaoSignInLogin)',
+      '[Watchdog] arm ${timeout.inSeconds}s (kakaoSignInLogin${isB2 ? ", B2" : ""})',
     );
   }
 
@@ -138,12 +145,17 @@ class FlutterWebViewBridgeJavaScriptChannel {
   void _onSsoWatchdogTimeout() {
     _ssoWatchdog = null;
     _ssoReloadCount += 1;
-    // reload 후 fresh page 가 올라오면 카카오 payload 재전송 (sessionStorage resume 대체).
-    _resendKakaoAfterReload = true;
+    // B1(web 교환): reload 후 fresh page 에 카카오 raw payload 재전송 (web 교환 재개).
+    // B2(네이티브 교환): reload 후 fresh page 가 REFRESH_TOKEN_READ → 세션 replay 로 로그인 복원
+    //   (raw 재전송 불필요 — replay 가 throttle/race 없이 동일 payload 전달). jettison 으로 새 문서가
+    //   AUTH_TOKENS_READY 를 못 받아 confirm(REFRESH_TOKEN_WRITE) 미수신인 케이스를 결정론적 복구.
+    if (!_ssoWatchdogB2) {
+      _resendKakaoAfterReload = true;
+    }
     // ignore: avoid_print
     print(
-      '[Watchdog] reload $_ssoReloadCount — SSO hang '
-      '(REFRESH_TOKEN_WRITE ${_ssoWatchdogTimeout.inSeconds}s 미수신)',
+      '[Watchdog] reload $_ssoReloadCount — SSO confirm 미수신 '
+      '(${_ssoWatchdogB2 ? "B2 replay" : "B1 resend"})',
     );
     try {
       webViewController.reload();
@@ -371,15 +383,20 @@ class FlutterWebViewBridgeJavaScriptChannel {
           debugPrint(
             '[Bridge] postMessage OK type=${webViewBridgeFeatureType.value} result=$r',
           );
-          // 카카오 로그인 결과 송신 성공 → SSO hang watchdog arm.
-          // ⚠ B2(apiBaseUrl 주입) 활성 시엔 네이티브 교환이라 watchdog 불필요 + AUTH_TOKENS_READY
-          // 는 REFRESH_TOKEN_WRITE 를 안 보내 cancel 안 되므로 반드시 arm 회피.
-          if (apiBaseUrl == null &&
-              webViewBridgeFeatureType ==
-                  WebViewBridgeFeatureType.kakaoSignInLogin) {
-            // reload 복구용으로 payload 보관 후 watchdog arm.
-            _lastKakaoSendData = sendData;
-            _armSsoWatchdog();
+          // 카카오 로그인 결과 송신 성공 → SSO watchdog arm (jettison 복구).
+          if (webViewBridgeFeatureType ==
+              WebViewBridgeFeatureType.kakaoSignInLogin) {
+            if (apiBaseUrl == null) {
+              // B1(web 교환): reload 후 raw 재전송용 payload 보관 + watchdog(7s).
+              _lastKakaoSendData = sendData;
+              _armSsoWatchdog();
+            } else if (sendData['type'] ==
+                WebViewBridgeFeatureType.authTokensReady.value) {
+              // B2(네이티브 교환 성공): AUTH_TOKENS_READY 송신 완료.
+              // web 가 로그인 확정 시 REFRESH_TOKEN_WRITE 로 confirm → cancel. 미수신(jettison 으로
+              // 새 문서가 못 받음)이면 timeout 후 reload → fresh page REFRESH_TOKEN_READ → 세션 replay.
+              _armSsoWatchdog(isB2: true);
+            }
           }
         } catch (e) {
           debugPrint(
