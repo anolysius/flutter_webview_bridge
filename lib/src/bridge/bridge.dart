@@ -118,6 +118,29 @@ class FlutterWebViewBridgeJavaScriptChannel {
   Map<String, Object?>? _cachedSessionPayload;
   DateTime? _cachedSessionAt;
 
+  String? _authSessionIdOf(dynamic data) =>
+      data is Map ? data['authSessionId'] as String? : null;
+
+  String? _providerOfRequest(dynamic data) =>
+      data is Map ? data['provider'] as String? : null;
+
+  void _clearSessionReplay(String reason) {
+    final hadPayload = _cachedSessionPayload != null;
+    _cachedSessionPayload = null;
+    _cachedSessionAt = null;
+    if (hadPayload) {
+      // ignore: avoid_print
+      print('[SsoExchange] session replay clear ($reason)');
+    }
+  }
+
+  void _clearSsoTransientState(String reason) {
+    cancelSsoWatchdog(reason);
+    _lastKakaoSendData = null;
+    _resendKakaoAfterReload = false;
+    _clearSessionReplay(reason);
+  }
+
   void _armSsoWatchdog({bool isB2 = false}) {
     _ssoWatchdog?.cancel();
     _ssoWatchdogB2 = isB2;
@@ -236,36 +259,48 @@ class FlutterWebViewBridgeJavaScriptChannel {
               sendData = await ExitAppEvent().process(context);
               break;
             case WebViewBridgeFeatureType.googleSignInLogin:
+              _clearSsoTransientState(
+                'ssoStart:${webViewBridgeFeatureType.value}',
+              );
               sendData = await SignInGoogle.shared.process(
                 context,
                 action: 'login',
               );
               break;
             case WebViewBridgeFeatureType.googleSignInLogout:
+              _clearSsoTransientState('googleSignInLogout');
               sendData = await SignInGoogle.shared.process(
                 context,
                 action: 'logout',
               );
               break;
             case WebViewBridgeFeatureType.appleSignInLogin:
+              _clearSsoTransientState(
+                'ssoStart:${webViewBridgeFeatureType.value}',
+              );
               sendData = await SignInApple.shared.process(
                 context,
                 action: 'login',
               );
               break;
             case WebViewBridgeFeatureType.appleSignInLogout:
+              _clearSsoTransientState('appleSignInLogout');
               sendData = await SignInApple.shared.process(
                 context,
                 action: 'logout',
               );
               break;
             case WebViewBridgeFeatureType.kakaoSignInLogin:
+              _clearSsoTransientState(
+                'ssoStart:${webViewBridgeFeatureType.value}',
+              );
               sendData = await SignInKakao.shared.process(
                 context,
                 action: 'login',
               );
               break;
             case WebViewBridgeFeatureType.kakaoSignInLogout:
+              _clearSsoTransientState('kakaoSignInLogout');
               sendData = await SignInKakao.shared.process(
                 context,
                 action: 'logout',
@@ -289,15 +324,15 @@ class FlutterWebViewBridgeJavaScriptChannel {
             case WebViewBridgeFeatureType.refreshTokenDelete:
               // web 가 종결 실패/로그아웃으로 token 삭제 — 타이머 살아있는 실제 실패이므로
               // reload 무의미. watchdog 해제 (frozen 케이스는 애초에 아무 메시지도 안 옴).
-              cancelSsoWatchdog('refreshTokenDelete');
-              // 로그아웃/실패 → 세션 replay 캐시 무효화 (stale 토큰 replay 방지).
-              _cachedSessionPayload = null;
-              _cachedSessionAt = null;
+              _clearSsoTransientState('refreshTokenDelete');
               sendData = await RefreshTokenEvent().process(
                 context,
                 action: 'delete',
               );
               break;
+            case WebViewBridgeFeatureType.navigateHome:
+              await _navigateHome(data);
+              return;
             case WebViewBridgeFeatureType.channelTalkBoot:
               sendData = await ChannelTalkEvent().processBoot(context, data);
               break;
@@ -320,6 +355,7 @@ class FlutterWebViewBridgeJavaScriptChannel {
           // AUTH_ERROR payload 송신 + native SnackBar skip.
           // (사용자 toast 는 webview 측이 단독 표시 — 중복 회피)
           if (e is AuthError) {
+            _clearSsoTransientState('authError');
             try {
               await runJavaScriptReturningResultPostMessage(
                 jsonEncode({
@@ -369,7 +405,7 @@ class FlutterWebViewBridgeJavaScriptChannel {
         if (apiBaseUrl != null &&
             webViewBridgeFeatureType ==
                 WebViewBridgeFeatureType.refreshTokenRead) {
-          final replay = _replayRecentSession();
+          final replay = _replayRecentSession(data);
           if (replay != null) sendData = replay;
         }
 
@@ -434,6 +470,28 @@ class FlutterWebViewBridgeJavaScriptChannel {
     return SsoProvider.kakao;
   }
 
+  Future<void> _navigateHome(dynamic data) async {
+    final rawUrl = data is Map ? data['url'] as String? : null;
+    final authSessionId = _authSessionIdOf(data);
+    if (rawUrl == null || rawUrl.isEmpty) {
+      // ignore: avoid_print
+      print('[Bridge] NAVIGATE_HOME skipped — url missing');
+      return;
+    }
+    final uri = Uri.tryParse(rawUrl);
+    if (uri == null || (uri.scheme != 'https' && uri.scheme != 'http')) {
+      // ignore: avoid_print
+      print('[Bridge] NAVIGATE_HOME skipped — invalid url: $rawUrl');
+      return;
+    }
+    // ignore: avoid_print
+    print(
+      '[Bridge] NAVIGATE_HOME loadRequest '
+      'authSessionId=${authSessionId ?? "null"} url=$uri',
+    );
+    await webViewController.loadRequest(uri);
+  }
+
   Future<Map<String, String>> _deviceHeaders() async {
     final info = await WebViewDeviceInfo.fromData();
     return {
@@ -462,6 +520,8 @@ class FlutterWebViewBridgeJavaScriptChannel {
     };
     final persist =
         (requestData is Map ? requestData['persist'] : null) == true;
+    final authSessionId = _authSessionIdOf(requestData);
+    final requestProvider = _providerOfRequest(requestData);
     try {
       final sso = SsoExchange(apiBaseUrl: apiBaseUrl!);
       final deviceHeaders = await _deviceHeaders();
@@ -489,7 +549,8 @@ class FlutterWebViewBridgeJavaScriptChannel {
       // ignore: avoid_print
       print(
         '[SsoExchange] OK ${type.value} → AUTH_TOKENS_READY '
-        '(me ${me == null ? "SKIP" : "OK"})',
+        '(me ${me == null ? "SKIP" : "OK"}, '
+        'authSessionId=${authSessionId ?? "null"})',
       );
       final payload = <String, Object?>{
         'type': WebViewBridgeFeatureType.authTokensReady.value,
@@ -497,6 +558,8 @@ class FlutterWebViewBridgeJavaScriptChannel {
           'accessToken': result.accessToken,
           'refreshToken': result.refreshToken,
           'profile': profile,
+          if (authSessionId != null) 'authSessionId': authSessionId,
+          if (requestProvider != null) 'provider': requestProvider,
           if (me != null) 'me': me,
         },
       };
@@ -521,7 +584,7 @@ class FlutterWebViewBridgeJavaScriptChannel {
   /// 새 home 문서가 로그인 결과를 못 받는 경우, 그 문서의 REFRESH_TOKEN_READ 에 이 캐시를 그대로
   /// 재전송한다. 재교환이 아니라 캐시 replay 이므로 throttle/race 가 없고, 로그인 때 통한 동일
   /// payload 라 콘텐츠도 정상. TTL 게이트로 reboot·일반 자동로그인(캐시 없음)은 baseline 유지.
-  Map<String, Object?>? _replayRecentSession() {
+  Map<String, Object?>? _replayRecentSession(dynamic requestData) {
     final at = _cachedSessionAt;
     final payload = _cachedSessionPayload;
     if (payload == null || at == null) return null;
@@ -530,8 +593,26 @@ class FlutterWebViewBridgeJavaScriptChannel {
       _cachedSessionAt = null;
       return null;
     }
+    final requestedAuthSessionId = _authSessionIdOf(requestData);
+    final cachedData = payload['data'];
+    final cachedAuthSessionId = cachedData is Map
+        ? cachedData['authSessionId'] as String?
+        : null;
+    if (requestedAuthSessionId != null &&
+        cachedAuthSessionId != null &&
+        requestedAuthSessionId != cachedAuthSessionId) {
+      // ignore: avoid_print
+      print(
+        '[SsoExchange] session replay skip — authSessionId mismatch '
+        'request=$requestedAuthSessionId cache=$cachedAuthSessionId',
+      );
+      return null;
+    }
     // ignore: avoid_print
-    print('[SsoExchange] session replay → AUTH_TOKENS_READY (새 document 로그인 복원)');
+    print(
+      '[SsoExchange] session replay → AUTH_TOKENS_READY '
+      '(authSessionId=${cachedAuthSessionId ?? "null"})',
+    );
     return payload;
   }
   // ───────────────────────────────────────────────────────────────────────────

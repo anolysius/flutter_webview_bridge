@@ -21,6 +21,7 @@ enum WebViewBridgeFeatureType {
   refreshTokenRead,
   refreshTokenWrite,
   refreshTokenDelete,
+  navigateHome,
   channelTalkBoot,
   channelTalkShowMessenger,
   channelTalkShutdown,
@@ -75,6 +76,8 @@ extension WebViewBridgeFeatureTypeValue on WebViewBridgeFeatureType {
         return 'REFRESH_TOKEN_WRITE';
       case WebViewBridgeFeatureType.refreshTokenDelete:
         return 'REFRESH_TOKEN_DELETE';
+      case WebViewBridgeFeatureType.navigateHome:
+        return 'NAVIGATE_HOME';
       case WebViewBridgeFeatureType.channelTalkBoot:
         return 'CHANNEL_TALK_BOOT';
       case WebViewBridgeFeatureType.channelTalkShowMessenger:
@@ -136,6 +139,8 @@ extension WebViewBridgeFeatureTypeString on String {
         return WebViewBridgeFeatureType.refreshTokenWrite;
       case 'REFRESH_TOKEN_DELETE':
         return WebViewBridgeFeatureType.refreshTokenDelete;
+      case 'NAVIGATE_HOME':
+        return WebViewBridgeFeatureType.navigateHome;
       case 'CHANNEL_TALK_BOOT':
         return WebViewBridgeFeatureType.channelTalkBoot;
       case 'CHANNEL_TALK_SHOW_MESSENGER':
@@ -144,6 +149,8 @@ extension WebViewBridgeFeatureTypeString on String {
         return WebViewBridgeFeatureType.channelTalkShutdown;
       case 'AUTH_ERROR':
         return WebViewBridgeFeatureType.authError;
+      case 'AUTH_TOKENS_READY':
+        return WebViewBridgeFeatureType.authTokensReady;
     }
     return null;
   }
