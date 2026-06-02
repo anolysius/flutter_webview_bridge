@@ -153,6 +153,16 @@ class FlutterWebViewBridgeJavaScriptChannel {
         'isHomeDocument=${data['isHomeDocument'] ?? "null"}';
   }
 
+  String _deleteDebugOf(dynamic data) {
+    if (data is! Map) return 'legacy-null';
+    return 'source=${data['source'] ?? "null"} '
+        'documentId=${data['documentId'] ?? "null"} '
+        'pathname=${data['pathname'] ?? data['webPathname'] ?? "null"} '
+        'authSessionId=${data['authSessionId'] ?? "null"} '
+        'isHomeDocument=${data['isHomeDocument'] ?? "null"} '
+        'error=${data['errorMessage'] ?? "null"}';
+  }
+
   void _clearSessionReplay(String reason) {
     final hadPayload = _cachedSessionPayload != null;
     _cachedSessionPayload = null;
@@ -403,6 +413,10 @@ class FlutterWebViewBridgeJavaScriptChannel {
             case WebViewBridgeFeatureType.refreshTokenDelete:
               // web 가 종결 실패/로그아웃으로 token 삭제 — 타이머 살아있는 실제 실패이므로
               // reload 무의미. watchdog 해제 (frozen 케이스는 애초에 아무 메시지도 안 옴).
+              // ignore: avoid_print
+              print(
+                '[SsoExchange] refresh token delete requested ${_deleteDebugOf(data)}',
+              );
               _clearSsoTransientState('refreshTokenDelete');
               sendData = await RefreshTokenEvent().process(
                 context,
@@ -570,10 +584,25 @@ class FlutterWebViewBridgeJavaScriptChannel {
     final homeUri = Uri.parse('${currentUri.origin}/');
     // ignore: avoid_print
     print(
-      '[Bridge] NAVIGATE_HOME loadRequest '
+      '[Bridge] NAVIGATE_HOME replace '
       'authSessionId=${authSessionId ?? "null"} url=$homeUri',
     );
-    await webViewController.loadRequest(homeUri);
+    await _replaceCurrentDocument(homeUri, reason: 'NAVIGATE_HOME');
+  }
+
+  Future<void> _replaceCurrentDocument(
+    Uri uri, {
+    required String reason,
+  }) async {
+    try {
+      await webViewController.runJavaScript(
+        'window.location.replace(${jsonEncode(uri.toString())});',
+      );
+    } catch (e) {
+      // ignore: avoid_print
+      print('[Bridge] $reason replace FAIL; fallback loadRequest: $e');
+      await webViewController.loadRequest(uri);
+    }
   }
 
   Future<Map<String, String>> _deviceHeaders() async {
