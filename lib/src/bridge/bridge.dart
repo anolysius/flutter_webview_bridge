@@ -97,7 +97,6 @@ class FlutterWebViewBridgeJavaScriptChannel {
   static const Duration _ssoWatchdogTimeoutB2 = Duration(seconds: 8);
   Timer? _ssoWatchdog;
   int _ssoReloadCount = 0;
-  Future<void> _messageQueue = Future.value();
   // B2 watchdog 여부 — timeout 시 raw 재전송(B1) 대신 reload→세션 replay(B2) 로 복구.
   bool _ssoWatchdogB2 = false;
   // reload 복구: native 메모리에 마지막 카카오 결과 보관 (WebContent jettison 무관).
@@ -118,12 +117,32 @@ class FlutterWebViewBridgeJavaScriptChannel {
   static const Duration _sessionReplayTtl = Duration(seconds: 120);
   Map<String, Object?>? _cachedSessionPayload;
   DateTime? _cachedSessionAt;
+  int _authEpoch = 0;
+  String? _activeAuthSessionId;
+  String? _activeAuthProvider;
 
   String? _authSessionIdOf(dynamic data) =>
       data is Map ? data['authSessionId'] as String? : null;
 
   String? _providerOfRequest(dynamic data) =>
       data is Map ? data['provider'] as String? : null;
+
+  bool _isSsoLogin(WebViewBridgeFeatureType type) =>
+      type == WebViewBridgeFeatureType.googleSignInLogin ||
+      type == WebViewBridgeFeatureType.appleSignInLogin ||
+      type == WebViewBridgeFeatureType.kakaoSignInLogin;
+
+  String _providerNameOf(WebViewBridgeFeatureType type) {
+    if (type == WebViewBridgeFeatureType.googleSignInLogin ||
+        type == WebViewBridgeFeatureType.googleSignInLogout) {
+      return 'google';
+    }
+    if (type == WebViewBridgeFeatureType.appleSignInLogin ||
+        type == WebViewBridgeFeatureType.appleSignInLogout) {
+      return 'apple';
+    }
+    return 'kakao';
+  }
 
   String? _stringFieldOf(dynamic data, String key) =>
       data is Map ? data[key] as String? : null;
@@ -179,6 +198,58 @@ class FlutterWebViewBridgeJavaScriptChannel {
     _lastKakaoSendData = null;
     _resendKakaoAfterReload = false;
     _clearSessionReplay(reason);
+  }
+
+  int _beginAuthTransaction(WebViewBridgeFeatureType type, dynamic data) {
+    _authEpoch += 1;
+    _clearSsoTransientState('ssoStart:${type.value}');
+    _activeAuthSessionId = _authSessionIdOf(data);
+    _activeAuthProvider = _providerOfRequest(data) ?? _providerNameOf(type);
+    // ignore: avoid_print
+    print(
+      '[SsoExchange] auth transaction begin '
+      'epoch=$_authEpoch provider=${_activeAuthProvider ?? "null"} '
+      'authSessionId=${_activeAuthSessionId ?? "null"}',
+    );
+    return _authEpoch;
+  }
+
+  void _invalidateAuthTransaction(String reason) {
+    _authEpoch += 1;
+    _activeAuthSessionId = null;
+    _activeAuthProvider = null;
+    _clearSsoTransientState(reason);
+    // ignore: avoid_print
+    print(
+      '[SsoExchange] auth transaction invalidated ($reason) epoch=$_authEpoch',
+    );
+  }
+
+  bool _isCurrentAuthTransaction(int epoch, dynamic data) {
+    if (epoch != _authEpoch) return false;
+    final requestedAuthSessionId = _authSessionIdOf(data);
+    if (requestedAuthSessionId != null &&
+        _activeAuthSessionId != null &&
+        requestedAuthSessionId != _activeAuthSessionId) {
+      return false;
+    }
+    return true;
+  }
+
+  bool _isStaleAuthSessionMessage(dynamic data) {
+    final requestedAuthSessionId = _authSessionIdOf(data);
+    return requestedAuthSessionId != null &&
+        _activeAuthSessionId != null &&
+        requestedAuthSessionId != _activeAuthSessionId;
+  }
+
+  void _logStaleAuthMessage(String reason, dynamic data) {
+    // ignore: avoid_print
+    print(
+      '[SsoExchange] stale auth message skipped ($reason) '
+      'request=${_authSessionIdOf(data) ?? "null"} '
+      'active=${_activeAuthSessionId ?? "null"} epoch=$_authEpoch',
+    );
   }
 
   void _armSsoWatchdog({bool isB2 = false}) {
@@ -274,16 +345,7 @@ class FlutterWebViewBridgeJavaScriptChannel {
   }
   // ───────────────────────────────────────────────────────────────────────────
 
-  Future<void> onMessageReceived(JavaScriptMessage message) {
-    final next = _messageQueue.then((_) => _handleMessageReceived(message));
-    _messageQueue = next.catchError((Object e, StackTrace st) {
-      // ignore: avoid_print
-      print('[Bridge] message queue error: $e');
-    });
-    return next;
-  }
-
-  Future<void> _handleMessageReceived(JavaScriptMessage message) async {
+  Future<void> onMessageReceived(JavaScriptMessage message) async {
     final json = jsonDecode(message.message);
     final type = json['type'] as String?;
     final data = json['data'];
@@ -291,8 +353,12 @@ class FlutterWebViewBridgeJavaScriptChannel {
       final webViewBridgeFeatureType = type.webViewBridgeFeatureType;
       if (webViewBridgeFeatureType != null) {
         late Map<String, Object?> sendData;
+        int? authEpoch;
 
         try {
+          if (_isSsoLogin(webViewBridgeFeatureType)) {
+            authEpoch = _beginAuthTransaction(webViewBridgeFeatureType, data);
+          }
           switch (webViewBridgeFeatureType) {
             case WebViewBridgeFeatureType.appStateChange:
               sendData = await AppStateChangeEvent().process(context);
@@ -337,48 +403,51 @@ class FlutterWebViewBridgeJavaScriptChannel {
               sendData = await ExitAppEvent().process(context);
               break;
             case WebViewBridgeFeatureType.googleSignInLogin:
-              _clearSsoTransientState(
-                'ssoStart:${webViewBridgeFeatureType.value}',
-              );
               sendData = await SignInGoogle.shared.process(
                 context,
                 action: 'login',
               );
+              if (!_isCurrentAuthTransaction(authEpoch!, data)) {
+                _logStaleAuthMessage(webViewBridgeFeatureType.value, data);
+                return;
+              }
               break;
             case WebViewBridgeFeatureType.googleSignInLogout:
-              _clearSsoTransientState('googleSignInLogout');
+              _invalidateAuthTransaction('googleSignInLogout');
               sendData = await SignInGoogle.shared.process(
                 context,
                 action: 'logout',
               );
               break;
             case WebViewBridgeFeatureType.appleSignInLogin:
-              _clearSsoTransientState(
-                'ssoStart:${webViewBridgeFeatureType.value}',
-              );
               sendData = await SignInApple.shared.process(
                 context,
                 action: 'login',
               );
+              if (!_isCurrentAuthTransaction(authEpoch!, data)) {
+                _logStaleAuthMessage(webViewBridgeFeatureType.value, data);
+                return;
+              }
               break;
             case WebViewBridgeFeatureType.appleSignInLogout:
-              _clearSsoTransientState('appleSignInLogout');
+              _invalidateAuthTransaction('appleSignInLogout');
               sendData = await SignInApple.shared.process(
                 context,
                 action: 'logout',
               );
               break;
             case WebViewBridgeFeatureType.kakaoSignInLogin:
-              _clearSsoTransientState(
-                'ssoStart:${webViewBridgeFeatureType.value}',
-              );
               sendData = await SignInKakao.shared.process(
                 context,
                 action: 'login',
               );
+              if (!_isCurrentAuthTransaction(authEpoch!, data)) {
+                _logStaleAuthMessage(webViewBridgeFeatureType.value, data);
+                return;
+              }
               break;
             case WebViewBridgeFeatureType.kakaoSignInLogout:
-              _clearSsoTransientState('kakaoSignInLogout');
+              _invalidateAuthTransaction('kakaoSignInLogout');
               sendData = await SignInKakao.shared.process(
                 context,
                 action: 'logout',
@@ -391,6 +460,10 @@ class FlutterWebViewBridgeJavaScriptChannel {
               );
               break;
             case WebViewBridgeFeatureType.refreshTokenWrite:
+              if (_isStaleAuthSessionMessage(data)) {
+                _logStaleAuthMessage('refreshTokenWrite', data);
+                return;
+              }
               // web SSO 교환 성공 신호. B2 카카오 로그인 중 signin 문서 confirm 은
               // 사용자가 보는 홈 문서 로그인을 보장하지 못하므로 watchdog 을 유지한다.
               // 반대로 홈 문서 confirm 은 AUTH_TOKENS_READY persist 가 active home 에
@@ -421,19 +494,27 @@ class FlutterWebViewBridgeJavaScriptChannel {
               );
               break;
             case WebViewBridgeFeatureType.refreshTokenDelete:
+              if (_isStaleAuthSessionMessage(data)) {
+                _logStaleAuthMessage('refreshTokenDelete', data);
+                return;
+              }
               // web 가 종결 실패/로그아웃으로 token 삭제 — 타이머 살아있는 실제 실패이므로
               // reload 무의미. watchdog 해제 (frozen 케이스는 애초에 아무 메시지도 안 옴).
               // ignore: avoid_print
               print(
                 '[SsoExchange] refresh token delete requested ${_deleteDebugOf(data)}',
               );
-              _clearSsoTransientState('refreshTokenDelete');
+              _invalidateAuthTransaction('refreshTokenDelete');
               sendData = await RefreshTokenEvent().process(
                 context,
                 action: 'delete',
               );
               break;
             case WebViewBridgeFeatureType.navigateHome:
+              if (_isStaleAuthSessionMessage(data)) {
+                _logStaleAuthMessage('navigateHome', data);
+                return;
+              }
               await _navigateHome(data);
               return;
             case WebViewBridgeFeatureType.channelTalkBoot:
@@ -458,7 +539,7 @@ class FlutterWebViewBridgeJavaScriptChannel {
           // AUTH_ERROR payload 송신 + native SnackBar skip.
           // (사용자 toast 는 webview 측이 단독 표시 — 중복 회피)
           if (e is AuthError) {
-            _clearSsoTransientState('authError');
+            _invalidateAuthTransaction('authError');
             try {
               await runJavaScriptReturningResultPostMessage(
                 jsonEncode({
@@ -492,11 +573,14 @@ class FlutterWebViewBridgeJavaScriptChannel {
         if (apiBaseUrl != null &&
             webViewBridgeFeatureType ==
                 WebViewBridgeFeatureType.kakaoSignInLogin) {
-          sendData = await _ssoExchangeToTokensReady(
+          final exchanged = await _ssoExchangeToTokensReady(
             webViewBridgeFeatureType,
             sendData,
             data,
+            authEpoch!,
           );
+          if (exchanged == null) return;
+          sendData = exchanged;
         }
 
         // ── 근본 fix: WebContent jettison 후 새 document 의 세션 replay ──
@@ -520,6 +604,13 @@ class FlutterWebViewBridgeJavaScriptChannel {
         // reload 0, jettison-miss(confirm 미수신)만 timeout 후 reload→replay.
         if (webViewBridgeFeatureType ==
             WebViewBridgeFeatureType.kakaoSignInLogin) {
+          if (!_isCurrentAuthTransaction(authEpoch!, data)) {
+            _logStaleAuthMessage(
+              'post:${webViewBridgeFeatureType.value}',
+              data,
+            );
+            return;
+          }
           if (apiBaseUrl == null) {
             // B1(web 교환): reload 후 raw 재전송용 payload 보관 + watchdog(7s).
             _lastKakaoSendData = sendData;
@@ -628,10 +719,11 @@ class FlutterWebViewBridgeJavaScriptChannel {
 
   /// SSO SignIn 결과(idToken 포함 sendData)를 네이티브 교환 후 AUTH_TOKENS_READY payload 로
   /// 변환. 실패 시 AUTH_ERROR payload. web 은 결과로 토큰 persist 만 (HTTP 교환 0).
-  Future<Map<String, Object?>> _ssoExchangeToTokensReady(
+  Future<Map<String, Object?>?> _ssoExchangeToTokensReady(
     WebViewBridgeFeatureType type,
     Map<String, Object?> sendData,
     dynamic requestData,
+    int authEpoch,
   ) async {
     final data = sendData['data'];
     final idToken = data is Map ? data['idToken'] as String? : null;
@@ -655,6 +747,10 @@ class FlutterWebViewBridgeJavaScriptChannel {
         persist: persist,
         deviceHeaders: deviceHeaders,
       );
+      if (!_isCurrentAuthTransaction(authEpoch, requestData)) {
+        _logStaleAuthMessage('ssoExchange:afterExchange', requestData);
+        return null;
+      }
       // 자동로그인용 refresh 네이티브 저장. (RefreshTokenEvent 는 context 를 SharedPreferences
       // 용으로만 받고 UI 미사용 → async gap 안전)
       await RefreshTokenEvent().process(
@@ -669,6 +765,10 @@ class FlutterWebViewBridgeJavaScriptChannel {
         accessToken: result.accessToken,
         deviceHeaders: deviceHeaders,
       );
+      if (!_isCurrentAuthTransaction(authEpoch, requestData)) {
+        _logStaleAuthMessage('ssoExchange:afterMe', requestData);
+        return null;
+      }
       // ignore: avoid_print
       print(
         '[SsoExchange] OK ${type.value} → AUTH_TOKENS_READY '
@@ -692,6 +792,10 @@ class FlutterWebViewBridgeJavaScriptChannel {
       _cachedSessionAt = DateTime.now();
       return payload;
     } catch (e) {
+      if (!_isCurrentAuthTransaction(authEpoch, requestData)) {
+        _logStaleAuthMessage('ssoExchange:catch', requestData);
+        return null;
+      }
       // ignore: avoid_print
       print('[SsoExchange] FAIL ${type.value}: $e');
       return {
@@ -721,6 +825,16 @@ class FlutterWebViewBridgeJavaScriptChannel {
     final cachedAuthSessionId = cachedData is Map
         ? cachedData['authSessionId'] as String?
         : null;
+    if (_activeAuthSessionId != null &&
+        cachedAuthSessionId != null &&
+        _activeAuthSessionId != cachedAuthSessionId) {
+      // ignore: avoid_print
+      print(
+        '[SsoExchange] session replay skip — active authSessionId mismatch '
+        'active=$_activeAuthSessionId cache=$cachedAuthSessionId',
+      );
+      return null;
+    }
     if (requestedAuthSessionId != null &&
         cachedAuthSessionId != null &&
         requestedAuthSessionId != cachedAuthSessionId) {
