@@ -736,27 +736,17 @@ class FlutterWebViewBridgeJavaScriptChannel {
       return;
     }
     final homeUri = Uri.parse('${currentUri.origin}/');
+    // Use the controller-level navigation instead of JS location.replace.
+    // In iOS WKWebView, app-switch SSO can leave multiple inspectable
+    // WebContent documents around; JS may run in a document that is not the
+    // visible top-level page. loadRequest forces the displayed WebView to
+    // converge on home, where session replay can hydrate auth state.
     // ignore: avoid_print
     print(
-      '[Bridge] NAVIGATE_HOME replace '
+      '[Bridge] NAVIGATE_HOME loadRequest '
       'authSessionId=${authSessionId ?? "null"} url=$homeUri',
     );
-    await _replaceCurrentDocument(homeUri, reason: 'NAVIGATE_HOME');
-  }
-
-  Future<void> _replaceCurrentDocument(
-    Uri uri, {
-    required String reason,
-  }) async {
-    try {
-      await webViewController.runJavaScript(
-        'window.location.replace(${jsonEncode(uri.toString())});',
-      );
-    } catch (e) {
-      // ignore: avoid_print
-      print('[Bridge] $reason replace FAIL; fallback loadRequest: $e');
-      await webViewController.loadRequest(uri);
-    }
+    await webViewController.loadRequest(homeUri);
   }
 
   Future<Map<String, String>> _deviceHeaders() async {
