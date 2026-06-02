@@ -243,6 +243,18 @@ class FlutterWebViewBridgeJavaScriptChannel {
         requestedAuthSessionId != _activeAuthSessionId;
   }
 
+  bool _shouldRevokeNativeSso(dynamic data) =>
+      data is Map && data['revokeNativeSso'] == true;
+
+  String? _normalizedProviderOf(dynamic data) {
+    final raw = _providerOfRequest(data)?.toLowerCase();
+    if (raw == null || raw.isEmpty) return null;
+    if (raw.contains('kakao')) return 'kakao';
+    if (raw.contains('google') || raw.contains('gmail')) return 'google';
+    if (raw.contains('apple')) return 'apple';
+    return null;
+  }
+
   void _logStaleAuthMessage(String reason, dynamic data) {
     // ignore: avoid_print
     print(
@@ -509,6 +521,7 @@ class FlutterWebViewBridgeJavaScriptChannel {
                 context,
                 action: 'delete',
               );
+              await _revokeNativeSsoSessions(data);
               break;
             case WebViewBridgeFeatureType.navigateHome:
               if (_isStaleAuthSessionMessage(data)) {
@@ -662,6 +675,46 @@ class FlutterWebViewBridgeJavaScriptChannel {
       return SsoProvider.apple;
     }
     return SsoProvider.kakao;
+  }
+
+  Future<void> _revokeNativeSsoSessions(dynamic data) async {
+    if (!_shouldRevokeNativeSso(data)) return;
+
+    final provider = _normalizedProviderOf(data);
+    final providers = provider == null
+        ? const ['kakao', 'google', 'apple']
+        : <String>[provider];
+
+    for (final provider in providers) {
+      try {
+        // ignore: avoid_print
+        print('[SsoExchange] native SSO logout start provider=$provider');
+        switch (provider) {
+          case 'kakao':
+            await SignInKakao.shared
+                .process(context, action: 'logout')
+                .timeout(const Duration(seconds: 3));
+            break;
+          case 'google':
+            await SignInGoogle.shared
+                .process(context, action: 'logout')
+                .timeout(const Duration(seconds: 3));
+            break;
+          case 'apple':
+            await SignInApple.shared
+                .process(context, action: 'logout')
+                .timeout(const Duration(seconds: 3));
+            break;
+        }
+        // ignore: avoid_print
+        print('[SsoExchange] native SSO logout OK provider=$provider');
+      } catch (e) {
+        // SDK 세션 정리 실패가 사줘 refresh token 삭제를 되돌리면 안 된다.
+        // 다음 로그인 시도는 새 authSessionId 로 시작하고, 실패 원인은 로그로 남긴다.
+        // ignore: avoid_print
+        print('[SsoExchange] native SSO logout FAIL provider=$provider: $e');
+      }
+    }
   }
 
   Future<void> _navigateHome(dynamic data) async {
