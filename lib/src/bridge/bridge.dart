@@ -192,6 +192,7 @@ class FlutterWebViewBridgeJavaScriptChannel {
     }
     _ssoWatchdog?.cancel();
     _ssoWatchdog = null;
+    _ssoWatchdogB2 = false;
   }
 
   void _onSsoWatchdogTimeout() {
@@ -370,19 +371,26 @@ class FlutterWebViewBridgeJavaScriptChannel {
               );
               break;
             case WebViewBridgeFeatureType.refreshTokenWrite:
-              // web SSO 교환 성공 신호. B2 카카오 로그인 중에는 signin/home 문서의
-              // confirm 만으로 "사용자가 보고 있는" home 문서 로그인 보장을 할 수 없다.
-              // 두 WebContent/document 가 동시에 살아있을 수 있으므로 B2 watchdog 은
-              // confirm 으로 취소하지 않고 timeout 까지 유지해 home load 를 한 번 더 수렴시킨다.
+              // web SSO 교환 성공 신호. B2 카카오 로그인 중 signin 문서 confirm 은
+              // 사용자가 보는 홈 문서 로그인을 보장하지 못하므로 watchdog 을 유지한다.
+              // 반대로 홈 문서 confirm 은 AUTH_TOKENS_READY persist 가 active home 에
+              // 도달했다는 신호이므로 즉시 watchdog 을 종료한다. 이를 유지하면 timeout 이
+              // 추가 home load 를 만들어 Safari Develop inspectable document 가 매회 늘어난다.
               if (_ssoWatchdogB2 && (_ssoWatchdog?.isActive ?? false)) {
-                final confirmKind = _isHomeDocumentConfirm(data)
-                    ? 'home'
-                    : 'non-home';
-                // ignore: avoid_print
-                print(
-                  '[Watchdog] keep B2 watchdog — $confirmKind confirm; '
-                  'wait forced home convergence ${_confirmDebugOf(data)}',
-                );
+                if (_isHomeDocumentConfirm(data)) {
+                  cancelSsoWatchdog('refreshTokenWrite:home');
+                  // ignore: avoid_print
+                  print(
+                    '[Watchdog] home confirm accepted; '
+                    'B2 convergence complete ${_confirmDebugOf(data)}',
+                  );
+                } else {
+                  // ignore: avoid_print
+                  print(
+                    '[Watchdog] keep B2 watchdog — non-home confirm; '
+                    'wait home convergence ${_confirmDebugOf(data)}',
+                  );
+                }
               } else {
                 cancelSsoWatchdog('refreshTokenWrite');
               }
