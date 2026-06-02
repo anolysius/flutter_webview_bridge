@@ -373,6 +373,25 @@ class FlutterWebViewBridgeJavaScriptChannel {
           if (replay != null) sendData = replay;
         }
 
+        // ── SSO watchdog arm (반드시 송신 *전*) ──
+        // ⚠ 송신 후 arm 하면, B2 에서 web 이 AUTH_TOKENS_READY 수신 즉시 보내는 confirm
+        // (REFRESH_TOKEN_WRITE)이 arm *전*에 처리돼 cancel 이 no-op 이 되고, 직후 arm 된 watchdog 가
+        // 성공 로그인에도 false-fire(reload)한다 (실기기 확인 2026-06-02: confirm 36.800 → arm 36.802
+        // → reload 38.805). 송신 전 arm 하면 송신 후 도착하는 confirm 이 정상 cancel → 성공 로그인은
+        // reload 0, jettison-miss(confirm 미수신)만 timeout 후 reload→replay.
+        if (webViewBridgeFeatureType ==
+            WebViewBridgeFeatureType.kakaoSignInLogin) {
+          if (apiBaseUrl == null) {
+            // B1(web 교환): reload 후 raw 재전송용 payload 보관 + watchdog(7s).
+            _lastKakaoSendData = sendData;
+            _armSsoWatchdog();
+          } else if (sendData['type'] ==
+              WebViewBridgeFeatureType.authTokensReady.value) {
+            // B2(네이티브 교환 성공): AUTH_TOKENS_READY 송신 예정. web confirm 미수신 시 reload→replay.
+            _armSsoWatchdog(isB2: true);
+          }
+        }
+
         // Send Data to WebView
         final encoded = jsonEncode(sendData);
         debugPrint(
@@ -383,21 +402,6 @@ class FlutterWebViewBridgeJavaScriptChannel {
           debugPrint(
             '[Bridge] postMessage OK type=${webViewBridgeFeatureType.value} result=$r',
           );
-          // 카카오 로그인 결과 송신 성공 → SSO watchdog arm (jettison 복구).
-          if (webViewBridgeFeatureType ==
-              WebViewBridgeFeatureType.kakaoSignInLogin) {
-            if (apiBaseUrl == null) {
-              // B1(web 교환): reload 후 raw 재전송용 payload 보관 + watchdog(7s).
-              _lastKakaoSendData = sendData;
-              _armSsoWatchdog();
-            } else if (sendData['type'] ==
-                WebViewBridgeFeatureType.authTokensReady.value) {
-              // B2(네이티브 교환 성공): AUTH_TOKENS_READY 송신 완료.
-              // web 가 로그인 확정 시 REFRESH_TOKEN_WRITE 로 confirm → cancel. 미수신(jettison 으로
-              // 새 문서가 못 받음)이면 timeout 후 reload → fresh page REFRESH_TOKEN_READ → 세션 replay.
-              _armSsoWatchdog(isB2: true);
-            }
-          }
         } catch (e) {
           debugPrint(
             '[Bridge] postMessage FAIL type=${webViewBridgeFeatureType.value}: $e',
