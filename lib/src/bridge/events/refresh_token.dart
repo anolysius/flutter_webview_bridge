@@ -28,8 +28,13 @@ class RefreshTokenEvent {
     } else if (action == 'write') {
       sendData['type'] = WebViewBridgeFeatureType.refreshTokenWrite.value;
 
-      // Set the refresh token
-      final refreshToken = data as String?;
+      // Set the refresh token. Newer web clients send confirm metadata together
+      // with the token so native can tell which document confirmed SSO.
+      final refreshToken = data is String
+          ? data
+          : data is Map
+          ? (data['refreshToken'] ?? data['token']) as String?
+          : null;
       if (refreshToken != null) {
         final r = await prefs.setString(kRefreshTokenKey, refreshToken);
         if (r == true) {

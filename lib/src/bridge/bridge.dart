@@ -92,9 +92,9 @@ class FlutterWebViewBridgeJavaScriptChannel {
   // reload 후 web 의 resume 은 내부 fake postMessage(window.callbackPostMessage)라 native 로
   // 다시 오지 않으므로 재-arm 되지 않는다 → 한 번의 카카오 로그인당 reload 최대 1회.
   static const Duration _ssoWatchdogTimeout = Duration(seconds: 7);
-  // B2(네이티브 교환) 경로 watchdog timeout — web 로그인 확정(REFRESH_TOKEN_WRITE)은 보통 ~1s 내
-  // 도착하므로 2s 면 충분. jettison 으로 새 문서가 AUTH_TOKENS_READY 를 놓친 경우만 미수신 → reload.
-  static const Duration _ssoWatchdogTimeoutB2 = Duration(seconds: 2);
+  // B2(네이티브 교환) 경로 watchdog timeout — signin 문서 confirm 이후 native home load 와
+  // fresh home document replay confirm 까지 허용하되, home 이 끝내 갱신되지 않으면 복구.
+  static const Duration _ssoWatchdogTimeoutB2 = Duration(seconds: 4);
   Timer? _ssoWatchdog;
   int _ssoReloadCount = 0;
   // B2 watchdog 여부 — timeout 시 raw 재전송(B1) 대신 reload→세션 replay(B2) 로 복구.
@@ -123,6 +123,35 @@ class FlutterWebViewBridgeJavaScriptChannel {
 
   String? _providerOfRequest(dynamic data) =>
       data is Map ? data['provider'] as String? : null;
+
+  String? _stringFieldOf(dynamic data, String key) =>
+      data is Map ? data[key] as String? : null;
+
+  bool _boolFieldOf(dynamic data, String key) =>
+      data is Map && data[key] == true;
+
+  bool _isHomePath(String? pathname) {
+    if (pathname == null || pathname.isEmpty) return false;
+    final uri = Uri.tryParse(pathname);
+    final path = uri?.path ?? pathname.split('?').first.split('#').first;
+    if (path == '/') return true;
+    final segments = path.split('/').where((s) => s.isNotEmpty).toList();
+    return segments.length == 1 &&
+        const {'ko', 'en', 'ja'}.contains(segments.first);
+  }
+
+  bool _isHomeDocumentConfirm(dynamic data) =>
+      _boolFieldOf(data, 'isHomeDocument') ||
+      _isHomePath(_stringFieldOf(data, 'pathname')) ||
+      _isHomePath(_stringFieldOf(data, 'webPathname'));
+
+  String _confirmDebugOf(dynamic data) {
+    if (data is! Map) return 'legacy-string';
+    return 'documentId=${data['documentId'] ?? "null"} '
+        'pathname=${data['pathname'] ?? data['webPathname'] ?? "null"} '
+        'authSessionId=${data['authSessionId'] ?? "null"} '
+        'isHomeDocument=${data['isHomeDocument'] ?? "null"}';
+  }
 
   void _clearSessionReplay(String reason) {
     final hadPayload = _cachedSessionPayload != null;
@@ -181,10 +210,38 @@ class FlutterWebViewBridgeJavaScriptChannel {
       '(${_ssoWatchdogB2 ? "B2 replay" : "B1 resend"})',
     );
     try {
-      webViewController.reload();
+      if (_ssoWatchdogB2) {
+        unawaited(_loadHomeForSsoRecovery());
+      } else {
+        webViewController.reload();
+      }
     } catch (e) {
       // ignore: avoid_print
       print('[Watchdog] reload FAIL: $e');
+    }
+  }
+
+  Future<void> _loadHomeForSsoRecovery() async {
+    try {
+      final rawCurrentUrl = await webViewController.currentUrl();
+      if (rawCurrentUrl == null || rawCurrentUrl.isEmpty) {
+        await webViewController.reload();
+        return;
+      }
+      final currentUri = Uri.tryParse(rawCurrentUrl);
+      if (currentUri == null ||
+          (currentUri.scheme != 'https' && currentUri.scheme != 'http') ||
+          currentUri.host.isEmpty) {
+        await webViewController.reload();
+        return;
+      }
+      final homeUri = Uri.parse('${currentUri.origin}/');
+      // ignore: avoid_print
+      print('[Watchdog] load home for B2 recovery url=$homeUri');
+      await webViewController.loadRequest(homeUri);
+    } catch (e) {
+      // ignore: avoid_print
+      print('[Watchdog] load home FAIL: $e');
     }
   }
 
@@ -313,8 +370,22 @@ class FlutterWebViewBridgeJavaScriptChannel {
               );
               break;
             case WebViewBridgeFeatureType.refreshTokenWrite:
-              // web SSO 교환 성공 신호 — watchdog 해제 (reload 불필요).
-              cancelSsoWatchdog('refreshTokenWrite');
+              // web SSO 교환 성공 신호. B2 카카오 로그인 중에는 signin 문서의
+              // confirm 만으로 home 문서 로그인 보장을 할 수 없으므로 home document
+              // confirm 일 때만 watchdog 을 해제한다.
+              if (_ssoWatchdogB2 && (_ssoWatchdog?.isActive ?? false)) {
+                if (_isHomeDocumentConfirm(data)) {
+                  cancelSsoWatchdog('refreshTokenWrite:home');
+                } else {
+                  // ignore: avoid_print
+                  print(
+                    '[Watchdog] keep B2 watchdog — non-home confirm '
+                    '${_confirmDebugOf(data)}',
+                  );
+                }
+              } else {
+                cancelSsoWatchdog('refreshTokenWrite');
+              }
               sendData = await RefreshTokenEvent().process(
                 context,
                 action: 'write',
