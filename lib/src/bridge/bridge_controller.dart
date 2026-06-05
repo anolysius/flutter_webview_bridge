@@ -12,6 +12,10 @@ class WebViewBridgeController {
   Completer<void>? _initCompleter;
   final Queue<_QueuedRequest> _requestQueue = Queue<_QueuedRequest>();
 
+  /// PUSH_TOKEN payload 에 동봉할 서비스 국가 (APP-300 R6 — 푸시 segmentation).
+  /// init 시 주입. 미주입=null → payload 에서 'KR' 기본값.
+  String? _serviceCountry;
+
   void initFlutterWebViewBridgeJavaScriptChannel(
     BuildContext context,
     WebViewController webViewController, {
@@ -21,6 +25,7 @@ class WebViewBridgeController {
     String? serviceCountry,
     void Function(String requestedCountry)? onServiceCountryChange,
   }) {
+    _serviceCountry = serviceCountry;
     if (_channel != null) {
       // WebView 재생성 시 channel handler 는 유지, controller 만 swap.
       // addJavaScriptChannel 중복 호출은 stale handler 위험만 키우므로 회피.
@@ -86,6 +91,8 @@ class WebViewBridgeController {
             'token': token,
             'platform': Platform.isIOS ? 'ios' : 'android',
             'isRefresh': isRefresh,
+            // APP-300 R6: 푸시 country segmentation (서버 등록 시 활용). KR 기본값.
+            'serviceCountry': _serviceCountry ?? 'KR',
           },
         };
         await _channel!.runJavaScriptReturningResultPostMessage(
