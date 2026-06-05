@@ -22,6 +22,7 @@ import 'events/open_in_app_browser.dart';
 import 'events/photo_library_access.dart';
 import 'events/push_token.dart';
 import 'events/refresh_token.dart';
+import 'events/service_country.dart';
 import 'events/set_clipboard.dart';
 import 'events/sign_in_apple.dart';
 import 'events/sign_in_google.dart';
@@ -39,6 +40,13 @@ class FlutterWebViewBridgeJavaScriptChannel {
   /// 미주입(null) 시 기존 경로(SIGN_IN_LOGIN → web 교환 + watchdog) fallback.
   final String? apiBaseUrl;
 
+  /// 서비스 국가 코드 (APP-300 R5 — 'KR' / 'GLOBAL'). 미주입(null)=KR/레거시 동작.
+  /// RefreshToken 키 + SSO domainType 분기에 사용. KR/null 은 현행과 byte-identical.
+  final String? serviceCountry;
+
+  /// 웹의 SERVICE_COUNTRY_CHANGE 수신 시 앱이 override+reload 하도록 위임하는 콜백.
+  final void Function(String requestedCountry)? onServiceCountryChange;
+
   FlutterWebViewBridgeJavaScriptChannel({
     required this.context,
     required this.webViewController,
@@ -46,6 +54,8 @@ class FlutterWebViewBridgeJavaScriptChannel {
     required this.googleServerClientId,
     required this.kakaoNativeAppKey,
     this.apiBaseUrl,
+    this.serviceCountry,
+    this.onServiceCountryChange,
   }) {
     if (googleServerClientId != null) {
       SignInGoogle.shared.initialize(
@@ -469,6 +479,7 @@ class FlutterWebViewBridgeJavaScriptChannel {
               sendData = await RefreshTokenEvent().process(
                 context,
                 action: 'read',
+                serviceCountry: serviceCountry,
               );
               break;
             case WebViewBridgeFeatureType.refreshTokenWrite:
@@ -503,6 +514,7 @@ class FlutterWebViewBridgeJavaScriptChannel {
                 context,
                 action: 'write',
                 data: data,
+                serviceCountry: serviceCountry,
               );
               break;
             case WebViewBridgeFeatureType.refreshTokenDelete:
@@ -520,9 +532,23 @@ class FlutterWebViewBridgeJavaScriptChannel {
               sendData = await RefreshTokenEvent().process(
                 context,
                 action: 'delete',
+                serviceCountry: serviceCountry,
               );
               await _revokeNativeSsoSessions(data);
               break;
+            case WebViewBridgeFeatureType.serviceCountryQuery:
+              // 웹이 현재 서비스 국가 조회 → 주입된 serviceCountry 즉시 응답.
+              sendData = ServiceCountryEvent().queryResponse(serviceCountry);
+              break;
+            case WebViewBridgeFeatureType.serviceCountryChange:
+              // 웹의 국가 변경 요청 → 앱 콜백으로 위임(override + reload 는 앱 책임).
+              final requested = ServiceCountryEvent().parseRequestedCountry(
+                data,
+              );
+              if (requested != null) {
+                onServiceCountryChange?.call(requested);
+              }
+              return;
             case WebViewBridgeFeatureType.navigateHome:
               if (_isStaleAuthSessionMessage(data)) {
                 _logStaleAuthMessage('navigateHome', data);
@@ -781,7 +807,14 @@ class FlutterWebViewBridgeJavaScriptChannel {
     final authSessionId = _authSessionIdOf(requestData);
     final requestProvider = _providerOfRequest(requestData);
     try {
-      final sso = SsoExchange(apiBaseUrl: apiBaseUrl!);
+      // domainType: KR(또는 null)=sazo-korea-shop(현행) / GLOBAL=sazo-global-shop
+      // (웹 배포 계약 09-env-runtime 확인값). KR 경로 byte-identical.
+      final sso = SsoExchange(
+        apiBaseUrl: apiBaseUrl!,
+        domainType: serviceCountry == 'GLOBAL'
+            ? 'sazo-global-shop'
+            : 'sazo-korea-shop',
+      );
       final deviceHeaders = await _deviceHeaders();
       final result = await sso.exchange(
         provider: _providerOf(type),
@@ -801,6 +834,7 @@ class FlutterWebViewBridgeJavaScriptChannel {
         context,
         action: 'write',
         data: result.refreshToken,
+        serviceCountry: serviceCountry,
       );
       // me 도 네이티브 fetch — web me fetch 가 카카오 throttle 로 hang 하는 것 우회.
       // 실패는 non-fatal(me 생략 → web 이 기존 fetch 로 fallback).

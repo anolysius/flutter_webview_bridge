@@ -18,6 +18,8 @@ class WebViewBridgeController {
     required String? googleServerClientId,
     required String? kakaoNativeAppKey,
     String? apiBaseUrl,
+    String? serviceCountry,
+    void Function(String requestedCountry)? onServiceCountryChange,
   }) {
     if (_channel != null) {
       // WebView 재생성 시 channel handler 는 유지, controller 만 swap.
@@ -34,6 +36,8 @@ class WebViewBridgeController {
       googleServerClientId: googleServerClientId,
       kakaoNativeAppKey: kakaoNativeAppKey,
       apiBaseUrl: apiBaseUrl,
+      serviceCountry: serviceCountry,
+      onServiceCountryChange: onServiceCountryChange,
     );
     _channel!.addJavaScriptChannel();
 
