@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:collection';
 import 'dart:convert';
 
 import 'package:flutter/material.dart';
@@ -46,6 +47,12 @@ class FlutterWebViewBridgeJavaScriptChannel {
 
   /// 웹의 SERVICE_COUNTRY_CHANGE 수신 시 앱이 override+reload 하도록 위임하는 콜백.
   final void Function(String requestedCountry)? onServiceCountryChange;
+  bool _isDisposed = false;
+  bool _pendingSsoRecovery = false;
+  AppLifecycleState _appLifecycleState = AppLifecycleState.resumed;
+  final Queue<String> _pendingPostMessages = Queue<String>();
+  bool _isFlushingPendingPostMessages = false;
+  static const int _maxPendingPostMessages = 20;
 
   FlutterWebViewBridgeJavaScriptChannel({
     required this.context,
@@ -68,6 +75,8 @@ class FlutterWebViewBridgeJavaScriptChannel {
   }
 
   Future<void> addJavaScriptChannel() {
+    if (_isDisposed) return Future<void>.value();
+
     return webViewController.addJavaScriptChannel(
       channelName,
       onMessageReceived: onMessageReceived,
@@ -75,6 +84,8 @@ class FlutterWebViewBridgeJavaScriptChannel {
   }
 
   Future<void> removeJavaScriptChannel() {
+    if (_isDisposed) return Future<void>.value();
+
     return webViewController.removeJavaScriptChannel(channelName);
   }
 
@@ -84,9 +95,43 @@ class FlutterWebViewBridgeJavaScriptChannel {
     WebViewController controller, {
     BuildContext? newContext,
   }) {
+    if (_isDisposed) return;
+
     webViewController = controller;
     if (newContext != null) {
       context = newContext;
+    }
+  }
+
+  void updateAppLifecycleState(AppLifecycleState state) {
+    if (_isDisposed) return;
+
+    _appLifecycleState = state;
+    if (_isAppResumed) {
+      unawaited(_runResumedPendingWork());
+    }
+  }
+
+  void dispose() {
+    _isDisposed = true;
+    _pendingSsoRecovery = false;
+    _pendingPostMessages.clear();
+    cancelSsoWatchdog('channel-dispose');
+  }
+
+  bool get _isAppResumed => _appLifecycleState == AppLifecycleState.resumed;
+
+  bool get _canTouchWebView => !_isDisposed && context.mounted;
+
+  bool get _canRunLifecycleSensitiveWebViewWork =>
+      _canTouchWebView && _isAppResumed;
+
+  Future<void> _runResumedPendingWork() async {
+    await _flushPendingPostMessages();
+
+    if (_pendingSsoRecovery && _canRunLifecycleSensitiveWebViewWork) {
+      _pendingSsoRecovery = false;
+      await _runSsoWatchdogRecovery();
     }
   }
 
@@ -301,6 +346,26 @@ class FlutterWebViewBridgeJavaScriptChannel {
 
   void _onSsoWatchdogTimeout() {
     _ssoWatchdog = null;
+    if (!_canTouchWebView) return;
+
+    if (!_isAppResumed) {
+      _pendingSsoRecovery = true;
+      // ignore: avoid_print
+      print(
+        '[Watchdog] recovery deferred — appLifecycle=${_appLifecycleState.name}',
+      );
+      return;
+    }
+
+    unawaited(_runSsoWatchdogRecovery());
+  }
+
+  Future<void> _runSsoWatchdogRecovery() async {
+    if (!_canRunLifecycleSensitiveWebViewWork) {
+      _pendingSsoRecovery = !_isDisposed && context.mounted;
+      return;
+    }
+
     _ssoReloadCount += 1;
     // B1(web 교환): reload 후 fresh page 에 카카오 raw payload 재전송 (web 교환 재개).
     // B2(네이티브 교환): reload 후 fresh page 가 REFRESH_TOKEN_READ → 세션 replay 로 로그인 복원
@@ -316,9 +381,9 @@ class FlutterWebViewBridgeJavaScriptChannel {
     );
     try {
       if (_ssoWatchdogB2) {
-        unawaited(_loadHomeForSsoRecovery());
+        await _loadHomeForSsoRecovery();
       } else {
-        webViewController.reload();
+        await webViewController.reload();
       }
     } catch (e) {
       // ignore: avoid_print
@@ -327,8 +392,14 @@ class FlutterWebViewBridgeJavaScriptChannel {
   }
 
   Future<void> _loadHomeForSsoRecovery() async {
+    if (!_canRunLifecycleSensitiveWebViewWork) {
+      _pendingSsoRecovery = !_isDisposed && context.mounted;
+      return;
+    }
+
     try {
       final rawCurrentUrl = await webViewController.currentUrl();
+      if (!_canRunLifecycleSensitiveWebViewWork) return;
       if (rawCurrentUrl == null || rawCurrentUrl.isEmpty) {
         await webViewController.reload();
         return;
@@ -343,6 +414,7 @@ class FlutterWebViewBridgeJavaScriptChannel {
       final homeUri = Uri.parse('${currentUri.origin}/');
       // ignore: avoid_print
       print('[Watchdog] load home for B2 recovery url=$homeUri');
+      if (!_canRunLifecycleSensitiveWebViewWork) return;
       await webViewController.loadRequest(homeUri);
     } catch (e) {
       // ignore: avoid_print
@@ -354,12 +426,14 @@ class FlutterWebViewBridgeJavaScriptChannel {
   /// 재-arm 하지 않음 → reload 는 카카오 로그인당 최대 1회 (구조적 loop-guard).
   /// 재전송 후의 hang 은 fresh page(타이머 살아있음)의 web timeout/retry 가 흡수.
   Future<void> _resendKakaoLogin() async {
+    if (!_canTouchWebView) return;
+
     final data = _lastKakaoSendData;
     if (data == null) return;
     // ignore: avoid_print
     print('[Watchdog] resend KAKAO_SIGN_IN_LOGIN (reload 후 fresh page 재전송)');
     try {
-      await runJavaScriptReturningResultPostMessage(jsonEncode(data));
+      await runJavaScriptPostMessage(jsonEncode(data));
     } catch (e) {
       // ignore: avoid_print
       print('[Watchdog] resend FAIL: $e');
@@ -580,7 +654,7 @@ class FlutterWebViewBridgeJavaScriptChannel {
           if (e is AuthError) {
             _invalidateAuthTransaction('authError');
             try {
-              await runJavaScriptReturningResultPostMessage(
+              await runJavaScriptPostMessage(
                 jsonEncode({
                   'type': WebViewBridgeFeatureType.authError.value,
                   'data': {'code': e.code, 'message': e.message},
@@ -591,7 +665,7 @@ class FlutterWebViewBridgeJavaScriptChannel {
           }
           // 일반 exception — silent drop 방지: webview 측이 응답을 기다리고 있으므로 error payload 1건 전송 시도
           try {
-            await runJavaScriptReturningResultPostMessage(
+            await runJavaScriptPostMessage(
               jsonEncode({
                 'type': webViewBridgeFeatureType.value,
                 'error': e.toString(),
@@ -667,9 +741,9 @@ class FlutterWebViewBridgeJavaScriptChannel {
           '[Bridge] postMessage type=${webViewBridgeFeatureType.value} len=${encoded.length}',
         );
         try {
-          final r = await runJavaScriptReturningResultPostMessage(encoded);
+          await runJavaScriptPostMessage(encoded);
           debugPrint(
-            '[Bridge] postMessage OK type=${webViewBridgeFeatureType.value} result=$r',
+            '[Bridge] postMessage OK type=${webViewBridgeFeatureType.value}',
           );
         } catch (e) {
           debugPrint(
@@ -744,8 +818,11 @@ class FlutterWebViewBridgeJavaScriptChannel {
   }
 
   Future<void> _navigateHome(dynamic data) async {
+    if (!_canRunLifecycleSensitiveWebViewWork) return;
+
     final authSessionId = _authSessionIdOf(data);
     final rawCurrentUrl = await webViewController.currentUrl();
+    if (!_canRunLifecycleSensitiveWebViewWork) return;
     if (rawCurrentUrl == null || rawCurrentUrl.isEmpty) {
       // ignore: avoid_print
       print('[Bridge] NAVIGATE_HOME skipped — currentUrl missing');
@@ -772,6 +849,7 @@ class FlutterWebViewBridgeJavaScriptChannel {
       '[Bridge] NAVIGATE_HOME loadRequest '
       'authSessionId=${authSessionId ?? "null"} url=$homeUri',
     );
+    if (!_canRunLifecycleSensitiveWebViewWork) return;
     await webViewController.loadRequest(homeUri);
   }
 
@@ -931,41 +1009,96 @@ class FlutterWebViewBridgeJavaScriptChannel {
   }
   // ───────────────────────────────────────────────────────────────────────────
 
-  Future<Object> runJavaScriptReturningResultAppState(String jsonData) async {
-    // JSON 문자열에서 특수문자 이스케이프 처리
-    final escapedData = jsonData.replaceAll("'", "\\'").replaceAll('\n', '\\n');
+  Future<void> runJavaScriptAppState(String jsonData) async {
+    if (!_canRunLifecycleSensitiveWebViewWork) return;
 
-    return webViewController.runJavaScriptReturningResult('''
-        (function() {
-          if (typeof window.callbackAppState === 'function') {
-            window.callbackAppState('$escapedData');
-            return 'success';
-          } else if (typeof document.callbackAppState === 'function') {
-            document.callbackAppState('$escapedData');
-            return 'success';
-          }
-          throw new Error('callbackAppState function not available');
-        })()
-      ''');
+    await _runBridgeCallback(
+      callbackName: 'callbackAppState',
+      jsonData: jsonData,
+    );
   }
 
-  Future<Object> runJavaScriptReturningResultPostMessage(
-    String jsonData,
-  ) async {
-    // JSON 문자열에서 특수문자 이스케이프 처리
-    final escapedData = jsonData.replaceAll("'", "\\'").replaceAll('\n', '\\n');
+  Future<void> runJavaScriptReturningResultAppState(String jsonData) {
+    return runJavaScriptAppState(jsonData);
+  }
 
-    return webViewController.runJavaScriptReturningResult('''
+  Future<void> runJavaScriptPostMessage(String jsonData) async {
+    if (!_canTouchWebView) return;
+
+    if (!_isAppResumed) {
+      _enqueuePendingPostMessage(jsonData);
+      return;
+    }
+
+    await _sendPostMessageNow(jsonData);
+  }
+
+  Future<void> runJavaScriptReturningResultPostMessage(String jsonData) {
+    return runJavaScriptPostMessage(jsonData);
+  }
+
+  void _enqueuePendingPostMessage(String jsonData) {
+    if (_pendingPostMessages.length >= _maxPendingPostMessages) {
+      _pendingPostMessages.removeFirst();
+    }
+    _pendingPostMessages.add(jsonData);
+    debugPrint(
+      '[Bridge] postMessage queued appLifecycle=${_appLifecycleState.name} '
+      'queue=${_pendingPostMessages.length}',
+    );
+  }
+
+  Future<void> _flushPendingPostMessages() async {
+    if (_isFlushingPendingPostMessages ||
+        !_canRunLifecycleSensitiveWebViewWork) {
+      return;
+    }
+
+    _isFlushingPendingPostMessages = true;
+    try {
+      while (_pendingPostMessages.isNotEmpty &&
+          _canRunLifecycleSensitiveWebViewWork) {
+        final jsonData = _pendingPostMessages.removeFirst();
+        await _sendPostMessageNow(jsonData);
+      }
+    } finally {
+      _isFlushingPendingPostMessages = false;
+    }
+  }
+
+  Future<void> _sendPostMessageNow(String jsonData) {
+    return _runBridgeCallback(
+      callbackName: 'callbackPostMessage',
+      jsonData: jsonData,
+    );
+  }
+
+  Future<void> _runBridgeCallback({
+    required String callbackName,
+    required String jsonData,
+  }) async {
+    if (!_canTouchWebView) return;
+
+    final payloadLiteral = jsonEncode(jsonData);
+    try {
+      await webViewController.runJavaScript('''
         (function() {
-          if (typeof window.callbackPostMessage === 'function') {
-            window.callbackPostMessage('$escapedData');
-            return 'success';
-          } else if (typeof document.callbackPostMessage === 'function') {
-            document.callbackPostMessage('$escapedData');
-            return 'success';
-          }
-          throw new Error('callbackPostMessage function not available');
-        })()
+          try {
+            var payload = $payloadLiteral;
+            if (typeof window.$callbackName === 'function') {
+              window.$callbackName(payload);
+              return;
+            }
+            if (typeof document.$callbackName === 'function') {
+              document.$callbackName(payload);
+            }
+          } catch (_) {}
+        })();
       ''');
+    } catch (e) {
+      if (!_isDisposed) {
+        debugPrint('[Bridge] $callbackName JS skipped: $e');
+      }
+    }
   }
 }
