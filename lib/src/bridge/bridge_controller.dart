@@ -11,6 +11,8 @@ class WebViewBridgeController {
   FlutterWebViewBridgeJavaScriptChannel? _channel;
   Completer<void>? _initCompleter;
   final Queue<_QueuedRequest> _requestQueue = Queue<_QueuedRequest>();
+  bool _isTerminated = false;
+  AppLifecycleState _appLifecycleState = AppLifecycleState.resumed;
 
   /// PUSH_TOKEN payload 에 동봉할 서비스 국가 (APP-300 R6 — 푸시 segmentation).
   /// init 시 주입. 미주입=null → payload 에서 'KR' 기본값.
@@ -25,12 +27,14 @@ class WebViewBridgeController {
     String? serviceCountry,
     void Function(String requestedCountry)? onServiceCountryChange,
   }) {
+    _isTerminated = false;
     _serviceCountry = serviceCountry;
     if (_channel != null) {
       // WebView 재생성 시 channel handler 는 유지, controller 만 swap.
       // addJavaScriptChannel 중복 호출은 stale handler 위험만 키우므로 회피.
       _channel!.updateWebViewController(webViewController, newContext: context);
-      _initCompleter?.complete();
+      _channel!.updateAppLifecycleState(_appLifecycleState);
+      _completeInitialization();
       _processQueue();
       return;
     }
@@ -44,37 +48,51 @@ class WebViewBridgeController {
       serviceCountry: serviceCountry,
       onServiceCountryChange: onServiceCountryChange,
     );
+    _channel!.updateAppLifecycleState(_appLifecycleState);
     _channel!.addJavaScriptChannel();
 
-    _initCompleter?.complete();
+    _completeInitialization();
 
     _processQueue();
   }
 
-  Future<Object?> runJavaScriptReturningResultAppState(
-    AppLifecycleState state,
-  ) async {
+  void handleAppLifecycleState(AppLifecycleState state) {
+    if (_isTerminated) return;
+
+    _appLifecycleState = state;
+    _channel?.updateAppLifecycleState(state);
+
+    if (state == AppLifecycleState.resumed) {
+      unawaited(runJavaScriptAppState(state));
+    }
+  }
+
+  Future<void> runJavaScriptAppState(AppLifecycleState state) async {
+    if (_isTerminated || state != AppLifecycleState.resumed) return;
+
     return _executeOrQueue(
-      operation: () {
+      operation: () async {
         Map<String, Object?> sendData = {
           'type': WebViewBridgeFeatureType.appStateChange.value,
           'data': {'state': state.name},
         };
-        return _channel!.runJavaScriptReturningResultAppState(
-          jsonEncode(sendData),
-        );
+        await _channel!.runJavaScriptAppState(jsonEncode(sendData));
       },
     );
+  }
+
+  Future<void> runJavaScriptReturningResultAppState(AppLifecycleState state) {
+    return runJavaScriptAppState(state);
   }
 
   Future<void> runJavaScriptReturningResultPostMessage(
     Map<String, Object?> sendData,
   ) async {
+    if (_isTerminated) return;
+
     return _executeOrQueue(
       operation: () async {
-        await _channel!.runJavaScriptReturningResultPostMessage(
-          jsonEncode(sendData),
-        );
+        await _channel!.runJavaScriptPostMessage(jsonEncode(sendData));
       },
     );
   }
@@ -83,6 +101,8 @@ class WebViewBridgeController {
     String token, {
     required bool isRefresh,
   }) async {
+    if (_isTerminated) return;
+
     return _executeOrQueue(
       operation: () async {
         Map<String, Object?> sendData = {
@@ -95,9 +115,7 @@ class WebViewBridgeController {
             'serviceCountry': _serviceCountry ?? 'KR',
           },
         };
-        await _channel!.runJavaScriptReturningResultPostMessage(
-          jsonEncode(sendData),
-        );
+        await _channel!.runJavaScriptPostMessage(jsonEncode(sendData));
       },
     );
   }
@@ -105,6 +123,10 @@ class WebViewBridgeController {
   Future<T> _executeOrQueue<T>({
     required Future<T> Function() operation,
   }) async {
+    if (_isTerminated) {
+      throw StateError('WebViewBridgeController is terminated');
+    }
+
     if (_channel == null) {
       final completer = Completer<T>();
       _requestQueue.add(
@@ -122,10 +144,20 @@ class WebViewBridgeController {
     await _initCompleter!.future;
   }
 
+  void _completeInitialization() {
+    final initCompleter = _initCompleter;
+    if (initCompleter != null && !initCompleter.isCompleted) {
+      initCompleter.complete();
+    }
+  }
+
   Future<void> _processQueue() async {
     while (_requestQueue.isNotEmpty) {
       final request = _requestQueue.removeFirst();
       try {
+        if (_isTerminated) {
+          throw StateError('WebViewBridgeController is terminated');
+        }
         final result = await request.operation();
         request.completer.complete(result);
       } catch (error) {
@@ -145,8 +177,9 @@ class WebViewBridgeController {
   /// [forceTerminate]=true 를 명시해 큐의 Completer 들을 error 로 종결할 것.
   void dispose({bool forceTerminate = false}) {
     // SSO hang watchdog 정리 — 채널 teardown 후 stale controller reload 방지.
-    _channel?.cancelSsoWatchdog('controller-dispose');
+    _channel?.dispose();
     if (forceTerminate) {
+      _isTerminated = true;
       while (_requestQueue.isNotEmpty) {
         _requestQueue.removeFirst().completer.completeError(
           Exception(
@@ -154,9 +187,17 @@ class WebViewBridgeController {
           ),
         );
       }
+      final initCompleter = _initCompleter;
+      if (initCompleter != null && !initCompleter.isCompleted) {
+        initCompleter.completeError(
+          Exception('WebViewBridgeController terminated before initialization'),
+        );
+      }
     }
     _channel = null;
-    _initCompleter = null;
+    if (forceTerminate || _requestQueue.isEmpty) {
+      _initCompleter = null;
+    }
   }
 }
 
