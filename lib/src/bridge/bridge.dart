@@ -115,6 +115,14 @@ class FlutterWebViewBridgeJavaScriptChannel {
     _serviceCountry = code;
   }
 
+  /// 명시적 로그아웃(staff 서비스 국가 전환 등) 시 in-memory SSO transient 상태를 정리한다.
+  /// = SSO replay 캐시(`_cachedSessionPayload`) + watchdog + kakao resend.
+  ///
+  /// persistent refresh token([clearAllRefreshTokens])만 지우면, 전환 reload 후 새 문서의
+  /// REFRESH_TOKEN_READ 에 bridge 가 TTL(120s) 내 캐시를 replay 해 재인증되어 로그아웃이
+  /// 안 된다. 전환 경로에서 reload 전에 호출해 replay window 를 제거한다.
+  void clearSsoTransientState(String reason) => _clearSsoTransientState(reason);
+
   void updateAppLifecycleState(AppLifecycleState state) {
     if (_isDisposed) return;
 

@@ -134,6 +134,12 @@ class WebViewBridgeController {
     _channel?.updateServiceCountry(code);
   }
 
+  /// staff 서비스 국가 전환 시 채널의 in-memory SSO transient 상태(replay 캐시 등) 정리.
+  /// [clearAllRefreshTokens](persistent)와 짝 — 전환 reload 후 bridge 가 replay 로 재인증해
+  /// 로그아웃이 안 되는 것을 막는다. 채널 미초기화 시 no-op.
+  void clearSsoTransientState() =>
+      _channel?.clearSsoTransientState('service-country-switch');
+
   Future<T> _executeOrQueue<T>({
     required Future<T> Function() operation,
   }) async {
