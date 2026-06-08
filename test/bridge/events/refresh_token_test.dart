@@ -127,4 +127,37 @@ void main() {
       );
     });
   });
+
+  group('clearAllRefreshTokens — staff 국가 전환 = 완전 로그아웃', () {
+    test('양쪽 키(KR 레거시 + GLOBAL) 모두 삭제', () async {
+      SharedPreferences.setMockInitialValues({
+        'flutter_webview_bridge_refresh_token': 'kr-token',
+        'flutter_webview_bridge_refresh_token__global': 'global-token',
+      });
+
+      await clearAllRefreshTokens();
+
+      final prefs = await SharedPreferences.getInstance();
+      expect(prefs.getString('flutter_webview_bridge_refresh_token'), isNull);
+      expect(
+        prefs.getString('flutter_webview_bridge_refresh_token__global'),
+        isNull,
+      );
+    });
+
+    test('한쪽만 있어도 에러 없이 동작 (멱등)', () async {
+      SharedPreferences.setMockInitialValues({
+        'flutter_webview_bridge_refresh_token': 'kr-token',
+      });
+
+      await clearAllRefreshTokens();
+
+      final prefs = await SharedPreferences.getInstance();
+      expect(prefs.getString('flutter_webview_bridge_refresh_token'), isNull);
+      expect(
+        prefs.getString('flutter_webview_bridge_refresh_token__global'),
+        isNull,
+      );
+    });
+  });
 }

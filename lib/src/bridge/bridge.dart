@@ -43,7 +43,11 @@ class FlutterWebViewBridgeJavaScriptChannel {
 
   /// 서비스 국가 코드 (APP-300 R5 — 'KR' / 'GLOBAL'). 미주입(null)=KR/레거시 동작.
   /// RefreshToken 키 + SSO domainType 분기에 사용. KR/null 은 현행과 byte-identical.
-  final String? serviceCountry;
+  ///
+  /// staff 국가 전환(SERVICE_COUNTRY_CHANGE) 시 [updateServiceCountry] 로 세션 내 갱신 →
+  /// 재시작 없이 refresh-key/domainType 가 새 국가를 반영한다.
+  String? _serviceCountry;
+  String? get serviceCountry => _serviceCountry;
 
   /// 웹의 SERVICE_COUNTRY_CHANGE 수신 시 앱이 override+reload 하도록 위임하는 콜백.
   final void Function(String requestedCountry)? onServiceCountryChange;
@@ -61,9 +65,9 @@ class FlutterWebViewBridgeJavaScriptChannel {
     required this.googleServerClientId,
     required this.kakaoNativeAppKey,
     this.apiBaseUrl,
-    this.serviceCountry,
+    String? serviceCountry,
     this.onServiceCountryChange,
-  }) {
+  }) : _serviceCountry = serviceCountry {
     if (googleServerClientId != null) {
       SignInGoogle.shared.initialize(
         googleServerClientId: googleServerClientId,
@@ -101,6 +105,14 @@ class FlutterWebViewBridgeJavaScriptChannel {
     if (newContext != null) {
       context = newContext;
     }
+  }
+
+  /// staff 서비스 국가 전환 시 세션 내 serviceCountry 갱신 (재시작 불요).
+  /// 이후 RefreshToken 키 분기(refreshTokenRead/Write/Delete) 와 SSO domainType 가
+  /// 즉시 새 국가를 반영한다. 채널 재생성 없이 동작.
+  void updateServiceCountry(String? code) {
+    if (_isDisposed) return;
+    _serviceCountry = code;
   }
 
   void updateAppLifecycleState(AppLifecycleState state) {

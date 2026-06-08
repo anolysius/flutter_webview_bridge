@@ -7,6 +7,8 @@ import 'package:flutter/cupertino.dart';
 import 'package:flutter_webview_bridge/flutter_webview_bridge.dart';
 import 'package:webview_flutter/webview_flutter.dart';
 
+import 'events/refresh_token.dart' as refresh_token;
+
 class WebViewBridgeController {
   FlutterWebViewBridgeJavaScriptChannel? _channel;
   Completer<void>? _initCompleter;
@@ -118,6 +120,18 @@ class WebViewBridgeController {
         await _channel!.runJavaScriptPostMessage(jsonEncode(sendData));
       },
     );
+  }
+
+  /// staff 서비스 국가 전환 시 양쪽(KR 레거시 + GLOBAL `__global`) RefreshToken 일괄 삭제.
+  /// 전환 = 완전 로그아웃 — 전환 후 어느 도메인도 자동로그인되지 않게 한다.
+  /// SharedPreferences 직접 조작이라 채널 미초기화/terminated 와 무관하게 동작.
+  Future<void> clearAllRefreshTokens() => refresh_token.clearAllRefreshTokens();
+
+  /// 세션 내 serviceCountry 갱신 — 컨트롤러의 PUSH_TOKEN payload 국가 + 채널의
+  /// refresh-key/SSO domainType 분기를 둘 다 새 국가로. 재시작 불요.
+  void updateServiceCountry(String? code) {
+    _serviceCountry = code;
+    _channel?.updateServiceCountry(code);
   }
 
   Future<T> _executeOrQueue<T>({

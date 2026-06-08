@@ -16,6 +16,17 @@ String refreshTokenKeyFor(String? serviceCountry) {
   return '${kRefreshTokenKey}__${serviceCountry.toLowerCase()}';
 }
 
+/// 모든 서비스 국가의 RefreshToken 을 일괄 삭제한다.
+///
+/// 서비스 국가 전환(staff)은 "완전 로그아웃" 의미이므로 KR 레거시 키와 GLOBAL(`__global`)
+/// 키를 **둘 다** 제거한다 — 전환 후 어느 도메인도 자동로그인되지 않도록. 단일 키만 지우는
+/// 기존 `RefreshTokenEvent(action: 'delete')`(웹 메시지 기반) 와 달리 네이티브가 직접 호출한다.
+Future<void> clearAllRefreshTokens() async {
+  final SharedPreferences prefs = await SharedPreferences.getInstance();
+  await prefs.remove(refreshTokenKeyFor('KR')); // 레거시 키
+  await prefs.remove(refreshTokenKeyFor('GLOBAL')); // __global
+}
+
 class RefreshTokenEvent {
   Future<Map<String, Object?>> process(
     BuildContext context, {
