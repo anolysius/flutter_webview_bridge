@@ -40,9 +40,12 @@ class SsoExchange {
   /// API 도메인 타입 (KR 앱 = sazo-korea-shop). web koAxios 가 x-domain-type 으로 항상 전송.
   final String domainType;
 
+  final http.Client? client;
+
   const SsoExchange({
     required this.apiBaseUrl,
     this.domainType = 'sazo-korea-shop',
+    this.client,
   });
 
   String _idTokenPath(SsoProvider provider) {
@@ -62,6 +65,26 @@ class SsoExchange {
     'Accept-Language': 'ko-KR,ko;q=0.9',
   };
 
+  Future<http.Response> _post(
+    Uri url, {
+    required Map<String, String> headers,
+    Object? body,
+  }) {
+    final injectedClient = client;
+    if (injectedClient != null) {
+      return injectedClient.post(url, headers: headers, body: body);
+    }
+    return http.post(url, headers: headers, body: body);
+  }
+
+  Future<http.Response> _get(Uri url, {required Map<String, String> headers}) {
+    final injectedClient = client;
+    if (injectedClient != null) {
+      return injectedClient.get(url, headers: headers);
+    }
+    return http.get(url, headers: headers);
+  }
+
   /// [deviceHeaders] 는 x-sazo-app-id / x-sazo-app-os / x-sazo-app-version / x-sazo-device-id.
   /// refresh 교환이 device-bound access token 발급에 사용한다.
   Future<SsoExchangeResult> exchange({
@@ -72,9 +95,9 @@ class SsoExchange {
     required Map<String, String> deviceHeaders,
   }) async {
     // 1) id-token 교환 → refreshToken
-    final idRes = await http.post(
+    final idRes = await _post(
       Uri.parse('$apiBaseUrl${_idTokenPath(provider)}'),
-      headers: _baseHeaders(),
+      headers: {..._baseHeaders(), ...deviceHeaders},
       body: jsonEncode({
         'idToken': idToken,
         'profile': profile ?? <String, Object?>{},
@@ -111,7 +134,7 @@ class SsoExchange {
     required String refreshToken,
     required Map<String, String> deviceHeaders,
   }) async {
-    final rfRes = await http.post(
+    final rfRes = await _post(
       Uri.parse('$apiBaseUrl/api/user/auth/token/refresh'),
       headers: {..._baseHeaders(), ...deviceHeaders},
       body: jsonEncode({'refreshToken': refreshToken}),
@@ -149,7 +172,7 @@ class SsoExchange {
     required Map<String, String> deviceHeaders,
   }) async {
     try {
-      final res = await http.get(
+      final res = await _get(
         Uri.parse('$apiBaseUrl/api/user/user-me'),
         headers: {
           ..._baseHeaders(),
