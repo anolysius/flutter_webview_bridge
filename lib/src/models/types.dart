@@ -27,6 +27,7 @@ enum WebViewBridgeFeatureType {
   channelTalkShutdown,
   authError,
   authTokensReady,
+  authUiCommitted,
   serviceCountryQuery,
   serviceCountryChange,
 }
@@ -90,6 +91,8 @@ extension WebViewBridgeFeatureTypeValue on WebViewBridgeFeatureType {
         return 'AUTH_ERROR';
       case WebViewBridgeFeatureType.authTokensReady:
         return 'AUTH_TOKENS_READY';
+      case WebViewBridgeFeatureType.authUiCommitted:
+        return 'AUTH_UI_COMMITTED';
       case WebViewBridgeFeatureType.serviceCountryQuery:
         return 'SERVICE_COUNTRY_QUERY';
       case WebViewBridgeFeatureType.serviceCountryChange:
@@ -157,6 +160,8 @@ extension WebViewBridgeFeatureTypeString on String {
         return WebViewBridgeFeatureType.authError;
       case 'AUTH_TOKENS_READY':
         return WebViewBridgeFeatureType.authTokensReady;
+      case 'AUTH_UI_COMMITTED':
+        return WebViewBridgeFeatureType.authUiCommitted;
       case 'SERVICE_COUNTRY_QUERY':
         return WebViewBridgeFeatureType.serviceCountryQuery;
       case 'SERVICE_COUNTRY_CHANGE':

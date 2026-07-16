@@ -28,6 +28,7 @@ class WebViewBridgeController {
     String? apiBaseUrl,
     String? serviceCountry,
     void Function(String requestedCountry)? onServiceCountryChange,
+    AuthTraceCallback? onAuthTrace,
   }) {
     _isTerminated = false;
     _serviceCountry = serviceCountry;
@@ -49,6 +50,7 @@ class WebViewBridgeController {
       apiBaseUrl: apiBaseUrl,
       serviceCountry: serviceCountry,
       onServiceCountryChange: onServiceCountryChange,
+      onAuthTrace: onAuthTrace,
     );
     _channel!.updateAppLifecycleState(_appLifecycleState);
     _channel!.addJavaScriptChannel();

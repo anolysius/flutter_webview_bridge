@@ -75,5 +75,30 @@ void main() {
         );
       }
     });
+
+    test('5xx는 external failure로 분류하고 응답 본문을 exception에 노출하지 않는다', () async {
+      final exchange = SsoExchange(
+        apiBaseUrl: 'https://qa.api.sazo.kr',
+        client: MockClient(
+          (_) async => http.Response(
+            '{"email":"private@example.com","accessToken":"secret"}',
+            503,
+          ),
+        ),
+      );
+
+      try {
+        await exchange.exchange(
+          provider: SsoProvider.kakao,
+          idToken: 'id-token',
+          deviceHeaders: const {},
+        );
+        fail('exception expected');
+      } on SsoExchangeException catch (error) {
+        expect(error.externalFailure, isTrue);
+        expect(error.toString(), isNot(contains('private@example.com')));
+        expect(error.toString(), isNot(contains('secret')));
+      }
+    });
   });
 }

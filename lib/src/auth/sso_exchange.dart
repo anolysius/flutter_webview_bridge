@@ -27,7 +27,13 @@ class SsoExchangeResult {
 
 class SsoExchangeException implements Exception {
   final String message;
-  const SsoExchangeException(this.message);
+  final bool externalFailure;
+  final int? statusCode;
+  const SsoExchangeException(
+    this.message, {
+    this.externalFailure = false,
+    this.statusCode,
+  });
 
   @override
   String toString() => 'SsoExchangeException: $message';
@@ -106,15 +112,15 @@ class SsoExchange {
     );
     if (idRes.statusCode < 200 || idRes.statusCode >= 300) {
       throw SsoExchangeException(
-        'id-token ${idRes.statusCode}: ${_preview(idRes.body)}',
+        'id-token HTTP ${idRes.statusCode}',
+        externalFailure: _isExternalStatus(idRes.statusCode),
+        statusCode: idRes.statusCode,
       );
     }
     final idBody = _decode(idRes.body);
     final refreshToken = idBody['refreshToken'] as String?;
     if (refreshToken == null || refreshToken.isEmpty) {
-      throw SsoExchangeException(
-        'id-token 응답 refreshToken 부재: ${_preview(idRes.body)}',
-      );
+      throw SsoExchangeException('id-token response missing refreshToken');
     }
 
     // 2) refresh 교환 → device-bound accessToken (+ 갱신 refreshToken)
@@ -141,7 +147,9 @@ class SsoExchange {
     );
     if (rfRes.statusCode < 200 || rfRes.statusCode >= 300) {
       throw SsoExchangeException(
-        'refresh ${rfRes.statusCode}: ${_preview(rfRes.body)}',
+        'refresh HTTP ${rfRes.statusCode}',
+        externalFailure: _isExternalStatus(rfRes.statusCode),
+        statusCode: rfRes.statusCode,
       );
     }
     final rfBody = _decode(rfRes.body);
@@ -150,9 +158,7 @@ class SsoExchange {
     final finalRefresh =
         (data is Map ? data['refreshToken'] as String? : null) ?? refreshToken;
     if (accessToken == null || accessToken.isEmpty) {
-      throw SsoExchangeException(
-        'refresh 응답 accessToken 부재: ${_preview(rfRes.body)}',
-      );
+      throw SsoExchangeException('refresh response missing accessToken');
     }
     return SsoExchangeResult(
       accessToken: accessToken,
@@ -201,6 +207,6 @@ class SsoExchange {
     return <String, dynamic>{};
   }
 
-  String _preview(String body) =>
-      body.length <= 200 ? body : '${body.substring(0, 200)}…';
+  bool _isExternalStatus(int statusCode) =>
+      statusCode == 408 || statusCode == 429 || statusCode >= 500;
 }
