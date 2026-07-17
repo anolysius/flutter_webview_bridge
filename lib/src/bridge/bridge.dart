@@ -611,6 +611,36 @@ class FlutterWebViewBridgeJavaScriptChannel {
       type == WebViewBridgeFeatureType.appleSignInLogin ||
       type == WebViewBridgeFeatureType.kakaoSignInLogin;
 
+  bool _isAuthAttemptFeature(WebViewBridgeFeatureType type) =>
+      _isSsoLogin(type) ||
+      type == WebViewBridgeFeatureType.refreshTokenRead ||
+      type == WebViewBridgeFeatureType.authUiCommitted;
+
+  String _unexpectedAuthFailureStage(WebViewBridgeFeatureType type) {
+    if (_isSsoLogin(type)) return 'native_sdk';
+    if (type == WebViewBridgeFeatureType.refreshTokenRead) {
+      return 'refresh_exchange';
+    }
+    if (type == WebViewBridgeFeatureType.authUiCommitted) return 'ui_commit';
+    return 'unknown';
+  }
+
+  void _emitMeFetchResult(Map<String, dynamic>? me, dynamic data) {
+    if (me != null) {
+      _emitAuthTrace('auth.me.fetched', resultCode: 'success', data: data);
+      return;
+    }
+    _emitAuthTrace(
+      'auth.me.fetch_fallback',
+      resultCode: 'fallback',
+      data: _failureData(
+        data,
+        failureStage: 'me_fetch',
+        failureCode: 'ME_FETCH_FALLBACK',
+      ),
+    );
+  }
+
   String _providerNameOf(WebViewBridgeFeatureType type) {
     if (type == WebViewBridgeFeatureType.googleSignInLogin ||
         type == WebViewBridgeFeatureType.googleSignInLogout) {
@@ -1346,6 +1376,35 @@ class FlutterWebViewBridgeJavaScriptChannel {
             } catch (_) {}
             return;
           }
+          // 예상 밖 auth exception도 반드시 canonical terminal로 닫는다. 그렇지 않으면
+          // UI에는 실패가 보여도 KPI에는 attempt 자체가 사라질 수 있다.
+          if (_isAuthAttemptFeature(webViewBridgeFeatureType)) {
+            final failureData = _failureData(
+              data,
+              failureStage: _unexpectedAuthFailureStage(
+                webViewBridgeFeatureType,
+              ),
+              failureCode: 'NATIVE_INTERNAL_ERROR',
+            );
+            _emitAuthTerminal(
+              'code_failure:native_internal',
+              data: failureData,
+            );
+            _invalidateAuthTransaction('NATIVE_INTERNAL_ERROR');
+            try {
+              await runJavaScriptPostMessage(
+                jsonEncode({
+                  'type': WebViewBridgeFeatureType.authError.value,
+                  'data': {
+                    ...failureData,
+                    'code': 'NATIVE_INTERNAL_ERROR',
+                    'message': '',
+                  },
+                }),
+              );
+            } catch (_) {}
+            return;
+          }
           // 일반 exception — silent drop 방지: webview 측이 응답을 기다리고 있으므로 error payload 1건 전송 시도
           try {
             await runJavaScriptPostMessage(
@@ -1814,6 +1873,7 @@ class FlutterWebViewBridgeJavaScriptChannel {
         accessToken: result.accessToken,
         deviceHeaders: deviceHeaders,
       );
+      _emitMeFetchResult(me, requestData);
       final payload = <String, Object?>{
         'type': WebViewBridgeFeatureType.authTokensReady.value,
         'data': {
@@ -1949,6 +2009,7 @@ class FlutterWebViewBridgeJavaScriptChannel {
         accessToken: result.accessToken,
         deviceHeaders: deviceHeaders,
       );
+      _emitMeFetchResult(me, requestData);
       if (!_isCurrentAuthTransaction(authEpoch, requestData)) {
         _logStaleAuthMessage('ssoExchange:afterMe', requestData);
         return null;
