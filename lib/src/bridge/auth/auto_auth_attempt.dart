@@ -1,10 +1,11 @@
 const autoAuthProvider = 'AUTO_REFRESH';
 
-/// bridge instance의 첫 v2 refresh-token read를 독립 자동 로그인 시도로 승격한다.
+/// coordinator가 허용한 첫 v2 refresh-token read를 독립 자동 로그인 시도로 승격한다.
 ///
-/// 앱 프로세스가 살아 있는 동안 발생하는 WebContent reload/replay는 새 자동 로그인
-/// 시도가 아니다. 반대로 앱 강제 종료 뒤 생성된 새 bridge instance의 첫 token read는
-/// 새 attempt ID를 받아 현재 UI 수렴을 다시 계측한다.
+/// process-wide 1회 게이트와 interactive 우선권은
+/// ProcessAuthAttemptCoordinator가 담당하고, 이 객체는 현재 bridge의 attempt ID 결합만
+/// 담당한다. 앱 프로세스가 살아 있는 동안 발생하는 WebContent reload/replay는 새 자동
+/// 로그인 시도가 아니다.
 class AutoAuthAttemptController {
   bool _initialV2RefreshObserved = false;
   String? _activeAttemptId;

@@ -34,8 +34,19 @@ import 'auth/auth_revision_store.dart';
 import 'auth/auth_terminal_store.dart';
 import 'auth/auth_ui_commit.dart';
 import 'auth/auto_auth_attempt.dart';
+import 'auth/process_auth_attempt_coordinator.dart';
 
 typedef AuthTraceCallback = void Function(Map<String, Object?> event);
+
+class _ProcessAutoAuthWork {
+  const _ProcessAutoAuthWork({
+    required this.lease,
+    required this.tracksTerminal,
+  });
+
+  final ProcessAuthAttemptLease lease;
+  final bool tracksTerminal;
+}
 
 class _AuthOperationValue<T> {
   const _AuthOperationValue(this.value);
@@ -167,6 +178,7 @@ class FlutterWebViewBridgeJavaScriptChannel {
     _activeAuthAbortCompleter = null;
     _authAttemptPhase.settle();
     _autoAuthAttempt.clearActiveAttempt();
+    _completeProcessAuthLease();
     _attemptTerminalTimer?.cancel();
     _attemptTerminalTimer = null;
     _pendingSsoRecovery = false;
@@ -243,6 +255,9 @@ class FlutterWebViewBridgeJavaScriptChannel {
   final Set<String> _terminalAuthSessionIds = <String>{};
   final AutoAuthAttemptController _autoAuthAttempt =
       AutoAuthAttemptController();
+  final ProcessAuthAttemptCoordinator _processAuthCoordinator =
+      ProcessAuthAttemptCoordinator.shared;
+  ProcessAuthAttemptLease? _processAuthLease;
 
   String? _authSessionIdOf(dynamic data) =>
       data is Map ? data['authSessionId'] as String? : null;
@@ -342,10 +357,27 @@ class FlutterWebViewBridgeJavaScriptChannel {
         resultCode: resultCode,
         data: data,
       );
+      _completeProcessAuthLease();
       return;
     }
     _settleAuthTerminalTracking();
     _emitAuthTrace('auth.terminal', resultCode: resultCode, data: data);
+    _completeProcessAuthLease();
+  }
+
+  void _completeProcessAuthLease() {
+    final lease = _processAuthLease;
+    _processAuthLease = null;
+    if (lease != null) _processAuthCoordinator.complete(lease);
+  }
+
+  void _handleProcessAuthAttemptSuperseded(ProcessAuthAttemptLease lease) {
+    if (_isDisposed || !identical(_processAuthLease, lease)) return;
+    final supersededData = _activeAuthProtocolData();
+    _emitAuthTerminal('user_superseded', data: supersededData);
+    _authEpoch += 1;
+    _autoAuthAttempt.clearActiveAttempt();
+    _clearSsoTransientState('process-auth-superseded');
   }
 
   void _armAttemptTerminalTimer() {
@@ -469,28 +501,65 @@ class FlutterWebViewBridgeJavaScriptChannel {
     _clearSessionReplay(reason);
   }
 
-  void _beginAutoAuthAttemptIfNeeded(
+  _ProcessAutoAuthWork? _beginAutoAuthAttemptIfNeeded(
     dynamic requestData,
     Map<String, Object?> readResponse,
   ) {
-    final attemptId = _autoAuthAttempt.beginInitialRefresh(
-      requestData: requestData,
-      readResponse: readResponse,
-      interactiveAttemptActive: _awaitingAuthTerminal,
-      fallbackNonce: DateTime.now().microsecondsSinceEpoch,
-    );
-    if (attemptId == null) return;
+    if (_protocolVersionOf(requestData) < 2) return null;
 
-    _activeAuthSessionId = attemptId;
-    _activeAuthProvider = autoAuthProvider;
-    _activeRequestId = _requestIdOf(requestData);
-    _activeDocumentId = _stringFieldOf(requestData, 'documentId');
-    _activeProtocolVersion = 2;
-    _activeAuthAbortCompleter = null;
-    // refresh 교환 중에는 network/provider 응답을 기다리므로 짧은 UI deadline을
-    // 적용하지 않는다. AUTH_TOKENS_READY 송신 직전에 terminal convergence로 전환한다.
-    _authAttemptPhase.beginProviderInteraction(tracksTerminal: true);
-    _emitAuthTrace('auth.attempt.started', data: requestData);
+    final fallbackNonce = DateTime.now().microsecondsSinceEpoch;
+    final isInitialBootstrap = _processAuthCoordinator
+        .claimAutomaticBootstrap();
+    final trackedAttemptId = isInitialBootstrap
+        ? _autoAuthAttempt.beginInitialRefresh(
+            requestData: requestData,
+            readResponse: readResponse,
+            interactiveAttemptActive: _awaitingAuthTerminal,
+            fallbackNonce: fallbackNonce,
+          )
+        : null;
+    final tracksTerminal = trackedAttemptId != null;
+    final attemptId =
+        trackedAttemptId ??
+        _authSessionIdOf(requestData) ??
+        _requestIdOf(requestData) ??
+        'auto-work-$fallbackNonce';
+
+    late final ProcessAuthAttemptLease lease;
+    final claimed = _processAuthCoordinator.tryBeginAutomatic(
+      attemptId: attemptId,
+      onSuperseded: () {
+        if (tracksTerminal) _handleProcessAuthAttemptSuperseded(lease);
+      },
+    );
+    if (claimed == null) {
+      if (tracksTerminal) _autoAuthAttempt.clearActiveAttempt();
+      return null;
+    }
+    lease = claimed;
+    _processAuthLease = lease;
+
+    if (tracksTerminal) {
+      _activeAuthSessionId = attemptId;
+      _activeAuthProvider = autoAuthProvider;
+      _activeRequestId = _requestIdOf(requestData);
+      _activeDocumentId = _stringFieldOf(requestData, 'documentId');
+      _activeProtocolVersion = 2;
+      _activeAuthAbortCompleter = null;
+      // refresh 교환 중에는 network/provider 응답을 기다리므로 짧은 UI deadline을
+      // 적용하지 않는다. AUTH_TOKENS_READY 송신 직전에 terminal convergence로 전환한다.
+      _authAttemptPhase.beginProviderInteraction(tracksTerminal: true);
+      _emitAuthTrace('auth.attempt.started', data: requestData);
+    }
+    return _ProcessAutoAuthWork(lease: lease, tracksTerminal: tracksTerminal);
+  }
+
+  void _completeUntrackedAutoAuthWork(_ProcessAutoAuthWork? work) {
+    if (work == null || work.tracksTerminal) return;
+    if (identical(_processAuthLease, work.lease)) {
+      _processAuthLease = null;
+    }
+    _processAuthCoordinator.complete(work.lease);
   }
 
   void _bindAutoAuthAttemptToResponse(Map<String, Object?> response) {
@@ -502,6 +571,13 @@ class FlutterWebViewBridgeJavaScriptChannel {
     dynamic data,
   ) async {
     _authEpoch += 1;
+    late final ProcessAuthAttemptLease processLease;
+    processLease = _processAuthCoordinator.beginInteractive(
+      attemptId:
+          _authSessionIdOf(data) ?? 'interactive-${type.value}-$_authEpoch',
+      onSuperseded: () => _handleProcessAuthAttemptSuperseded(processLease),
+    );
+    _processAuthLease = processLease;
     _autoAuthAttempt.clearActiveAttempt();
     _ssoReloadCount = 0;
     _clearSsoTransientState('ssoStart:${type.value}');
@@ -532,6 +608,7 @@ class FlutterWebViewBridgeJavaScriptChannel {
 
   void _invalidateAuthTransaction(String reason) {
     _authEpoch += 1;
+    _completeProcessAuthLease();
     _activeAuthSessionId = null;
     _activeAuthProvider = null;
     _autoAuthAttempt.clearActiveAttempt();
@@ -752,6 +829,7 @@ class FlutterWebViewBridgeJavaScriptChannel {
       if (webViewBridgeFeatureType != null) {
         late Map<String, Object?> sendData;
         int? authEpoch;
+        _ProcessAutoAuthWork? processAutoAuthWork;
 
         try {
           if (_isSsoLogin(webViewBridgeFeatureType)) {
@@ -1046,7 +1124,13 @@ class FlutterWebViewBridgeJavaScriptChannel {
 
         if (webViewBridgeFeatureType ==
             WebViewBridgeFeatureType.refreshTokenRead) {
-          _beginAutoAuthAttemptIfNeeded(data, sendData);
+          processAutoAuthWork = _beginAutoAuthAttemptIfNeeded(data, sendData);
+          // protocol v2 자동 인증 응답은 process-wide 소유권이 있을 때만 진행한다.
+          // 다른 bridge instance에서 수동 로그인이 진행 중이면 오래된 refresh 결과가
+          // 사용자가 선택한 로그인 결과를 덮어쓰지 않도록 응답 자체를 중단한다.
+          if (_protocolVersionOf(data) >= 2 && processAutoAuthWork == null) {
+            return;
+          }
         }
 
         // ── B2: 카카오 로그인만 네이티브가 토큰 교환 후 AUTH_TOKENS_READY 로 변환 ──
@@ -1080,6 +1164,12 @@ class FlutterWebViewBridgeJavaScriptChannel {
           } else if (_protocolVersionOf(data) >= 2) {
             sendData = await _refreshStoredSessionToTokensReady(sendData, data);
           }
+        }
+
+        if (processAutoAuthWork != null &&
+            !_processAuthCoordinator.isActive(processAutoAuthWork.lease)) {
+          _completeUntrackedAutoAuthWork(processAutoAuthWork);
+          return;
         }
 
         if (webViewBridgeFeatureType ==
@@ -1174,6 +1264,7 @@ class FlutterWebViewBridgeJavaScriptChannel {
           _resendKakaoAfterReload = false;
           await _resendKakaoLogin();
         }
+        _completeUntrackedAutoAuthWork(processAutoAuthWork);
       }
     }
   }
