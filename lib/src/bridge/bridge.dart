@@ -30,6 +30,7 @@ import 'events/sign_in_apple.dart';
 import 'events/sign_in_google.dart';
 import 'events/sign_in_kakao.dart';
 import 'auth/auth_revision_store.dart';
+import 'auth/auth_terminal_store.dart';
 import 'auth/auth_ui_commit.dart';
 
 typedef AuthTraceCallback = void Function(Map<String, Object?> event);
@@ -271,24 +272,20 @@ class FlutterWebViewBridgeJavaScriptChannel {
     });
   }
 
-  String _terminalKeyOf(dynamic data) =>
-      _authSessionIdOf(data) ??
-      _activeAuthSessionId ??
-      'revision:${_authRevisionOf(data) ?? _activeAuthRevision}';
+  String _terminalKeyOf(dynamic data) => authTerminalKey(
+    authSessionId: _authSessionIdOf(data) ?? _activeAuthSessionId,
+    authRevision: _authRevisionOf(data) ?? _activeAuthRevision,
+  );
 
-  void _emitAuthTerminal(String resultCode, {dynamic data}) {
-    final key = _terminalKeyOf(data);
-    if (!_terminalAuthSessionIds.add(key)) {
-      _emitAuthTrace(
-        'auth.terminal.duplicate_ignored',
-        resultCode: resultCode,
-        data: data,
-      );
-      return;
-    }
+  bool _rememberTerminalKey(String key) {
+    if (!_terminalAuthSessionIds.add(key)) return false;
     if (_terminalAuthSessionIds.length > 200) {
       _terminalAuthSessionIds.remove(_terminalAuthSessionIds.first);
     }
+    return true;
+  }
+
+  void _settleAuthTerminalTracking() {
     _awaitingAuthTerminal = false;
     final abortCompleter = _activeAuthAbortCompleter;
     if (abortCompleter != null && !abortCompleter.isCompleted) {
@@ -296,6 +293,43 @@ class FlutterWebViewBridgeJavaScriptChannel {
     }
     _attemptTerminalTimer?.cancel();
     _attemptTerminalTimer = null;
+  }
+
+  Future<bool> _hasCompletedAuthTerminal(dynamic data) async {
+    final key = _terminalKeyOf(data);
+    if (_terminalAuthSessionIds.contains(key)) return true;
+
+    try {
+      final matchesPersistedSuccess = await const AuthTerminalStore()
+          .matchesSuccess(
+            authSessionId: _authSessionIdOf(data) ?? _activeAuthSessionId,
+            authRevision: _authRevisionOf(data) ?? _activeAuthRevision,
+            serviceCountry: serviceCountry,
+          );
+      if (!matchesPersistedSuccess) return false;
+      _rememberTerminalKey(key);
+      return true;
+    } catch (error) {
+      // 영속 marker 조회 실패가 실제 로그인 수렴을 방해하면 안 된다.
+      // ignore: avoid_print
+      print(
+        '[SsoExchange] auth terminal marker read FAIL: ${error.runtimeType}',
+      );
+      return false;
+    }
+  }
+
+  void _emitAuthTerminal(String resultCode, {dynamic data}) {
+    final key = _terminalKeyOf(data);
+    if (!_rememberTerminalKey(key)) {
+      _emitAuthTrace(
+        'auth.terminal.duplicate_ignored',
+        resultCode: resultCode,
+        data: data,
+      );
+      return;
+    }
+    _settleAuthTerminalTracking();
     _emitAuthTrace('auth.terminal', resultCode: resultCode, data: data);
   }
 
@@ -1022,9 +1056,19 @@ class FlutterWebViewBridgeJavaScriptChannel {
             _activeProtocolVersion >= 2 &&
             sendData['type'] ==
                 WebViewBridgeFeatureType.authTokensReady.value) {
-          _awaitingAuthTerminal = true;
-          _armAttemptTerminalTimer();
-          _armSsoWatchdog(isB2: true);
+          if (await _hasCompletedAuthTerminal(data)) {
+            _settleAuthTerminalTracking();
+            cancelSsoWatchdog('refreshTokenRead:terminalAlreadyCompleted');
+            _emitAuthTrace(
+              'auth.terminal.rearm_skipped',
+              resultCode: 'terminal_already_emitted',
+              data: data,
+            );
+          } else {
+            _awaitingAuthTerminal = true;
+            _armAttemptTerminalTimer();
+            _armSsoWatchdog(isB2: true);
+          }
         }
 
         // Send Data to WebView
@@ -1122,19 +1166,7 @@ class FlutterWebViewBridgeJavaScriptChannel {
   Future<void> _handleAuthUiCommitted(dynamic data) async {
     if (data is! Map || data['protocolVersion'] != 2) return;
 
-    if (!_awaitingAuthTerminal) {
-      _emitAuthTrace(
-        'auth.ui.duplicate_ignored',
-        resultCode: 'terminal_already_emitted',
-        data: data,
-      );
-      return;
-    }
-
-    final authSessionId = _authSessionIdOf(data);
-    final terminalKey =
-        authSessionId ??
-        'revision:${_authRevisionOf(data) ?? _activeAuthRevision}';
+    final terminalKey = _terminalKeyOf(data);
     if (_terminalAuthSessionIds.contains(terminalKey)) {
       _emitAuthTrace(
         'auth.ui.duplicate_ignored',
@@ -1144,26 +1176,87 @@ class FlutterWebViewBridgeJavaScriptChannel {
       return;
     }
 
-    final currentUrl = await webViewController.currentUrl();
-    final decision = validateAuthUiCommit(
-      data: data,
-      activeRequestId: _activeRequestId,
-      activeAuthSessionId: _activeAuthSessionId,
-      activeAuthRevision: _activeAuthRevision,
-      nativeIsHome: _isHomePath(currentUrl),
-      webIsHome: _isHomePath(_stringFieldOf(data, 'pathname')),
-    );
-    if (!decision.isAccepted) {
-      _emitAuthTrace(
-        'auth.ui.rejected',
-        resultCode: decision.rejection!.name,
-        data: data,
-      );
-      return;
-    }
+    // UI ACK가 native URL을 확인하는 동안 deadline timer가 같은 attempt를 먼저
+    // 실패 처리하지 못하게 잠시 멈춘다. 거부되면 기존 모드로 다시 arm한다.
+    final attemptTimerWasActive = _attemptTerminalTimer?.isActive ?? false;
+    final watchdogWasActive = _ssoWatchdog?.isActive ?? false;
+    final watchdogWasB2 = _ssoWatchdogB2;
+    _attemptTerminalTimer?.cancel();
+    _attemptTerminalTimer = null;
+    _ssoWatchdog?.cancel();
+    _ssoWatchdog = null;
+    var accepted = false;
 
-    cancelSsoWatchdog('authUiCommitted');
-    _emitAuthTerminal('ui_authenticated', data: data);
+    // `_awaitingAuthTerminal == false`는 성공 terminal의 증거가 아니다. 새 document의
+    // 토큰 read/ACK 순서에 따라 flag가 false인 동안에도 유효한 UI commit이 도착할 수 있다.
+    // 반드시 payload를 먼저 검증하고 실제 terminal key/영속 marker로만 중복 판정한다.
+    try {
+      String? currentUrl;
+      try {
+        currentUrl = await webViewController.currentUrl().timeout(
+          const Duration(seconds: 3),
+        );
+      } catch (error) {
+        _emitAuthTrace(
+          'auth.ui.rejected',
+          resultCode: 'native_url_unavailable',
+          data: data,
+        );
+        return;
+      }
+      final decision = validateAuthUiCommit(
+        data: data,
+        activeRequestId: _activeRequestId,
+        activeAuthSessionId: _activeAuthSessionId,
+        activeAuthRevision: _activeAuthRevision,
+        nativeIsHome: _isHomePath(currentUrl),
+        webIsHome: _isHomePath(_stringFieldOf(data, 'pathname')),
+      );
+      if (!decision.isAccepted) {
+        _emitAuthTrace(
+          'auth.ui.rejected',
+          resultCode: decision.rejection!.name,
+          data: data,
+        );
+        return;
+      }
+      accepted = true;
+
+      // 여기부터는 사용자가 보는 UI 성공이 검증됐다. SharedPreferences 조회/쓰기 중
+      // watchdog이 끼어들어 같은 시도를 timeout으로 먼저 종결하지 못하게 즉시 정지한다.
+      _settleAuthTerminalTracking();
+      cancelSsoWatchdog('authUiCommitted:validated');
+
+      if (await _hasCompletedAuthTerminal(data)) {
+        _emitAuthTrace(
+          'auth.ui.duplicate_ignored',
+          resultCode: 'idempotent_duplicate',
+          data: data,
+        );
+        return;
+      }
+
+      try {
+        await const AuthTerminalStore().markSuccess(
+          authSessionId: _authSessionIdOf(data) ?? _activeAuthSessionId,
+          authRevision: _authRevisionOf(data) ?? _activeAuthRevision,
+          serviceCountry: serviceCountry,
+        );
+      } catch (error) {
+        // 계측 idempotency 저장 실패 때문에 사용자가 이미 본 로그인 성공을 실패로
+        // 바꾸지 않는다. 현재 process에서는 in-memory key가 계속 중복을 막는다.
+        // ignore: avoid_print
+        print(
+          '[SsoExchange] auth terminal marker write FAIL: ${error.runtimeType}',
+        );
+      }
+      _emitAuthTerminal('ui_authenticated', data: data);
+    } finally {
+      if (!accepted && _awaitingAuthTerminal && !_isDisposed) {
+        if (attemptTimerWasActive) _armAttemptTerminalTimer();
+        if (watchdogWasActive) _armSsoWatchdog(isB2: watchdogWasB2);
+      }
+    }
   }
 
   Future<void> _navigateHome(dynamic data) async {
