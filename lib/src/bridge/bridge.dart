@@ -29,6 +29,7 @@ import 'events/set_clipboard.dart';
 import 'events/sign_in_apple.dart';
 import 'events/sign_in_google.dart';
 import 'events/sign_in_kakao.dart';
+import 'auth/auth_attempt_phase.dart';
 import 'auth/auth_revision_store.dart';
 import 'auth/auth_terminal_store.dart';
 import 'auth/auth_ui_commit.dart';
@@ -146,7 +147,9 @@ class FlutterWebViewBridgeJavaScriptChannel {
 
     _appLifecycleState = state;
     if (_isAppResumed) {
-      if (_awaitingAuthTerminal) _armAttemptTerminalTimer();
+      if (_authAttemptPhase.shouldRunTerminalDeadline) {
+        _armAttemptTerminalTimer();
+      }
       unawaited(_runResumedPendingWork());
     } else {
       _attemptTerminalTimer?.cancel();
@@ -161,7 +164,7 @@ class FlutterWebViewBridgeJavaScriptChannel {
       abortCompleter.complete();
     }
     _activeAuthAbortCompleter = null;
-    _awaitingAuthTerminal = false;
+    _authAttemptPhase.settle();
     _attemptTerminalTimer?.cancel();
     _attemptTerminalTimer = null;
     _pendingSsoRecovery = false;
@@ -203,7 +206,9 @@ class FlutterWebViewBridgeJavaScriptChannel {
   static const Duration _attemptTerminalTimeout = Duration(seconds: 15);
   Timer? _ssoWatchdog;
   Timer? _attemptTerminalTimer;
-  bool _awaitingAuthTerminal = false;
+  final AuthAttemptPhaseController _authAttemptPhase =
+      AuthAttemptPhaseController();
+  bool get _awaitingAuthTerminal => _authAttemptPhase.isAwaitingTerminal;
   Completer<void>? _activeAuthAbortCompleter;
   int _ssoReloadCount = 0;
   // B2 watchdog 여부 — timeout 시 raw 재전송(B1) 대신 reload→세션 replay(B2) 로 복구.
@@ -286,7 +291,7 @@ class FlutterWebViewBridgeJavaScriptChannel {
   }
 
   void _settleAuthTerminalTracking() {
-    _awaitingAuthTerminal = false;
+    _authAttemptPhase.settle();
     final abortCompleter = _activeAuthAbortCompleter;
     if (abortCompleter != null && !abortCompleter.isCompleted) {
       abortCompleter.complete();
@@ -334,7 +339,11 @@ class FlutterWebViewBridgeJavaScriptChannel {
   }
 
   void _armAttemptTerminalTimer() {
-    if (!_awaitingAuthTerminal || !_isAppResumed || _isDisposed) return;
+    if (!_authAttemptPhase.shouldRunTerminalDeadline ||
+        !_isAppResumed ||
+        _isDisposed) {
+      return;
+    }
     _attemptTerminalTimer?.cancel();
     _attemptTerminalTimer = Timer(
       _attemptTerminalTimeout,
@@ -344,7 +353,7 @@ class FlutterWebViewBridgeJavaScriptChannel {
 
   void _onAttemptTerminalTimeout() {
     _attemptTerminalTimer = null;
-    if (!_awaitingAuthTerminal) return;
+    if (!_authAttemptPhase.shouldRunTerminalDeadline) return;
     _terminateAuthAttemptWithError(
       resultCode: 'code_failure:auth_terminal_timeout',
       code: 'AUTH_TERMINAL_TIMEOUT',
@@ -363,7 +372,7 @@ class FlutterWebViewBridgeJavaScriptChannel {
     required String resultCode,
     required String code,
   }) {
-    if (!_awaitingAuthTerminal) return;
+    if (!_authAttemptPhase.shouldRunTerminalDeadline) return;
     final timeoutData = _activeAuthProtocolData();
     _emitAuthTerminal(resultCode, data: timeoutData);
     _invalidateAuthTransaction(code);
@@ -468,8 +477,9 @@ class FlutterWebViewBridgeJavaScriptChannel {
     _activeAuthAbortCompleter = _activeProtocolVersion >= 2
         ? Completer<void>()
         : null;
-    _awaitingAuthTerminal = _activeProtocolVersion >= 2;
-    if (_awaitingAuthTerminal) _armAttemptTerminalTimer();
+    _authAttemptPhase.beginProviderInteraction(
+      tracksTerminal: _activeProtocolVersion >= 2,
+    );
     _emitAuthTrace('auth.attempt.started', data: data);
     // ignore: avoid_print
     print(
@@ -485,7 +495,7 @@ class FlutterWebViewBridgeJavaScriptChannel {
     _authEpoch += 1;
     _activeAuthSessionId = null;
     _activeAuthProvider = null;
-    _awaitingAuthTerminal = false;
+    _authAttemptPhase.settle();
     _attemptTerminalTimer?.cancel();
     _attemptTerminalTimer = null;
     _activeAuthAbortCompleter = null;
@@ -1027,6 +1037,16 @@ class FlutterWebViewBridgeJavaScriptChannel {
           }
         }
 
+        // OAuth 계정 선택/동의는 사람의 입력을 기다리는 provider interaction이다.
+        // 이 구간에는 짧은 terminal deadline을 적용하지 않고, SDK가 성공 결과를
+        // 반환해 web으로 전달할 준비가 끝난 뒤부터 UI 수렴 deadline을 시작한다.
+        // 반드시 postMessage 전에 arm해야 즉시 도착하는 UI ACK와의 race가 없다.
+        if (_isSsoLogin(webViewBridgeFeatureType) &&
+            _authAttemptPhase.completeProviderInteraction()) {
+          _emitAuthTrace('auth.provider.completed', data: data);
+          _armAttemptTerminalTimer();
+        }
+
         // ── SSO watchdog arm (반드시 송신 *전*) ──
         // ⚠ 송신 후 arm 하면, B2 에서 web 이 AUTH_TOKENS_READY 수신 즉시 보내는 confirm
         // (REFRESH_TOKEN_WRITE)이 arm *전*에 처리돼 cancel 이 no-op 이 되고, 직후 arm 된 watchdog 가
@@ -1065,7 +1085,7 @@ class FlutterWebViewBridgeJavaScriptChannel {
               data: data,
             );
           } else {
-            _awaitingAuthTerminal = true;
+            _authAttemptPhase.restoreTerminalConvergence();
             _armAttemptTerminalTimer();
             _armSsoWatchdog(isB2: true);
           }
