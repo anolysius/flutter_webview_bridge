@@ -323,6 +323,7 @@ class FlutterWebViewBridgeJavaScriptChannel {
 
   void _emitAuthTrace(String event, {String? resultCode, dynamic data}) {
     onAuthTrace?.call({
+      'traceSchemaVersion': 2,
       'protocolVersion': _activeProtocolVersion,
       'loginAttemptId': _effectiveAuthSessionIdOf(data),
       'requestId': _requestIdOf(data) ?? _activeRequestId,
@@ -334,9 +335,51 @@ class FlutterWebViewBridgeJavaScriptChannel {
       if (data is Map && data['visibilityState'] is String)
         'visibilityState': data['visibilityState'] as String,
       'provider': _providerOfRequest(data) ?? _activeAuthProvider,
+      'serviceCountry': serviceCountry,
       'event': event,
       if (resultCode != null) 'resultCode': resultCode,
+      if (data is Map && data['failureStage'] is String)
+        'failureStage': data['failureStage'] as String,
+      if (data is Map && data['failureCode'] is String)
+        'failureCode': data['failureCode'] as String,
+      if (data is Map && data['httpStatus'] is int)
+        'httpStatus': data['httpStatus'] as int,
     });
+  }
+
+  Map<String, Object?> _failureData(
+    dynamic data, {
+    required String failureStage,
+    required String failureCode,
+    int? httpStatus,
+  }) => <String, Object?>{
+    if (data is Map)
+      for (final entry in data.entries)
+        if (entry.key is String) entry.key as String: entry.value,
+    'failureStage': failureStage,
+    'failureCode': failureCode,
+    if (httpStatus != null) 'httpStatus': httpStatus,
+  };
+
+  String _failureStageOf(Object error, String fallback) {
+    if (error is SsoExchangeException) return error.failureStage;
+    if (error is StateError &&
+        error.message == 'REFRESH_TOKEN_PERSIST_FAILED') {
+      return 'refresh_persist';
+    }
+    return fallback;
+  }
+
+  String _failureCodeOf(Object error, String fallback) {
+    if (error is SsoExchangeException) return error.failureCode;
+    if (error is StateError &&
+        error.message == 'REFRESH_TOKEN_PERSIST_FAILED') {
+      return 'REFRESH_TOKEN_PERSIST_FAILED';
+    }
+    if (error is SocketException || error is TimeoutException) {
+      return 'NETWORK_ERROR';
+    }
+    return fallback;
   }
 
   String _terminalKeyOf(dynamic data) => authTerminalKey(
@@ -546,7 +589,11 @@ class FlutterWebViewBridgeJavaScriptChannel {
     required String code,
   }) {
     if (!_authAttemptPhase.shouldRunTerminalDeadline) return;
-    final timeoutData = _activeAuthProtocolData();
+    final timeoutData = _failureData(
+      _activeAuthProtocolData(),
+      failureStage: 'terminal_deadline',
+      failureCode: code,
+    );
     _emitAuthTerminal(resultCode, data: timeoutData);
     _invalidateAuthTransaction(code);
     unawaited(
@@ -1263,13 +1310,18 @@ class FlutterWebViewBridgeJavaScriptChannel {
           // AUTH_ERROR payload 송신 + native SnackBar skip.
           // (사용자 toast 는 webview 측이 단독 표시 — 중복 회피)
           if (e is AuthError) {
+            final failureData = _failureData(
+              data,
+              failureStage: 'native_sdk',
+              failureCode: e.code,
+            );
             _emitAuthTerminal(
               e.code == 'USER_CANCELLED'
                   ? 'user_cancelled'
                   : const {'NETWORK_ERROR', 'PROVIDER_ERROR'}.contains(e.code)
                   ? 'excluded_external_failure'
                   : 'code_failure:native_auth_error',
-              data: data,
+              data: failureData,
             );
             _invalidateAuthTransaction('authError');
             try {
@@ -1286,6 +1338,8 @@ class FlutterWebViewBridgeJavaScriptChannel {
                     if (_stringFieldOf(data, 'documentId') != null)
                       'documentId': _stringFieldOf(data, 'documentId'),
                     'authRevision': _activeAuthRevision,
+                    'failureStage': 'native_sdk',
+                    'failureCode': e.code,
                   },
                 }),
               );
@@ -1437,10 +1491,17 @@ class FlutterWebViewBridgeJavaScriptChannel {
         );
         try {
           final delivered = await _runJavaScriptPostMessageWithReceipt(encoded);
+          final deliveryTraceData = delivered
+              ? data
+              : _failureData(
+                  data,
+                  failureStage: 'web_delivery',
+                  failureCode: 'BRIDGE_HANDLER_UNAVAILABLE',
+                );
           _emitAuthTrace(
             'bridge.delivery.${delivered ? "received" : "missed"}',
             resultCode: delivered ? 'received' : 'handler_unavailable',
-            data: data,
+            data: deliveryTraceData,
           );
           debugPrint(
             '[Bridge] postMessage ${delivered ? "RECEIVED" : "MISSED"} '
@@ -1792,11 +1853,19 @@ class FlutterWebViewBridgeJavaScriptChannel {
           authRevision: _activeAuthRevision,
         );
       }
+      final failureStage = _failureStageOf(error, 'refresh_exchange');
+      final failureCode = _failureCodeOf(error, 'NATIVE_INTERNAL_ERROR');
+      final failureData = _failureData(
+        requestData,
+        failureStage: failureStage,
+        failureCode: failureCode,
+        httpStatus: statusCode,
+      );
       _emitAuthTerminal(
         _isExternalSsoFailure(error)
             ? 'excluded_external_failure'
             : 'code_failure:native_refresh_exchange',
-        data: requestData,
+        data: failureData,
       );
       return {
         'type': WebViewBridgeFeatureType.authError.value,
@@ -1811,6 +1880,9 @@ class FlutterWebViewBridgeJavaScriptChannel {
           if (_stringFieldOf(requestData, 'documentId') != null)
             'documentId': _stringFieldOf(requestData, 'documentId'),
           'authRevision': _activeAuthRevision,
+          'failureStage': failureStage,
+          'failureCode': failureCode,
+          if (statusCode != null) 'httpStatus': statusCode,
         },
       };
     }
@@ -1917,11 +1989,20 @@ class FlutterWebViewBridgeJavaScriptChannel {
       }
       // ignore: avoid_print
       print('[SsoExchange] FAIL ${type.value}: ${e.runtimeType}');
+      final statusCode = e is SsoExchangeException ? e.statusCode : null;
+      final failureStage = _failureStageOf(e, 'unknown');
+      final failureCode = _failureCodeOf(e, 'NATIVE_INTERNAL_ERROR');
+      final failureData = _failureData(
+        requestData,
+        failureStage: failureStage,
+        failureCode: failureCode,
+        httpStatus: statusCode,
+      );
       _emitAuthTerminal(
         _isExternalSsoFailure(e)
             ? 'excluded_external_failure'
             : 'code_failure:sso_exchange',
-        data: requestData,
+        data: failureData,
       );
       return {
         'type': WebViewBridgeFeatureType.authError.value,
@@ -1934,6 +2015,9 @@ class FlutterWebViewBridgeJavaScriptChannel {
           if (_stringFieldOf(requestData, 'documentId') != null)
             'documentId': _stringFieldOf(requestData, 'documentId'),
           'authRevision': _activeAuthRevision,
+          'failureStage': failureStage,
+          'failureCode': failureCode,
+          if (statusCode != null) 'httpStatus': statusCode,
         },
       };
     }

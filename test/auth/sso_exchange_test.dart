@@ -96,9 +96,74 @@ void main() {
         fail('exception expected');
       } on SsoExchangeException catch (error) {
         expect(error.externalFailure, isTrue);
+        expect(error.failureStage, 'id_token_exchange');
+        expect(error.failureCode, 'SSO_ID_TOKEN_HTTP');
+        expect(error.statusCode, 503);
         expect(error.toString(), isNot(contains('private@example.com')));
         expect(error.toString(), isNot(contains('secret')));
       }
+    });
+
+    test('id-token 성공 응답이 JSON이 아니면 안전한 구조화 코드로 분류한다', () async {
+      final exchange = SsoExchange(
+        apiBaseUrl: 'https://qa.api.sazo.kr',
+        client: MockClient(
+          (_) async => http.Response('<html>bad gateway</html>', 200),
+        ),
+      );
+
+      expect(
+        () => exchange.exchange(
+          provider: SsoProvider.kakao,
+          idToken: 'id-token',
+          deviceHeaders: const {},
+        ),
+        throwsA(
+          isA<SsoExchangeException>()
+              .having(
+                (e) => e.failureStage,
+                'failureStage',
+                'id_token_exchange',
+              )
+              .having(
+                (e) => e.failureCode,
+                'failureCode',
+                'SSO_ID_TOKEN_INVALID_RESPONSE',
+              ),
+        ),
+      );
+    });
+
+    test('refresh 응답 accessToken 누락은 refresh 단계 코드로 분류한다', () async {
+      final exchange = SsoExchange(
+        apiBaseUrl: 'https://qa.api.sazo.kr',
+        client: MockClient((request) async {
+          if (request.url.path.endsWith('/id-token')) {
+            return http.Response(
+              jsonEncode({'refreshToken': 'refresh-token'}),
+              200,
+            );
+          }
+          return http.Response(jsonEncode({'data': <String, Object?>{}}), 200);
+        }),
+      );
+
+      expect(
+        () => exchange.exchange(
+          provider: SsoProvider.google,
+          idToken: 'id-token',
+          deviceHeaders: const {},
+        ),
+        throwsA(
+          isA<SsoExchangeException>()
+              .having((e) => e.failureStage, 'failureStage', 'refresh_exchange')
+              .having(
+                (e) => e.failureCode,
+                'failureCode',
+                'SSO_REFRESH_MISSING_ACCESS',
+              ),
+        ),
+      );
     });
   });
 }
