@@ -50,6 +50,7 @@ class AutoAuthAttemptController {
     final responseData = response['data'];
     if (responseData is Map) {
       responseData['authSessionId'] = attemptId;
+      responseData['provider'] = autoAuthProvider;
     }
   }
 

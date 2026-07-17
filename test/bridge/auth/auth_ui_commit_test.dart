@@ -34,6 +34,18 @@ void main() {
     );
   });
 
+  test('process owner를 검증한 observer bridge는 local attempt 없이도 수락한다', () {
+    final decision = validateAuthUiCommit(
+      data: valid(),
+      activeAuthSessionId: null,
+      activeAuthRevision: 5,
+      nativeIsHome: true,
+      webIsHome: true,
+    );
+
+    expect(decision.isAccepted, isTrue);
+  });
+
   test('hidden/wrong attempt/stale revision/로그인 href를 각각 거부한다', () {
     expect(
       evaluate({...valid(), 'visibilityState': 'hidden'}).rejection,

@@ -344,12 +344,6 @@ class FlutterWebViewBridgeJavaScriptChannel {
     authRevision: _authRevisionOf(data) ?? _activeAuthRevision,
   );
 
-  String? get _currentEffectiveAuthSessionId =>
-      _autoAuthAttempt.effectiveAttemptId(
-        messageAttemptId: null,
-        activeAttemptId: _activeAuthSessionId,
-      );
-
   AuthTerminalWorkSnapshot _captureAuthTerminalWork(dynamic data) {
     final attemptId = _effectiveAuthSessionIdOf(data);
     return AuthTerminalWorkSnapshot(
@@ -363,15 +357,11 @@ class FlutterWebViewBridgeJavaScriptChannel {
   }
 
   bool _isCurrentAuthTerminalWork(AuthTerminalWorkSnapshot snapshot) {
-    final attemptId = _currentEffectiveAuthSessionId;
     return !_isDisposed &&
-        snapshot.matches(
+        _processAuthCoordinator.isCurrentTerminalWork(
+          snapshot,
           epoch: _authEpoch,
-          attemptId: attemptId,
           revision: _activeAuthRevision,
-          leaseGeneration: _processAuthCoordinator.activeGenerationForAttempt(
-            attemptId,
-          ),
         );
   }
 
@@ -1541,7 +1531,17 @@ class FlutterWebViewBridgeJavaScriptChannel {
       attemptId: workSnapshot.attemptId,
       revision: workSnapshot.revision,
     );
-    if (workSnapshot.leaseGeneration == null && !isKnownTerminal) {
+    final terminalKey = _terminalKeyOf(data);
+    if (isKnownTerminal || _terminalAuthSessionIds.contains(terminalKey)) {
+      _rememberTerminalKey(terminalKey);
+      _emitAuthTrace(
+        'auth.ui.duplicate_ignored',
+        resultCode: 'idempotent_duplicate',
+        data: data,
+      );
+      return;
+    }
+    if (workSnapshot.leaseGeneration == null) {
       _emitAuthTrace(
         'auth.ui.rejected',
         resultCode: 'no_active_auth_owner',
@@ -1553,16 +1553,6 @@ class FlutterWebViewBridgeJavaScriptChannel {
       _emitAuthTrace(
         'auth.ui.rejected',
         resultCode: 'stale_auth_work',
-        data: data,
-      );
-      return;
-    }
-
-    final terminalKey = _terminalKeyOf(data);
-    if (_terminalAuthSessionIds.contains(terminalKey)) {
-      _emitAuthTrace(
-        'auth.ui.duplicate_ignored',
-        resultCode: 'idempotent_duplicate',
         data: data,
       );
       return;
@@ -1606,7 +1596,9 @@ class FlutterWebViewBridgeJavaScriptChannel {
       }
       final decision = validateAuthUiCommit(
         data: data,
-        activeAuthSessionId: _activeAuthSessionId,
+        // process generation으로 동일 attempt임을 이미 검증했다. observer home
+        // bridge의 local active attempt는 비어 있거나 이전 document 값일 수 있다.
+        activeAuthSessionId: workSnapshot.attemptId,
         activeAuthRevision: _activeAuthRevision,
         nativeIsHome: _isHomePath(currentUrl),
         webIsHome: _isHomePath(_stringFieldOf(data, 'pathname')),

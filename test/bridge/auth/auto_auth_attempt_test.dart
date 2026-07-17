@@ -136,6 +136,7 @@ void main() {
         (tokenResponse['data'] as Map)['authSessionId'],
         'auto-auth-request-1',
       );
+      expect((tokenResponse['data'] as Map)['provider'], autoAuthProvider);
     });
 
     test('active attempt 정리는 cold-start 1회 게이트를 다시 열지 않는다', () {

@@ -365,6 +365,34 @@ void main() {
         active.generation,
       );
       expect(coordinator.activeGenerationForAttempt('sso-other'), isNull);
+
+      final observerSnapshot = AuthTerminalWorkSnapshot(
+        epoch: 5,
+        attemptId: 'sso-cross-document',
+        revision: 9,
+        leaseGeneration: active.generation,
+      );
+      expect(
+        coordinator.isCurrentTerminalWork(
+          observerSnapshot,
+          epoch: 5,
+          revision: 9,
+        ),
+        isTrue,
+      );
+      expect(
+        coordinator.isCurrentTerminalWork(
+          AuthTerminalWorkSnapshot(
+            epoch: 5,
+            attemptId: 'sso-other',
+            revision: 9,
+            leaseGeneration: active.generation,
+          ),
+          epoch: 5,
+          revision: 9,
+        ),
+        isFalse,
+      );
     });
 
     test('boundary 이전 stale lease 완료가 대상 국가의 새 auto owner를 지우지 않는다', () {
@@ -427,11 +455,10 @@ void main() {
       leaseGeneration: 11,
     );
 
-    test('async gap 전후 모든 identity가 같을 때만 현재 작업이다', () {
+    test('다른 bridge도 같은 process generation/revision이면 현재 작업이다', () {
       expect(
-        snapshot.matches(
+        snapshot.matchesProcessOwner(
           epoch: 3,
-          attemptId: 'sso-1',
           revision: 7,
           leaseGeneration: 11,
         ),
@@ -439,11 +466,10 @@ void main() {
       );
     });
 
-    test('await 중 새 attempt/epoch/lease로 바뀌면 stale로 판정한다', () {
+    test('await 중 epoch/revision/lease가 바뀌면 stale로 판정한다', () {
       expect(
-        snapshot.matches(
+        snapshot.matchesProcessOwner(
           epoch: 4,
-          attemptId: 'sso-2',
           revision: 8,
           leaseGeneration: 12,
         ),
@@ -453,11 +479,21 @@ void main() {
 
     test('같은 attempt/revision이어도 process generation이 바뀌면 stale이다', () {
       expect(
-        snapshot.matches(
+        snapshot.matchesProcessOwner(
           epoch: 3,
-          attemptId: 'sso-1',
           revision: 7,
           leaseGeneration: 12,
+        ),
+        isFalse,
+      );
+    });
+
+    test('active process owner가 사라지면 null generation끼리도 현재 작업이 아니다', () {
+      expect(
+        snapshot.matchesProcessOwner(
+          epoch: 3,
+          revision: 7,
+          leaseGeneration: null,
         ),
         isFalse,
       );

@@ -40,15 +40,19 @@ class AuthTerminalWorkSnapshot {
   final int revision;
   final int? leaseGeneration;
 
-  bool matches({
+  /// [attemptId]로 조회한 process owner의 generation과 bridge-local 경계만 비교한다.
+  ///
+  /// UI commit은 로그인 시작 WebView가 아닌 새 home WebView에서 도착할 수 있으므로
+  /// observer bridge의 local active attempt는 identity에 포함하지 않는다. 대신 caller가
+  /// 이 snapshot의 [attemptId]로 조회한 process generation을 전달해야 한다.
+  bool matchesProcessOwner({
     required int epoch,
-    required String? attemptId,
     required int revision,
     required int? leaseGeneration,
   }) =>
       this.epoch == epoch &&
-      this.attemptId == attemptId &&
       this.revision == revision &&
+      this.leaseGeneration != null &&
       this.leaseGeneration == leaseGeneration;
 }
 
@@ -218,6 +222,16 @@ class ProcessAuthAttemptCoordinator {
     if (attemptId == null || active?.attemptId != attemptId) return null;
     return active!.generation;
   }
+
+  bool isCurrentTerminalWork(
+    AuthTerminalWorkSnapshot snapshot, {
+    required int epoch,
+    required int revision,
+  }) => snapshot.matchesProcessOwner(
+    epoch: epoch,
+    revision: revision,
+    leaseGeneration: activeGenerationForAttempt(snapshot.attemptId),
+  );
 
   void complete(ProcessAuthAttemptLease lease) {
     if (isActive(lease)) _active = null;
