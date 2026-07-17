@@ -142,6 +142,11 @@ class WebViewBridgeController {
   void clearSsoTransientState() =>
       _channel?.clearSsoTransientState('service-country-switch');
 
+  /// 국가 전환 auth boundary: 모든 bridge의 active transaction/lease/timer와
+  /// bootstrap gate를 초기화해 대상 origin의 REFRESH_TOKEN_READ가 반드시 응답받게 한다.
+  void resetAuthStateForServiceCountrySwitch() =>
+      _channel?.resetAuthStateForServiceCountrySwitch('service-country-switch');
+
   Future<T> _executeOrQueue<T>({
     required Future<T> Function() operation,
   }) async {

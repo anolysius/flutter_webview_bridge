@@ -56,4 +56,10 @@ class AutoAuthAttemptController {
   void clearActiveAttempt() {
     _activeAttemptId = null;
   }
+
+  /// origin/service-country 전환은 같은 process 안에서도 새로운 auth bootstrap이다.
+  void resetForAuthBoundary() {
+    _initialV2RefreshObserved = false;
+    _activeAttemptId = null;
+  }
 }

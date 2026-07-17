@@ -154,6 +154,14 @@ class FlutterWebViewBridgeJavaScriptChannel {
   /// 안 된다. 전환 경로에서 reload 전에 호출해 replay window 를 제거한다.
   void clearSsoTransientState(String reason) => _clearSsoTransientState(reason);
 
+  /// 서비스 국가 전환은 token/replay뿐 아니라 process-wide 인증 소유권까지 끊는 경계다.
+  /// 남은 interactive lease가 새 origin의 REFRESH_TOKEN_READ를 막지 않게 reload 전에 호출한다.
+  void resetAuthStateForServiceCountrySwitch(String reason) {
+    _processAuthCoordinator.resetForAuthBoundary();
+    _autoAuthAttempt.resetForAuthBoundary();
+    _invalidateAuthTransaction(reason);
+  }
+
   void updateAppLifecycleState(AppLifecycleState state) {
     if (_isDisposed) return;
 

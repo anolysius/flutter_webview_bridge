@@ -155,6 +155,75 @@ void main() {
       expect(settled, 0);
       expect(coordinator.isActive(active), isTrue);
     });
+
+    test('auth boundary reset은 active owner를 종료하고 bootstrap gate를 다시 연다', () {
+      final coordinator = ProcessAuthAttemptCoordinator();
+      var superseded = 0;
+      final active = coordinator.beginInteractive(
+        attemptId: 'global-sso',
+        onSuperseded: () => superseded += 1,
+        onSettled: () {},
+      );
+      expect(coordinator.claimAutomaticBootstrap(), isTrue);
+      expect(coordinator.claimAutomaticBootstrap(), isFalse);
+
+      coordinator.resetForAuthBoundary();
+
+      expect(superseded, 1);
+      expect(coordinator.isActive(active), isFalse);
+      expect(coordinator.claimAutomaticBootstrap(), isTrue);
+    });
+
+    test('boundary 이전 stale lease 완료가 대상 국가의 새 auto owner를 지우지 않는다', () {
+      final coordinator = ProcessAuthAttemptCoordinator();
+      final old = coordinator.beginInteractive(
+        attemptId: 'global-sso',
+        onSuperseded: () {},
+        onSettled: () {},
+      );
+      coordinator.resetForAuthBoundary();
+      final target = coordinator.tryBeginAutomatic(
+        attemptId: 'kr-bootstrap',
+        onSuperseded: () {},
+        onSettled: () {},
+      )!;
+
+      coordinator.complete(old);
+
+      expect(coordinator.isActive(target), isTrue);
+    });
+
+    test('active owner가 없는 auth boundary reset은 반복 호출해도 안전하다', () {
+      final coordinator = ProcessAuthAttemptCoordinator();
+
+      coordinator.resetForAuthBoundary();
+      coordinator.resetForAuthBoundary();
+
+      expect(coordinator.claimAutomaticBootstrap(), isTrue);
+      expect(coordinator.claimAutomaticBootstrap(), isFalse);
+    });
+
+    test('superseded callback의 stale 완료가 callback 중 생성된 새 owner를 지우지 않는다', () {
+      final coordinator = ProcessAuthAttemptCoordinator();
+      late ProcessAuthAttemptLease old;
+      late ProcessAuthAttemptLease target;
+      old = coordinator.beginInteractive(
+        attemptId: 'global-sso',
+        onSuperseded: () {
+          target = coordinator.tryBeginAutomatic(
+            attemptId: 'kr-bootstrap',
+            onSuperseded: () {},
+            onSettled: () {},
+          )!;
+          coordinator.complete(old);
+        },
+        onSettled: () {},
+      );
+
+      coordinator.resetForAuthBoundary();
+
+      expect(coordinator.isActive(target), isTrue);
+    });
   });
 
   group('AuthTerminalWorkSnapshot', () {

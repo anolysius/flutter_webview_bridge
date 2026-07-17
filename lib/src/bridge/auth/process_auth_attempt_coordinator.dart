@@ -86,6 +86,15 @@ class ProcessAuthAttemptCoordinator {
     return true;
   }
 
+  /// 서비스 국가 전환처럼 인증 저장소와 origin이 함께 바뀌는 경계에서 호출한다.
+  /// 모든 bridge의 active owner를 선점 종료하고 대상 국가 bootstrap을 새로 허용한다.
+  void resetForAuthBoundary() {
+    _automaticBootstrapObserved = false;
+    final previous = _active;
+    _active = null;
+    previous?.onSuperseded();
+  }
+
   ProcessAuthAttemptLease? tryBeginAutomatic({
     required String attemptId,
     required AuthAttemptSupersededCallback onSuperseded,

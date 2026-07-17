@@ -160,5 +160,27 @@ void main() {
         isNull,
       );
     });
+
+    test('auth boundary reset은 대상 국가의 bootstrap을 새 시도로 허용한다', () {
+      final controller = AutoAuthAttemptController();
+      controller.beginInitialRefresh(
+        requestData: request(),
+        readResponse: response(),
+        interactiveAttemptActive: false,
+        fallbackNonce: 123,
+      );
+
+      controller.resetForAuthBoundary();
+
+      expect(
+        controller.beginInitialRefresh(
+          requestData: request(requestId: 'kr-request'),
+          readResponse: response(),
+          interactiveAttemptActive: false,
+          fallbackNonce: 124,
+        ),
+        'auto-auth-kr-request',
+      );
+    });
   });
 }
