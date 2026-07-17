@@ -156,4 +156,53 @@ void main() {
       expect(coordinator.isActive(active), isTrue);
     });
   });
+
+  group('AuthTerminalWorkSnapshot', () {
+    const snapshot = AuthTerminalWorkSnapshot(
+      epoch: 3,
+      attemptId: 'sso-1',
+      revision: 7,
+      requestId: 'request-1',
+      leaseGeneration: 11,
+    );
+
+    test('async gap 전후 모든 identity가 같을 때만 현재 작업이다', () {
+      expect(
+        snapshot.matches(
+          epoch: 3,
+          attemptId: 'sso-1',
+          revision: 7,
+          requestId: 'request-1',
+          leaseGeneration: 11,
+        ),
+        isTrue,
+      );
+    });
+
+    test('await 중 새 attempt/epoch/lease로 바뀌면 stale로 판정한다', () {
+      expect(
+        snapshot.matches(
+          epoch: 4,
+          attemptId: 'sso-2',
+          revision: 8,
+          requestId: 'request-2',
+          leaseGeneration: 12,
+        ),
+        isFalse,
+      );
+    });
+
+    test('동일 attempt여도 document request가 바뀐 옛 callback은 stale이다', () {
+      expect(
+        snapshot.matches(
+          epoch: 3,
+          attemptId: 'sso-1',
+          revision: 7,
+          requestId: 'request-new-document',
+          leaseGeneration: 11,
+        ),
+        isFalse,
+      );
+    });
+  });
 }

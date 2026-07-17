@@ -307,6 +307,31 @@ class FlutterWebViewBridgeJavaScriptChannel {
     authRevision: _authRevisionOf(data) ?? _activeAuthRevision,
   );
 
+  String? get _currentEffectiveAuthSessionId =>
+      _autoAuthAttempt.effectiveAttemptId(
+        messageAttemptId: null,
+        activeAttemptId: _activeAuthSessionId,
+      );
+
+  AuthTerminalWorkSnapshot _captureAuthTerminalWork(dynamic data) =>
+      AuthTerminalWorkSnapshot(
+        epoch: _authEpoch,
+        attemptId: _effectiveAuthSessionIdOf(data),
+        revision: _authRevisionOf(data) ?? _activeAuthRevision,
+        requestId: _requestIdOf(data) ?? _activeRequestId,
+        leaseGeneration: _processAuthLease?.generation,
+      );
+
+  bool _isCurrentAuthTerminalWork(AuthTerminalWorkSnapshot snapshot) =>
+      !_isDisposed &&
+      snapshot.matches(
+        epoch: _authEpoch,
+        attemptId: _currentEffectiveAuthSessionId,
+        revision: _activeAuthRevision,
+        requestId: _activeRequestId,
+        leaseGeneration: _processAuthLease?.generation,
+      );
+
   bool _rememberTerminalKey(String key) {
     if (!_terminalAuthSessionIds.add(key)) return false;
     if (_terminalAuthSessionIds.length > 200) {
@@ -415,19 +440,39 @@ class FlutterWebViewBridgeJavaScriptChannel {
       return;
     }
     _attemptTerminalTimer?.cancel();
-    _attemptTerminalTimer = Timer(
-      _attemptTerminalTimeout,
-      () => unawaited(_onAttemptTerminalTimeout()),
-    );
+    final timeoutData = _activeAuthProtocolData();
+    final snapshot = _captureAuthTerminalWork(timeoutData);
+    late final Timer timer;
+    timer = Timer(_attemptTerminalTimeout, () {
+      // 취소 직전 이미 event queue에 들어온 옛 callback이 새 timer reference를
+      // 지우지 못하게 자신이 아직 owner일 때만 해제한다.
+      if (identical(_attemptTerminalTimer, timer)) {
+        _attemptTerminalTimer = null;
+      }
+      unawaited(_onAttemptTerminalTimeout(snapshot, timeoutData));
+    });
+    _attemptTerminalTimer = timer;
   }
 
-  Future<void> _onAttemptTerminalTimeout() async {
-    _attemptTerminalTimer = null;
-    if (!_authAttemptPhase.shouldRunTerminalDeadline) return;
-    final timeoutData = _activeAuthProtocolData();
-    if (await _hasCompletedAuthTerminal(timeoutData)) {
-      _settleAuthTerminalTracking();
-      _completeProcessAuthLease();
+  Future<void> _onAttemptTerminalTimeout(
+    AuthTerminalWorkSnapshot snapshot,
+    dynamic timeoutData,
+  ) async {
+    if (!_isCurrentAuthTerminalWork(snapshot) ||
+        !_authAttemptPhase.shouldRunTerminalDeadline) {
+      _emitAuthTrace(
+        'auth.terminal.timeout_stale_ignored',
+        resultCode: 'attempt_changed_before_check',
+        data: timeoutData,
+      );
+      return;
+    }
+    final hasCompletedTerminal = await _hasCompletedAuthTerminal(timeoutData);
+    if (hasCompletedTerminal) {
+      if (_isCurrentAuthTerminalWork(snapshot)) {
+        _settleAuthTerminalTracking();
+        _completeProcessAuthLease();
+      }
       _emitAuthTrace(
         'auth.terminal.timeout_ignored',
         resultCode: 'terminal_already_emitted',
@@ -435,17 +480,16 @@ class FlutterWebViewBridgeJavaScriptChannel {
       );
       return;
     }
-    // marker 조회 중 다른 bridge가 성공을 확정했거나 현재 시도가 교체될 수 있다.
-    if (!_authAttemptPhase.shouldRunTerminalDeadline ||
+    // marker 조회 중 다른 bridge가 성공을 확정했거나 새 시도로 교체될 수 있다.
+    if (!_isCurrentAuthTerminalWork(snapshot) ||
+        !_authAttemptPhase.shouldRunTerminalDeadline ||
         _processAuthCoordinator.isTerminalSettled(
-          attemptId: _effectiveAuthSessionIdOf(timeoutData),
-          revision: _authRevisionOf(timeoutData) ?? _activeAuthRevision,
+          attemptId: snapshot.attemptId,
+          revision: snapshot.revision,
         )) {
-      _settleAuthTerminalTracking();
-      _completeProcessAuthLease();
       _emitAuthTrace(
-        'auth.terminal.timeout_ignored',
-        resultCode: 'terminal_settled_during_check',
+        'auth.terminal.timeout_stale_ignored',
+        resultCode: 'attempt_changed_during_check',
         data: timeoutData,
       );
       return;
@@ -626,6 +670,7 @@ class FlutterWebViewBridgeJavaScriptChannel {
     dynamic data,
   ) async {
     _authEpoch += 1;
+    final transactionEpoch = _authEpoch;
     late final ProcessAuthAttemptLease processLease;
     processLease = _processAuthCoordinator.beginInteractive(
       attemptId:
@@ -642,9 +687,17 @@ class FlutterWebViewBridgeJavaScriptChannel {
     _activeRequestId = _requestIdOf(data);
     _activeDocumentId = _stringFieldOf(data, 'documentId');
     _activeProtocolVersion = _protocolVersionOf(data);
-    _activeAuthRevision = await const AuthRevisionStore().next(
+    final nextRevision = await const AuthRevisionStore().next(
       serviceCountry: serviceCountry,
     );
+    // revision 저장을 기다리는 동안 다른 bridge의 interactive 시도가 이 lease를
+    // 선점할 수 있다. 옛 초기화가 복귀해 새 시도의 phase/revision을 덮지 못하게 한다.
+    if (_isDisposed ||
+        transactionEpoch != _authEpoch ||
+        !identical(_processAuthLease, processLease)) {
+      throw const _AuthOperationAborted();
+    }
+    _activeAuthRevision = nextRevision;
     _activeAuthAbortCompleter = _activeProtocolVersion >= 2
         ? Completer<void>()
         : null;
@@ -659,7 +712,7 @@ class FlutterWebViewBridgeJavaScriptChannel {
       'authSessionId=${_activeAuthSessionId ?? "null"} '
       'authRevision=$_activeAuthRevision protocol=$_activeProtocolVersion',
     );
-    return _authEpoch;
+    return transactionEpoch;
   }
 
   void _invalidateAuthTransaction(String reason) {
@@ -1383,6 +1436,16 @@ class FlutterWebViewBridgeJavaScriptChannel {
   Future<void> _handleAuthUiCommitted(dynamic data) async {
     if (data is! Map || data['protocolVersion'] != 2) return;
 
+    final workSnapshot = _captureAuthTerminalWork(data);
+    if (!_isCurrentAuthTerminalWork(workSnapshot)) {
+      _emitAuthTrace(
+        'auth.ui.rejected',
+        resultCode: 'stale_auth_work',
+        data: data,
+      );
+      return;
+    }
+
     final terminalKey = _terminalKeyOf(data);
     if (_terminalAuthSessionIds.contains(terminalKey)) {
       _emitAuthTrace(
@@ -1421,6 +1484,14 @@ class FlutterWebViewBridgeJavaScriptChannel {
         );
         return;
       }
+      if (!_isCurrentAuthTerminalWork(workSnapshot)) {
+        _emitAuthTrace(
+          'auth.ui.rejected',
+          resultCode: 'attempt_changed_during_url_check',
+          data: data,
+        );
+        return;
+      }
       final decision = validateAuthUiCommit(
         data: data,
         activeRequestId: _activeRequestId,
@@ -1444,10 +1515,19 @@ class FlutterWebViewBridgeJavaScriptChannel {
       _settleAuthTerminalTracking();
       cancelSsoWatchdog('authUiCommitted:validated');
 
-      if (await _hasCompletedAuthTerminal(data)) {
+      final hasCompletedTerminal = await _hasCompletedAuthTerminal(data);
+      if (hasCompletedTerminal) {
         _emitAuthTrace(
           'auth.ui.duplicate_ignored',
           resultCode: 'idempotent_duplicate',
+          data: data,
+        );
+        return;
+      }
+      if (!_isCurrentAuthTerminalWork(workSnapshot)) {
+        _emitAuthTrace(
+          'auth.ui.rejected',
+          resultCode: 'attempt_changed_during_terminal_check',
           data: data,
         );
         return;
@@ -1467,9 +1547,19 @@ class FlutterWebViewBridgeJavaScriptChannel {
           '[SsoExchange] auth terminal marker write FAIL: ${error.runtimeType}',
         );
       }
+      if (!_isCurrentAuthTerminalWork(workSnapshot)) {
+        _emitAuthTrace(
+          'auth.ui.rejected',
+          resultCode: 'attempt_changed_during_marker_write',
+          data: data,
+        );
+        return;
+      }
       _emitAuthTerminal('ui_authenticated', data: data);
     } finally {
-      if (!accepted && _awaitingAuthTerminal && !_isDisposed) {
+      if (!accepted &&
+          _isCurrentAuthTerminalWork(workSnapshot) &&
+          _awaitingAuthTerminal) {
         if (attemptTimerWasActive) _armAttemptTerminalTimer();
         if (watchdogWasActive) _armSsoWatchdog(isB2: watchdogWasB2);
       }

@@ -17,4 +17,16 @@ void main() {
     expect(await const AuthRevisionStore().next(serviceCountry: 'GLOBAL'), 2);
     expect(await const AuthRevisionStore().current(serviceCountry: 'KR'), 1);
   });
+
+  test('여러 bridge의 동시 next 요청도 중복 없이 단조 증가한다', () async {
+    final revisions = await Future.wait(
+      List.generate(
+        20,
+        (_) => const AuthRevisionStore().next(serviceCountry: 'KR'),
+      ),
+    );
+
+    expect(revisions.toSet(), Set<int>.from(List.generate(20, (i) => i + 1)));
+    expect(await const AuthRevisionStore().current(serviceCountry: 'KR'), 20);
+  });
 }

@@ -22,6 +22,36 @@ class ProcessAuthAttemptLease {
   final ProcessAuthAttemptKind kind;
 }
 
+/// async gap 전후에 같은 인증 작업이 유지되는지 판별하는 불변 identity.
+class AuthTerminalWorkSnapshot {
+  const AuthTerminalWorkSnapshot({
+    required this.epoch,
+    required this.attemptId,
+    required this.revision,
+    required this.requestId,
+    required this.leaseGeneration,
+  });
+
+  final int epoch;
+  final String? attemptId;
+  final int revision;
+  final String? requestId;
+  final int? leaseGeneration;
+
+  bool matches({
+    required int epoch,
+    required String? attemptId,
+    required int revision,
+    required String? requestId,
+    required int? leaseGeneration,
+  }) =>
+      this.epoch == epoch &&
+      this.attemptId == attemptId &&
+      this.revision == revision &&
+      this.requestId == requestId &&
+      this.leaseGeneration == leaseGeneration;
+}
+
 class _ActiveProcessAuthAttempt {
   const _ActiveProcessAuthAttempt({
     required this.lease,

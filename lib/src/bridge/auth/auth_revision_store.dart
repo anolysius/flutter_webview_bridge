@@ -15,19 +15,27 @@ String authRevisionKeyFor(String? serviceCountry) {
 class AuthRevisionStore {
   const AuthRevisionStore();
 
+  /// SharedPreferences의 read-modify-write는 자체적으로 원자적이지 않다.
+  /// 여러 bridge instance가 동시에 next()를 호출해도 process 안에서는 반드시 직렬화한다.
+  static Future<void> _nextSerial = Future<void>.value();
+
   Future<int> current({String? serviceCountry}) async {
     final prefs = await SharedPreferences.getInstance();
     return prefs.getInt(authRevisionKeyFor(serviceCountry)) ?? 0;
   }
 
-  Future<int> next({String? serviceCountry}) async {
-    final prefs = await SharedPreferences.getInstance();
-    final key = authRevisionKeyFor(serviceCountry);
-    final nextRevision = (prefs.getInt(key) ?? 0) + 1;
-    final stored = await prefs.setInt(key, nextRevision);
-    if (!stored || prefs.getInt(key) != nextRevision) {
-      throw StateError('Failed to persist auth revision');
-    }
-    return nextRevision;
+  Future<int> next({String? serviceCountry}) {
+    late int nextRevision;
+    final operation = _nextSerial.then((_) async {
+      final prefs = await SharedPreferences.getInstance();
+      final key = authRevisionKeyFor(serviceCountry);
+      nextRevision = (prefs.getInt(key) ?? 0) + 1;
+      final stored = await prefs.setInt(key, nextRevision);
+      if (!stored || prefs.getInt(key) != nextRevision) {
+        throw StateError('Failed to persist auth revision');
+      }
+    });
+    _nextSerial = operation.catchError((_) {});
+    return operation.then((_) => nextRevision);
   }
 }
