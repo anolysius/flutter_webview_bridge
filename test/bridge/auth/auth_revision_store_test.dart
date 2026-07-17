@@ -30,6 +30,26 @@ void main() {
     expect(await const AuthRevisionStore().current(serviceCountry: 'KR'), 20);
   });
 
+  test('직렬화 대기 전에 superseded 된 revision 작업은 저장하지 않는다', () async {
+    final revisions = await Future.wait([
+      ...List.generate(
+        20,
+        (_) => const AuthRevisionStore().nextIfCurrent(
+          serviceCountry: 'KR',
+          isCurrent: _alwaysStale,
+        ),
+      ),
+      const AuthRevisionStore().nextIfCurrent(
+        serviceCountry: 'KR',
+        isCurrent: _alwaysCurrent,
+      ),
+    ]);
+
+    expect(revisions.take(20), everyElement(isNull));
+    expect(revisions.last, 1);
+    expect(await const AuthRevisionStore().current(serviceCountry: 'KR'), 1);
+  });
+
   test('국가 전환 뒤 bootstrap read는 이전 국가 active revision 대신 대상 저장값을 채택한다', () {
     expect(
       resolveRefreshAuthRevision(
@@ -63,3 +83,7 @@ void main() {
     expect(snapshot.matches(epoch: 3, serviceCountry: 'KR'), isFalse);
   });
 }
+
+bool _alwaysStale() => false;
+
+bool _alwaysCurrent() => true;

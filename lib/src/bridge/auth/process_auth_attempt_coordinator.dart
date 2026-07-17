@@ -15,11 +15,13 @@ class ProcessAuthAttemptLease {
     required this.generation,
     required this.attemptId,
     required this.kind,
+    this.deduplicationKey,
   });
 
   final int generation;
   final String attemptId;
   final ProcessAuthAttemptKind kind;
+  final String? deduplicationKey;
 }
 
 /// async gap 전후에 같은 인증 작업이 유지되는지 판별하는 불변 identity.
@@ -113,13 +115,40 @@ class ProcessAuthAttemptCoordinator {
     required String attemptId,
     required AuthAttemptSupersededCallback onSuperseded,
     required AuthAttemptSettledCallback onSettled,
+    String? deduplicationKey,
+  }) {
+    return tryBeginInteractive(
+      attemptId: attemptId,
+      onSuperseded: onSuperseded,
+      onSettled: onSettled,
+      // 기존 API는 중복 제거를 요청하지 않은 호출이므로 매번 고유 key를 부여한다.
+      deduplicationKey:
+          deduplicationKey ?? 'legacy:${_generation + 1}:$attemptId',
+    )!;
+  }
+
+  /// 동일 provider/country의 interactive 인증이 이미 진행 중이면 새 작업을 만들지 않는다.
+  ///
+  /// UI 재클릭이나 여러 WebView document의 중복 전달이 기존 SDK interaction을 취소하고
+  /// revision write를 계속 적재하는 것을 막는다. 다른 provider로 전환한 명시적 사용자
+  /// 의도는 기존처럼 이전 시도를 선점한다.
+  ProcessAuthAttemptLease? tryBeginInteractive({
+    required String attemptId,
+    required AuthAttemptSupersededCallback onSuperseded,
+    required AuthAttemptSettledCallback onSettled,
+    required String deduplicationKey,
   }) {
     final previous = _active;
+    if (previous?.lease.kind == ProcessAuthAttemptKind.interactive &&
+        previous?.lease.deduplicationKey == deduplicationKey) {
+      return null;
+    }
     final lease = _activate(
       attemptId: attemptId,
       kind: ProcessAuthAttemptKind.interactive,
       onSuperseded: onSuperseded,
       onSettled: onSettled,
+      deduplicationKey: deduplicationKey,
     );
     previous?.onSuperseded();
     return lease;
@@ -130,12 +159,14 @@ class ProcessAuthAttemptCoordinator {
     required ProcessAuthAttemptKind kind,
     required AuthAttemptSupersededCallback onSuperseded,
     required AuthAttemptSettledCallback onSettled,
+    String? deduplicationKey,
   }) {
     _generation += 1;
     final lease = ProcessAuthAttemptLease._(
       generation: _generation,
       attemptId: attemptId,
       kind: kind,
+      deduplicationKey: deduplicationKey,
     );
     _active = _ActiveProcessAuthAttempt(
       lease: lease,

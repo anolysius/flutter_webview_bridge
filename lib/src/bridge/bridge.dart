@@ -333,7 +333,7 @@ class FlutterWebViewBridgeJavaScriptChannel {
         'pathname': data['pathname'] as String,
       if (data is Map && data['visibilityState'] is String)
         'visibilityState': data['visibilityState'] as String,
-      'provider': _activeAuthProvider,
+      'provider': _providerOfRequest(data) ?? _activeAuthProvider,
       'event': event,
       if (resultCode != null) 'resultCode': resultCode,
     });
@@ -709,29 +709,47 @@ class FlutterWebViewBridgeJavaScriptChannel {
     _authEpoch += 1;
     final transactionEpoch = _authEpoch;
     late final ProcessAuthAttemptLease processLease;
-    processLease = _processAuthCoordinator.beginInteractive(
+    final provider = _providerOfRequest(data) ?? _providerNameOf(type);
+    final claimedLease = _processAuthCoordinator.tryBeginInteractive(
       attemptId:
           _authSessionIdOf(data) ?? 'interactive-${type.value}-$_authEpoch',
       onSuperseded: () => _handleProcessAuthAttemptSuperseded(processLease),
       onSettled: () => _handleProcessAuthAttemptSettled(processLease),
+      deduplicationKey: '${serviceCountry ?? "KR"}:$provider',
     );
+    if (claimedLease == null) {
+      _emitAuthTrace(
+        'auth.attempt.duplicate_ignored',
+        resultCode: 'duplicate_in_flight',
+        data: data,
+      );
+      throw const _AuthOperationAborted();
+    }
+    processLease = claimedLease;
     _processAuthLease = processLease;
     _autoAuthAttempt.clearActiveAttempt();
     _ssoReloadCount = 0;
     _clearSsoTransientState('ssoStart:${type.value}');
     _activeAuthSessionId = _authSessionIdOf(data);
-    _activeAuthProvider = _providerOfRequest(data) ?? _providerNameOf(type);
+    _activeAuthProvider = provider;
     _activeRequestId = _requestIdOf(data);
     _activeDocumentId = _stringFieldOf(data, 'documentId');
     _activeProtocolVersion = _protocolVersionOf(data);
-    final nextRevision = await const AuthRevisionStore().next(
+    final nextRevision = await const AuthRevisionStore().nextIfCurrent(
       serviceCountry: serviceCountry,
+      isCurrent: () =>
+          !_isDisposed &&
+          transactionEpoch == _authEpoch &&
+          identical(_processAuthLease, processLease) &&
+          _processAuthCoordinator.isActive(processLease),
     );
     // revision 저장을 기다리는 동안 다른 bridge의 interactive 시도가 이 lease를
     // 선점할 수 있다. 옛 초기화가 복귀해 새 시도의 phase/revision을 덮지 못하게 한다.
     if (_isDisposed ||
         transactionEpoch != _authEpoch ||
-        !identical(_processAuthLease, processLease)) {
+        !identical(_processAuthLease, processLease) ||
+        nextRevision == null ||
+        !_processAuthCoordinator.isActive(processLease)) {
       throw const _AuthOperationAborted();
     }
     _activeAuthRevision = nextRevision;

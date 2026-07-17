@@ -47,17 +47,37 @@ class AuthRevisionStore {
   }
 
   Future<int> next({String? serviceCountry}) {
+    return nextIfCurrent(
+      serviceCountry: serviceCountry,
+      isCurrent: () => true,
+    ).then((revision) => revision!);
+  }
+
+  /// 직렬화 대기 중 이미 superseded 된 인증 작업은 SharedPreferences I/O를 생략한다.
+  ///
+  /// 취소된 클릭도 FIFO에 남아 최신 로그인까지 수 초간 막던 starvation을 방지한다.
+  /// 저장 직전에 한 번 더 검사하여 앞선 작업을 기다리는 동안의 선점도 흡수한다.
+  Future<int?> nextIfCurrent({
+    String? serviceCountry,
+    required bool Function() isCurrent,
+  }) {
     late int nextRevision;
     final operation = _nextSerial.then((_) async {
+      if (!isCurrent()) return false;
       final prefs = await SharedPreferences.getInstance();
+      if (!isCurrent()) return false;
       final key = authRevisionKeyFor(serviceCountry);
       nextRevision = (prefs.getInt(key) ?? 0) + 1;
       final stored = await prefs.setInt(key, nextRevision);
       if (!stored || prefs.getInt(key) != nextRevision) {
         throw StateError('Failed to persist auth revision');
       }
+      return true;
     });
-    _nextSerial = operation.catchError((_) {});
-    return operation.then((_) => nextRevision);
+    _nextSerial = operation.then<void>(
+      (_) {},
+      onError: (Object _, StackTrace __) {},
+    );
+    return operation.then((stored) => stored ? nextRevision : null);
   }
 }
