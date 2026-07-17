@@ -27,6 +27,7 @@ class WebViewBridgeController {
     required String? kakaoNativeAppKey,
     String? apiBaseUrl,
     String? serviceCountry,
+    String? bridgeRevision,
     void Function(String requestedCountry)? onServiceCountryChange,
     AuthTraceCallback? onAuthTrace,
   }) {
@@ -49,6 +50,7 @@ class WebViewBridgeController {
       kakaoNativeAppKey: kakaoNativeAppKey,
       apiBaseUrl: apiBaseUrl,
       serviceCountry: serviceCountry,
+      bridgeRevision: bridgeRevision,
       onServiceCountryChange: onServiceCountryChange,
       onAuthTrace: onAuthTrace,
     );

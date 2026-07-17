@@ -28,6 +28,7 @@ enum WebViewBridgeFeatureType {
   authError,
   authTokensReady,
   authUiCommitted,
+  authAttemptStarted,
   serviceCountryQuery,
   serviceCountryChange,
 }
@@ -93,6 +94,8 @@ extension WebViewBridgeFeatureTypeValue on WebViewBridgeFeatureType {
         return 'AUTH_TOKENS_READY';
       case WebViewBridgeFeatureType.authUiCommitted:
         return 'AUTH_UI_COMMITTED';
+      case WebViewBridgeFeatureType.authAttemptStarted:
+        return 'AUTH_ATTEMPT_STARTED';
       case WebViewBridgeFeatureType.serviceCountryQuery:
         return 'SERVICE_COUNTRY_QUERY';
       case WebViewBridgeFeatureType.serviceCountryChange:

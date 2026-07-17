@@ -4,11 +4,21 @@ import 'dart:io' show SocketException;
 import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:flutter_webview_bridge/src/bridge/events/auth_error_mapper.dart';
+import 'package:flutter_webview_bridge/src/bridge/events/auth_error.dart';
 import 'package:google_sign_in/google_sign_in.dart';
 import 'package:kakao_flutter_sdk/kakao_flutter_sdk.dart';
 import 'package:sign_in_with_apple/sign_in_with_apple.dart';
 
 void main() {
+  test('AuthError keeps only the explicit normalized native SDK code', () {
+    const error = AuthError(
+      AuthErrorCode.providerError,
+      'raw provider message',
+      nativeSdkErrorCode: 'KAKAO_PROVIDER_ERROR',
+    );
+    expect(error.nativeSdkErrorCode, 'KAKAO_PROVIDER_ERROR');
+  });
+
   group('mapKakaoError', () {
     test('PlatformException CANCELED → USER_CANCELLED', () {
       final e = PlatformException(code: 'CANCELED');

@@ -50,7 +50,8 @@ class SignInApple {
           'idToken': appleCredential.identityToken,
         };
       } catch (e) {
-        throw AuthError(mapAppleError(e), e.toString());
+        final code = mapAppleError(e);
+        throw AuthError(code, e.toString(), nativeSdkErrorCode: 'APPLE_$code');
       }
     }
 

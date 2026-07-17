@@ -36,6 +36,7 @@ import 'auth/auth_ui_commit.dart';
 import 'auth/auto_auth_attempt.dart';
 import 'auth/interactive_refresh_convergence.dart';
 import 'auth/process_auth_attempt_coordinator.dart';
+import 'auth/unexpected_auth_failure.dart';
 
 typedef AuthTraceCallback = void Function(Map<String, Object?> event);
 
@@ -69,6 +70,7 @@ class FlutterWebViewBridgeJavaScriptChannel {
   /// 주입 시 SSO 로그인 교환을 네이티브가 수행(AUTH_TOKENS_READY) — WKWebView throttling 우회.
   /// 미주입(null) 시 기존 경로(SIGN_IN_LOGIN → web 교환 + watchdog) fallback.
   final String? apiBaseUrl;
+  final String? bridgeRevision;
 
   /// 서비스 국가 코드 (APP-300 R5 — 'KR' / 'GLOBAL'). 미주입(null)=KR/레거시 동작.
   /// RefreshToken 키 + SSO domainType 분기에 사용. KR/null 은 현행과 byte-identical.
@@ -96,6 +98,7 @@ class FlutterWebViewBridgeJavaScriptChannel {
     required this.googleServerClientId,
     required this.kakaoNativeAppKey,
     this.apiBaseUrl,
+    this.bridgeRevision,
     String? serviceCountry,
     this.onServiceCountryChange,
     this.onAuthTrace,
@@ -344,6 +347,12 @@ class FlutterWebViewBridgeJavaScriptChannel {
         'failureCode': data['failureCode'] as String,
       if (data is Map && data['httpStatus'] is int)
         'httpStatus': data['httpStatus'] as int,
+      if (data is Map && data['nativeSdkErrorCode'] is String)
+        'nativeSdkErrorCode': data['nativeSdkErrorCode'] as String,
+      if (data is Map && data['success'] is bool)
+        'success': data['success'] as bool,
+      if (data is Map && data['uiAuthCommitted'] is bool)
+        'uiAuthCommitted': data['uiAuthCommitted'] as bool,
     });
   }
 
@@ -611,20 +620,6 @@ class FlutterWebViewBridgeJavaScriptChannel {
       type == WebViewBridgeFeatureType.appleSignInLogin ||
       type == WebViewBridgeFeatureType.kakaoSignInLogin;
 
-  bool _isAuthAttemptFeature(WebViewBridgeFeatureType type) =>
-      _isSsoLogin(type) ||
-      type == WebViewBridgeFeatureType.refreshTokenRead ||
-      type == WebViewBridgeFeatureType.authUiCommitted;
-
-  String _unexpectedAuthFailureStage(WebViewBridgeFeatureType type) {
-    if (_isSsoLogin(type)) return 'native_sdk';
-    if (type == WebViewBridgeFeatureType.refreshTokenRead) {
-      return 'refresh_exchange';
-    }
-    if (type == WebViewBridgeFeatureType.authUiCommitted) return 'ui_commit';
-    return 'unknown';
-  }
-
   void _emitMeFetchResult(Map<String, dynamic>? me, dynamic data) {
     if (me != null) {
       _emitAuthTrace('auth.me.fetched', resultCode: 'success', data: data);
@@ -838,6 +833,15 @@ class FlutterWebViewBridgeJavaScriptChannel {
       tracksTerminal: _activeProtocolVersion >= 2,
     );
     _emitAuthTrace('auth.attempt.started', data: data);
+    await runJavaScriptPostMessage(
+      jsonEncode({
+        'type': WebViewBridgeFeatureType.authAttemptStarted.value,
+        'data': {
+          ..._activeAuthProtocolData(),
+          if (_activeAuthProvider != null) 'provider': _activeAuthProvider,
+        },
+      }),
+    );
     // ignore: avoid_print
     print(
       '[SsoExchange] auth transaction begin '
@@ -1090,6 +1094,10 @@ class FlutterWebViewBridgeJavaScriptChannel {
               break;
             case WebViewBridgeFeatureType.deviceInfo:
               sendData = await DeviceInfoEvent().process(context);
+              final responseData = sendData['data'];
+              if (responseData is Map) {
+                responseData['bridgeRevision'] = bridgeRevision ?? 'unknown';
+              }
               break;
             case WebViewBridgeFeatureType.cameraAccess:
               sendData = await CameraAccessEvent().process(context);
@@ -1333,6 +1341,9 @@ class FlutterWebViewBridgeJavaScriptChannel {
             case WebViewBridgeFeatureType.authUiCommitted:
               await _handleAuthUiCommitted(data);
               return;
+            case WebViewBridgeFeatureType.authAttemptStarted:
+              // native → web acknowledgement only.
+              return;
           }
         } catch (e) {
           if (e is _AuthOperationAborted) return;
@@ -1344,7 +1355,7 @@ class FlutterWebViewBridgeJavaScriptChannel {
               data,
               failureStage: 'native_sdk',
               failureCode: e.code,
-            );
+            )..['nativeSdkErrorCode'] = e.nativeSdkErrorCode;
             _emitAuthTerminal(
               e.code == 'USER_CANCELLED'
                   ? 'user_cancelled'
@@ -1378,12 +1389,13 @@ class FlutterWebViewBridgeJavaScriptChannel {
           }
           // 예상 밖 auth exception도 반드시 canonical terminal로 닫는다. 그렇지 않으면
           // UI에는 실패가 보여도 KPI에는 attempt 자체가 사라질 수 있다.
-          if (_isAuthAttemptFeature(webViewBridgeFeatureType)) {
+          final unexpectedFailureStage = unexpectedAuthFailureStage(
+            webViewBridgeFeatureType,
+          );
+          if (unexpectedFailureStage != null) {
             final failureData = _failureData(
               data,
-              failureStage: _unexpectedAuthFailureStage(
-                webViewBridgeFeatureType,
-              ),
+              failureStage: unexpectedFailureStage,
               failureCode: 'NATIVE_INTERNAL_ERROR',
             );
             _emitAuthTerminal(
@@ -1778,7 +1790,13 @@ class FlutterWebViewBridgeJavaScriptChannel {
         );
         return;
       }
-      _emitAuthTerminal('ui_authenticated', data: data);
+      final successData = <String, Object?>{
+        for (final entry in data.entries)
+          if (entry.key is String) entry.key as String: entry.value,
+        'success': true,
+        'uiAuthCommitted': true,
+      };
+      _emitAuthTerminal('ui_authenticated', data: successData);
     } finally {
       if (!accepted &&
           _isCurrentAuthTerminalWork(workSnapshot) &&

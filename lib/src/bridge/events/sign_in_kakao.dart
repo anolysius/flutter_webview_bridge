@@ -153,7 +153,12 @@ class SignInKakao {
         debugPrint(
           '[SignInKakao] OUTER CATCH — throw AuthError: ${e.runtimeType}',
         );
-        throw AuthError(mapKakaoError(e), e.runtimeType.toString());
+        final code = mapKakaoError(e);
+        throw AuthError(
+          code,
+          e.runtimeType.toString(),
+          nativeSdkErrorCode: 'KAKAO_$code',
+        );
       }
     }
 
