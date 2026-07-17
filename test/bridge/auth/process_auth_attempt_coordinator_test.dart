@@ -15,11 +15,13 @@ void main() {
       final interactive = coordinator.beginInteractive(
         attemptId: 'sso-1',
         onSuperseded: () {},
+        onSettled: () {},
       );
 
       final automatic = coordinator.tryBeginAutomatic(
         attemptId: 'auto-1',
         onSuperseded: () {},
+        onSettled: () {},
       );
 
       expect(coordinator.isActive(interactive), isTrue);
@@ -32,11 +34,13 @@ void main() {
       final automatic = coordinator.tryBeginAutomatic(
         attemptId: 'auto-1',
         onSuperseded: () => superseded += 1,
+        onSettled: () {},
       )!;
 
       final interactive = coordinator.beginInteractive(
         attemptId: 'sso-1',
         onSuperseded: () {},
+        onSettled: () {},
       );
 
       expect(superseded, 1);
@@ -50,11 +54,13 @@ void main() {
       final first = coordinator.beginInteractive(
         attemptId: 'sso-1',
         onSuperseded: () => firstSuperseded += 1,
+        onSettled: () {},
       );
 
       final second = coordinator.beginInteractive(
         attemptId: 'sso-2',
         onSuperseded: () {},
+        onSettled: () {},
       );
 
       expect(firstSuperseded, 1);
@@ -67,10 +73,12 @@ void main() {
       final automatic = coordinator.tryBeginAutomatic(
         attemptId: 'auto-1',
         onSuperseded: () {},
+        onSettled: () {},
       )!;
       final interactive = coordinator.beginInteractive(
         attemptId: 'sso-1',
         onSuperseded: () {},
+        onSettled: () {},
       );
 
       coordinator.complete(automatic);
@@ -85,15 +93,67 @@ void main() {
       final first = coordinator.tryBeginAutomatic(
         attemptId: 'auto-1',
         onSuperseded: () {},
+        onSettled: () {},
       );
 
       final second = coordinator.tryBeginAutomatic(
         attemptId: 'auto-2',
         onSuperseded: () {},
+        onSettled: () {},
       );
 
       expect(first, isNotNull);
       expect(second, isNull);
+    });
+
+    test('다른 bridge의 terminal 확정은 원 소유자의 deadline을 즉시 정지시킨다', () {
+      final coordinator = ProcessAuthAttemptCoordinator();
+      var settled = 0;
+      final owner = coordinator.beginInteractive(
+        attemptId: 'sso-1',
+        onSuperseded: () {},
+        onSettled: () => settled += 1,
+      );
+
+      expect(
+        coordinator.settleTerminal(attemptId: 'sso-1', revision: 7),
+        isTrue,
+      );
+
+      expect(settled, 1);
+      expect(coordinator.isActive(owner), isFalse);
+    });
+
+    test('동일 attempt는 revision이 달라도 process terminal이 한 번만 승인된다', () {
+      final coordinator = ProcessAuthAttemptCoordinator();
+
+      expect(
+        coordinator.settleTerminal(attemptId: 'sso-1', revision: 7),
+        isTrue,
+      );
+      expect(
+        coordinator.settleTerminal(attemptId: 'sso-1', revision: 8),
+        isFalse,
+      );
+      expect(
+        coordinator.isTerminalSettled(attemptId: 'sso-1', revision: 99),
+        isTrue,
+      );
+    });
+
+    test('관련 없는 terminal은 현재 active attempt를 종료하지 않는다', () {
+      final coordinator = ProcessAuthAttemptCoordinator();
+      var settled = 0;
+      final active = coordinator.beginInteractive(
+        attemptId: 'sso-active',
+        onSuperseded: () {},
+        onSettled: () => settled += 1,
+      );
+
+      coordinator.settleTerminal(attemptId: 'sso-other', revision: 1);
+
+      expect(settled, 0);
+      expect(coordinator.isActive(active), isTrue);
     });
   });
 }

@@ -327,6 +327,15 @@ class FlutterWebViewBridgeJavaScriptChannel {
 
   Future<bool> _hasCompletedAuthTerminal(dynamic data) async {
     final key = _terminalKeyOf(data);
+    final attemptId = _effectiveAuthSessionIdOf(data);
+    final revision = _authRevisionOf(data) ?? _activeAuthRevision;
+    if (_processAuthCoordinator.isTerminalSettled(
+      attemptId: attemptId,
+      revision: revision,
+    )) {
+      _rememberTerminalKey(key);
+      return true;
+    }
     if (_terminalAuthSessionIds.contains(key)) return true;
 
     try {
@@ -338,6 +347,10 @@ class FlutterWebViewBridgeJavaScriptChannel {
           );
       if (!matchesPersistedSuccess) return false;
       _rememberTerminalKey(key);
+      _processAuthCoordinator.settleTerminal(
+        attemptId: attemptId,
+        revision: revision,
+      );
       return true;
     } catch (error) {
       // 영속 marker 조회 실패가 실제 로그인 수렴을 방해하면 안 된다.
@@ -351,12 +364,19 @@ class FlutterWebViewBridgeJavaScriptChannel {
 
   void _emitAuthTerminal(String resultCode, {dynamic data}) {
     final key = _terminalKeyOf(data);
-    if (!_rememberTerminalKey(key)) {
+    final attemptId = _effectiveAuthSessionIdOf(data);
+    final revision = _authRevisionOf(data) ?? _activeAuthRevision;
+    final isFirstProcessTerminal = _processAuthCoordinator.settleTerminal(
+      attemptId: attemptId,
+      revision: revision,
+    );
+    if (!isFirstProcessTerminal || !_rememberTerminalKey(key)) {
       _emitAuthTrace(
         'auth.terminal.duplicate_ignored',
         resultCode: resultCode,
         data: data,
       );
+      _settleAuthTerminalTracking();
       _completeProcessAuthLease();
       return;
     }
@@ -380,6 +400,14 @@ class FlutterWebViewBridgeJavaScriptChannel {
     _clearSsoTransientState('process-auth-superseded');
   }
 
+  void _handleProcessAuthAttemptSettled(ProcessAuthAttemptLease lease) {
+    if (_isDisposed || !identical(_processAuthLease, lease)) return;
+    _processAuthLease = null;
+    _settleAuthTerminalTracking();
+    cancelSsoWatchdog('process-auth-terminal-settled');
+    _autoAuthAttempt.clearActiveAttempt();
+  }
+
   void _armAttemptTerminalTimer() {
     if (!_authAttemptPhase.shouldRunTerminalDeadline ||
         !_isAppResumed ||
@@ -389,13 +417,39 @@ class FlutterWebViewBridgeJavaScriptChannel {
     _attemptTerminalTimer?.cancel();
     _attemptTerminalTimer = Timer(
       _attemptTerminalTimeout,
-      _onAttemptTerminalTimeout,
+      () => unawaited(_onAttemptTerminalTimeout()),
     );
   }
 
-  void _onAttemptTerminalTimeout() {
+  Future<void> _onAttemptTerminalTimeout() async {
     _attemptTerminalTimer = null;
     if (!_authAttemptPhase.shouldRunTerminalDeadline) return;
+    final timeoutData = _activeAuthProtocolData();
+    if (await _hasCompletedAuthTerminal(timeoutData)) {
+      _settleAuthTerminalTracking();
+      _completeProcessAuthLease();
+      _emitAuthTrace(
+        'auth.terminal.timeout_ignored',
+        resultCode: 'terminal_already_emitted',
+        data: timeoutData,
+      );
+      return;
+    }
+    // marker 조회 중 다른 bridge가 성공을 확정했거나 현재 시도가 교체될 수 있다.
+    if (!_authAttemptPhase.shouldRunTerminalDeadline ||
+        _processAuthCoordinator.isTerminalSettled(
+          attemptId: _effectiveAuthSessionIdOf(timeoutData),
+          revision: _authRevisionOf(timeoutData) ?? _activeAuthRevision,
+        )) {
+      _settleAuthTerminalTracking();
+      _completeProcessAuthLease();
+      _emitAuthTrace(
+        'auth.terminal.timeout_ignored',
+        resultCode: 'terminal_settled_during_check',
+        data: timeoutData,
+      );
+      return;
+    }
     _terminateAuthAttemptWithError(
       resultCode: 'code_failure:auth_terminal_timeout',
       code: 'AUTH_TERMINAL_TIMEOUT',
@@ -531,6 +585,7 @@ class FlutterWebViewBridgeJavaScriptChannel {
       onSuperseded: () {
         if (tracksTerminal) _handleProcessAuthAttemptSuperseded(lease);
       },
+      onSettled: () => _handleProcessAuthAttemptSettled(lease),
     );
     if (claimed == null) {
       if (tracksTerminal) _autoAuthAttempt.clearActiveAttempt();
@@ -576,6 +631,7 @@ class FlutterWebViewBridgeJavaScriptChannel {
       attemptId:
           _authSessionIdOf(data) ?? 'interactive-${type.value}-$_authEpoch',
       onSuperseded: () => _handleProcessAuthAttemptSuperseded(processLease),
+      onSettled: () => _handleProcessAuthAttemptSettled(processLease),
     );
     _processAuthLease = processLease;
     _autoAuthAttempt.clearActiveAttempt();
