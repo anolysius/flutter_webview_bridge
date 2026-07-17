@@ -33,6 +33,7 @@ import 'auth/auth_attempt_phase.dart';
 import 'auth/auth_revision_store.dart';
 import 'auth/auth_terminal_store.dart';
 import 'auth/auth_ui_commit.dart';
+import 'auth/auto_auth_attempt.dart';
 
 typedef AuthTraceCallback = void Function(Map<String, Object?> event);
 
@@ -165,6 +166,7 @@ class FlutterWebViewBridgeJavaScriptChannel {
     }
     _activeAuthAbortCompleter = null;
     _authAttemptPhase.settle();
+    _autoAuthAttempt.clearActiveAttempt();
     _attemptTerminalTimer?.cancel();
     _attemptTerminalTimer = null;
     _pendingSsoRecovery = false;
@@ -239,9 +241,17 @@ class FlutterWebViewBridgeJavaScriptChannel {
   String? _activeRequestId;
   String? _activeDocumentId;
   final Set<String> _terminalAuthSessionIds = <String>{};
+  final AutoAuthAttemptController _autoAuthAttempt =
+      AutoAuthAttemptController();
 
   String? _authSessionIdOf(dynamic data) =>
       data is Map ? data['authSessionId'] as String? : null;
+
+  String? _effectiveAuthSessionIdOf(dynamic data) =>
+      _autoAuthAttempt.effectiveAttemptId(
+        messageAttemptId: _authSessionIdOf(data),
+        activeAttemptId: _activeAuthSessionId,
+      );
 
   String? _providerOfRequest(dynamic data) =>
       data is Map ? data['provider'] as String? : null;
@@ -262,7 +272,7 @@ class FlutterWebViewBridgeJavaScriptChannel {
   void _emitAuthTrace(String event, {String? resultCode, dynamic data}) {
     onAuthTrace?.call({
       'protocolVersion': _activeProtocolVersion,
-      'loginAttemptId': _authSessionIdOf(data) ?? _activeAuthSessionId,
+      'loginAttemptId': _effectiveAuthSessionIdOf(data),
       'requestId': _requestIdOf(data) ?? _activeRequestId,
       'authRevision': _authRevisionOf(data) ?? _activeAuthRevision,
       if (data is Map && data['documentId'] is String)
@@ -278,7 +288,7 @@ class FlutterWebViewBridgeJavaScriptChannel {
   }
 
   String _terminalKeyOf(dynamic data) => authTerminalKey(
-    authSessionId: _authSessionIdOf(data) ?? _activeAuthSessionId,
+    authSessionId: _effectiveAuthSessionIdOf(data),
     authRevision: _authRevisionOf(data) ?? _activeAuthRevision,
   );
 
@@ -307,7 +317,7 @@ class FlutterWebViewBridgeJavaScriptChannel {
     try {
       final matchesPersistedSuccess = await const AuthTerminalStore()
           .matchesSuccess(
-            authSessionId: _authSessionIdOf(data) ?? _activeAuthSessionId,
+            authSessionId: _effectiveAuthSessionIdOf(data),
             authRevision: _authRevisionOf(data) ?? _activeAuthRevision,
             serviceCountry: serviceCountry,
           );
@@ -459,11 +469,40 @@ class FlutterWebViewBridgeJavaScriptChannel {
     _clearSessionReplay(reason);
   }
 
+  void _beginAutoAuthAttemptIfNeeded(
+    dynamic requestData,
+    Map<String, Object?> readResponse,
+  ) {
+    final attemptId = _autoAuthAttempt.beginInitialRefresh(
+      requestData: requestData,
+      readResponse: readResponse,
+      interactiveAttemptActive: _awaitingAuthTerminal,
+      fallbackNonce: DateTime.now().microsecondsSinceEpoch,
+    );
+    if (attemptId == null) return;
+
+    _activeAuthSessionId = attemptId;
+    _activeAuthProvider = autoAuthProvider;
+    _activeRequestId = _requestIdOf(requestData);
+    _activeDocumentId = _stringFieldOf(requestData, 'documentId');
+    _activeProtocolVersion = 2;
+    _activeAuthAbortCompleter = null;
+    // refresh 교환 중에는 network/provider 응답을 기다리므로 짧은 UI deadline을
+    // 적용하지 않는다. AUTH_TOKENS_READY 송신 직전에 terminal convergence로 전환한다.
+    _authAttemptPhase.beginProviderInteraction(tracksTerminal: true);
+    _emitAuthTrace('auth.attempt.started', data: requestData);
+  }
+
+  void _bindAutoAuthAttemptToResponse(Map<String, Object?> response) {
+    _autoAuthAttempt.bindToResponse(response);
+  }
+
   Future<int> _beginAuthTransaction(
     WebViewBridgeFeatureType type,
     dynamic data,
   ) async {
     _authEpoch += 1;
+    _autoAuthAttempt.clearActiveAttempt();
     _ssoReloadCount = 0;
     _clearSsoTransientState('ssoStart:${type.value}');
     _activeAuthSessionId = _authSessionIdOf(data);
@@ -495,6 +534,7 @@ class FlutterWebViewBridgeJavaScriptChannel {
     _authEpoch += 1;
     _activeAuthSessionId = null;
     _activeAuthProvider = null;
+    _autoAuthAttempt.clearActiveAttempt();
     _authAttemptPhase.settle();
     _attemptTerminalTimer?.cancel();
     _attemptTerminalTimer = null;
@@ -1004,6 +1044,11 @@ class FlutterWebViewBridgeJavaScriptChannel {
           return;
         }
 
+        if (webViewBridgeFeatureType ==
+            WebViewBridgeFeatureType.refreshTokenRead) {
+          _beginAutoAuthAttemptIfNeeded(data, sendData);
+        }
+
         // ── B2: 카카오 로그인만 네이티브가 토큰 교환 후 AUTH_TOKENS_READY 로 변환 ──
         // WKWebView throttling(카카오 앱 전환) 우회. 구글/애플은 앱 전환이 없어 문제 없고
         // 검증된 web 교환 경로 유지(회귀 안전). 필요 시 _isSsoLogin 으로 확장 가능.
@@ -1035,6 +1080,11 @@ class FlutterWebViewBridgeJavaScriptChannel {
           } else if (_protocolVersionOf(data) >= 2) {
             sendData = await _refreshStoredSessionToTokensReady(sendData, data);
           }
+        }
+
+        if (webViewBridgeFeatureType ==
+            WebViewBridgeFeatureType.refreshTokenRead) {
+          _bindAutoAuthAttemptToResponse(sendData);
         }
 
         // OAuth 계정 선택/동의는 사람의 입력을 기다리는 provider interaction이다.
@@ -1258,7 +1308,7 @@ class FlutterWebViewBridgeJavaScriptChannel {
 
       try {
         await const AuthTerminalStore().markSuccess(
-          authSessionId: _authSessionIdOf(data) ?? _activeAuthSessionId,
+          authSessionId: _effectiveAuthSessionIdOf(data),
           authRevision: _authRevisionOf(data) ?? _activeAuthRevision,
           serviceCountry: serviceCountry,
         );
