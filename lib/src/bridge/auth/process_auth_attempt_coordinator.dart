@@ -32,27 +32,23 @@ class AuthTerminalWorkSnapshot {
     required this.epoch,
     required this.attemptId,
     required this.revision,
-    required this.requestId,
     required this.leaseGeneration,
   });
 
   final int epoch;
   final String? attemptId;
   final int revision;
-  final String? requestId;
   final int? leaseGeneration;
 
   bool matches({
     required int epoch,
     required String? attemptId,
     required int revision,
-    required String? requestId,
     required int? leaseGeneration,
   }) =>
       this.epoch == epoch &&
       this.attemptId == attemptId &&
       this.revision == revision &&
-      this.requestId == requestId &&
       this.leaseGeneration == leaseGeneration;
 }
 
@@ -100,6 +96,19 @@ class ProcessAuthAttemptCoordinator {
   /// 모든 bridge의 active owner를 선점 종료하고 대상 국가 bootstrap을 새로 허용한다.
   void resetForAuthBoundary() {
     _automaticBootstrapObserved = false;
+    _supersedeActiveAttempt();
+  }
+
+  /// 명시적 로그아웃은 현재 process의 interactive owner를 즉시 종료한다.
+  ///
+  /// 로그아웃을 보낸 WebView와 로그인 owner WebView가 다를 수 있으므로 bridge-local
+  /// lease만 완료해서는 안 된다. 반면 같은 국가의 cold-start bootstrap gate는 다시
+  /// 열지 않아 로그아웃 직후 불필요한 자동 인증이 시작되지 않게 한다.
+  void cancelActiveForExplicitLogout() {
+    _supersedeActiveAttempt();
+  }
+
+  void _supersedeActiveAttempt() {
     final previous = _active;
     _active = null;
     previous?.onSuperseded();
@@ -201,6 +210,14 @@ class ProcessAuthAttemptCoordinator {
 
   bool isActive(ProcessAuthAttemptLease lease) =>
       _active?.lease.generation == lease.generation;
+
+  /// 다른 bridge instance도 같은 process-wide attempt의 async terminal 작업을
+  /// generation으로 fence할 수 있게 한다.
+  int? activeGenerationForAttempt(String? attemptId) {
+    final active = _active?.lease;
+    if (attemptId == null || active?.attemptId != attemptId) return null;
+    return active!.generation;
+  }
 
   void complete(ProcessAuthAttemptLease lease) {
     if (isActive(lease)) _active = null;

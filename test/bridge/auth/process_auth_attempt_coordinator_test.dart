@@ -327,6 +327,46 @@ void main() {
       expect(coordinator.claimAutomaticBootstrap(), isTrue);
     });
 
+    test('명시적 로그아웃은 shared owner만 즉시 종료하고 bootstrap gate는 유지한다', () {
+      final coordinator = ProcessAuthAttemptCoordinator();
+      var superseded = 0;
+      expect(coordinator.claimAutomaticBootstrap(), isTrue);
+      final active = coordinator.tryBeginInteractive(
+        attemptId: 'sso-kakao-old',
+        deduplicationKey: 'KR:KAKAO_SIGN_IN_LOGIN',
+        onSuperseded: () => superseded += 1,
+        onSettled: () {},
+      )!;
+
+      coordinator.cancelActiveForExplicitLogout();
+
+      expect(superseded, 1);
+      expect(coordinator.isActive(active), isFalse);
+      expect(coordinator.claimAutomaticBootstrap(), isFalse);
+      final immediateRelogin = coordinator.tryBeginInteractive(
+        attemptId: 'sso-kakao-new',
+        deduplicationKey: 'KR:KAKAO_SIGN_IN_LOGIN',
+        onSuperseded: () {},
+        onSettled: () {},
+      );
+      expect(immediateRelogin, isNotNull);
+    });
+
+    test('다른 bridge도 active attempt generation을 동일하게 관측한다', () {
+      final coordinator = ProcessAuthAttemptCoordinator();
+      final active = coordinator.beginInteractive(
+        attemptId: 'sso-cross-document',
+        onSuperseded: () {},
+        onSettled: () {},
+      );
+
+      expect(
+        coordinator.activeGenerationForAttempt('sso-cross-document'),
+        active.generation,
+      );
+      expect(coordinator.activeGenerationForAttempt('sso-other'), isNull);
+    });
+
     test('boundary 이전 stale lease 완료가 대상 국가의 새 auto owner를 지우지 않는다', () {
       final coordinator = ProcessAuthAttemptCoordinator();
       final old = coordinator.beginInteractive(
@@ -384,7 +424,6 @@ void main() {
       epoch: 3,
       attemptId: 'sso-1',
       revision: 7,
-      requestId: 'request-1',
       leaseGeneration: 11,
     );
 
@@ -394,7 +433,6 @@ void main() {
           epoch: 3,
           attemptId: 'sso-1',
           revision: 7,
-          requestId: 'request-1',
           leaseGeneration: 11,
         ),
         isTrue,
@@ -407,21 +445,19 @@ void main() {
           epoch: 4,
           attemptId: 'sso-2',
           revision: 8,
-          requestId: 'request-2',
           leaseGeneration: 12,
         ),
         isFalse,
       );
     });
 
-    test('동일 attempt여도 document request가 바뀐 옛 callback은 stale이다', () {
+    test('같은 attempt/revision이어도 process generation이 바뀌면 stale이다', () {
       expect(
         snapshot.matches(
           epoch: 3,
           attemptId: 'sso-1',
           revision: 7,
-          requestId: 'request-new-document',
-          leaseGeneration: 11,
+          leaseGeneration: 12,
         ),
         isFalse,
       );

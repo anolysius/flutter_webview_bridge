@@ -1,6 +1,5 @@
 enum AuthUiCommitRejection {
   invalidPayload,
-  wrongRequest,
   wrongAttempt,
   staleRevision,
   hiddenDocument,
@@ -19,7 +18,6 @@ class AuthUiCommitDecision {
 
 AuthUiCommitDecision validateAuthUiCommit({
   required dynamic data,
-  required String? activeRequestId,
   required String? activeAuthSessionId,
   required int activeAuthRevision,
   required bool nativeIsHome,
@@ -28,11 +26,6 @@ AuthUiCommitDecision validateAuthUiCommit({
   if (data is! Map || data['protocolVersion'] != 2) {
     return const AuthUiCommitDecision.rejected(
       AuthUiCommitRejection.invalidPayload,
-    );
-  }
-  if (activeRequestId != null && data['requestId'] != activeRequestId) {
-    return const AuthUiCommitDecision.rejected(
-      AuthUiCommitRejection.wrongRequest,
     );
   }
   if (activeAuthSessionId != null &&

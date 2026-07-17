@@ -350,24 +350,30 @@ class FlutterWebViewBridgeJavaScriptChannel {
         activeAttemptId: _activeAuthSessionId,
       );
 
-  AuthTerminalWorkSnapshot _captureAuthTerminalWork(dynamic data) =>
-      AuthTerminalWorkSnapshot(
-        epoch: _authEpoch,
-        attemptId: _effectiveAuthSessionIdOf(data),
-        revision: _authRevisionOf(data) ?? _activeAuthRevision,
-        requestId: _requestIdOf(data) ?? _activeRequestId,
-        leaseGeneration: _processAuthLease?.generation,
-      );
+  AuthTerminalWorkSnapshot _captureAuthTerminalWork(dynamic data) {
+    final attemptId = _effectiveAuthSessionIdOf(data);
+    return AuthTerminalWorkSnapshot(
+      epoch: _authEpoch,
+      attemptId: attemptId,
+      revision: _authRevisionOf(data) ?? _activeAuthRevision,
+      leaseGeneration: _processAuthCoordinator.activeGenerationForAttempt(
+        attemptId,
+      ),
+    );
+  }
 
-  bool _isCurrentAuthTerminalWork(AuthTerminalWorkSnapshot snapshot) =>
-      !_isDisposed &&
-      snapshot.matches(
-        epoch: _authEpoch,
-        attemptId: _currentEffectiveAuthSessionId,
-        revision: _activeAuthRevision,
-        requestId: _activeRequestId,
-        leaseGeneration: _processAuthLease?.generation,
-      );
+  bool _isCurrentAuthTerminalWork(AuthTerminalWorkSnapshot snapshot) {
+    final attemptId = _currentEffectiveAuthSessionId;
+    return !_isDisposed &&
+        snapshot.matches(
+          epoch: _authEpoch,
+          attemptId: attemptId,
+          revision: _activeAuthRevision,
+          leaseGeneration: _processAuthCoordinator.activeGenerationForAttempt(
+            attemptId,
+          ),
+        );
+  }
 
   bool _rememberTerminalKey(String key) {
     if (!_terminalAuthSessionIds.add(key)) return false;
@@ -1061,6 +1067,7 @@ class FlutterWebViewBridgeJavaScriptChannel {
               }
               break;
             case WebViewBridgeFeatureType.googleSignInLogout:
+              _processAuthCoordinator.cancelActiveForExplicitLogout();
               _activeAuthRevision = await const AuthRevisionStore().next(
                 serviceCountry: serviceCountry,
               );
@@ -1081,6 +1088,7 @@ class FlutterWebViewBridgeJavaScriptChannel {
               }
               break;
             case WebViewBridgeFeatureType.appleSignInLogout:
+              _processAuthCoordinator.cancelActiveForExplicitLogout();
               _activeAuthRevision = await const AuthRevisionStore().next(
                 serviceCountry: serviceCountry,
               );
@@ -1101,6 +1109,7 @@ class FlutterWebViewBridgeJavaScriptChannel {
               }
               break;
             case WebViewBridgeFeatureType.kakaoSignInLogout:
+              _processAuthCoordinator.cancelActiveForExplicitLogout();
               _activeAuthRevision = await const AuthRevisionStore().next(
                 serviceCountry: serviceCountry,
               );
@@ -1194,6 +1203,10 @@ class FlutterWebViewBridgeJavaScriptChannel {
                 _logStaleAuthMessage('refreshTokenDelete', data);
                 return;
               }
+              // account logout은 다른 WebView document에서 도착할 수 있다. 저장소 삭제를
+              // 기다리는 동안 직후 재로그인이 기존 process owner에 의해 중복 처리되지
+              // 않도록 shared owner를 먼저 동기적으로 종료한다.
+              _processAuthCoordinator.cancelActiveForExplicitLogout();
               // web 가 종결 실패/로그아웃으로 token 삭제 — 타이머 살아있는 실제 실패이므로
               // reload 무의미. watchdog 해제 (frozen 케이스는 애초에 아무 메시지도 안 옴).
               // ignore: avoid_print
@@ -1524,6 +1537,18 @@ class FlutterWebViewBridgeJavaScriptChannel {
     if (data is! Map || data['protocolVersion'] != 2) return;
 
     final workSnapshot = _captureAuthTerminalWork(data);
+    final isKnownTerminal = _processAuthCoordinator.isTerminalSettled(
+      attemptId: workSnapshot.attemptId,
+      revision: workSnapshot.revision,
+    );
+    if (workSnapshot.leaseGeneration == null && !isKnownTerminal) {
+      _emitAuthTrace(
+        'auth.ui.rejected',
+        resultCode: 'no_active_auth_owner',
+        data: data,
+      );
+      return;
+    }
     if (!_isCurrentAuthTerminalWork(workSnapshot)) {
       _emitAuthTrace(
         'auth.ui.rejected',
@@ -1581,7 +1606,6 @@ class FlutterWebViewBridgeJavaScriptChannel {
       }
       final decision = validateAuthUiCommit(
         data: data,
-        activeRequestId: _activeRequestId,
         activeAuthSessionId: _activeAuthSessionId,
         activeAuthRevision: _activeAuthRevision,
         nativeIsHome: _isHomePath(currentUrl),
