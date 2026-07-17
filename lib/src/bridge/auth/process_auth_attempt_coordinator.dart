@@ -15,12 +15,14 @@ class ProcessAuthAttemptLease {
     required this.generation,
     required this.attemptId,
     required this.kind,
+    required this.startedAt,
     this.deduplicationKey,
   });
 
   final int generation;
   final String attemptId;
   final ProcessAuthAttemptKind kind;
+  final DateTime startedAt;
   final String? deduplicationKey;
 }
 
@@ -72,10 +74,16 @@ class _ActiveProcessAuthAttempt {
 /// process당 한 번만 관측하며, 사용자가 시작한 interactive 로그인은 진행 중인 자동
 /// 로그인을 선점한다. stale lease의 완료가 현재 시도를 지우지 않도록 generation을 쓴다.
 class ProcessAuthAttemptCoordinator {
-  ProcessAuthAttemptCoordinator();
+  ProcessAuthAttemptCoordinator({
+    DateTime Function()? now,
+    this.interactiveDuplicateWindow = const Duration(seconds: 12),
+  }) : _now = now ?? DateTime.now;
 
   static final ProcessAuthAttemptCoordinator shared =
       ProcessAuthAttemptCoordinator();
+
+  final DateTime Function() _now;
+  final Duration interactiveDuplicateWindow;
 
   bool _automaticBootstrapObserved = false;
   int _generation = 0;
@@ -137,11 +145,22 @@ class ProcessAuthAttemptCoordinator {
     required AuthAttemptSupersededCallback onSuperseded,
     required AuthAttemptSettledCallback onSettled,
     required String deduplicationKey,
+    void Function()? onActivated,
+    bool forceSupersedeDuplicate = false,
   }) {
     final previous = _active;
+    if (previous?.lease.attemptId == attemptId) {
+      return null;
+    }
     if (previous?.lease.kind == ProcessAuthAttemptKind.interactive &&
         previous?.lease.deduplicationKey == deduplicationKey) {
-      return null;
+      final elapsed = _now().difference(previous!.lease.startedAt);
+      // Web의 12초 stuck escape hatch 전까지 도착한 동일 provider 요청만 중복으로 본다.
+      // window가 지나면 원 owner가 유실/고착됐다고 보고 새 시도가 선점할 수 있어야 한다.
+      if (!forceSupersedeDuplicate &&
+          (elapsed.isNegative || elapsed < interactiveDuplicateWindow)) {
+        return null;
+      }
     }
     final lease = _activate(
       attemptId: attemptId,
@@ -151,6 +170,9 @@ class ProcessAuthAttemptCoordinator {
       deduplicationKey: deduplicationKey,
     );
     previous?.onSuperseded();
+    // 이전 owner callback이 bridge epoch를 무효화한 뒤 새 epoch를 발급해야 한다.
+    // duplicate early-return 경로에서는 호출하지 않아 현재 owner identity를 보존한다.
+    onActivated?.call();
     return lease;
   }
 
@@ -166,6 +188,7 @@ class ProcessAuthAttemptCoordinator {
       generation: _generation,
       attemptId: attemptId,
       kind: kind,
+      startedAt: _now(),
       deduplicationKey: deduplicationKey,
     );
     _active = _ActiveProcessAuthAttempt(

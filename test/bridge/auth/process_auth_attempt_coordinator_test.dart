@@ -71,11 +71,13 @@ void main() {
     test('동일 provider의 중복 interactive 시도는 active owner를 유지한다', () {
       final coordinator = ProcessAuthAttemptCoordinator();
       var firstSuperseded = 0;
+      var activated = 0;
       final first = coordinator.tryBeginInteractive(
         attemptId: 'sso-google-1',
         deduplicationKey: 'KR:GOOGLE_SIGN_IN_LOGIN',
         onSuperseded: () => firstSuperseded += 1,
         onSettled: () {},
+        onActivated: () => activated += 1,
       )!;
 
       final duplicate = coordinator.tryBeginInteractive(
@@ -83,20 +85,26 @@ void main() {
         deduplicationKey: 'KR:GOOGLE_SIGN_IN_LOGIN',
         onSuperseded: () {},
         onSettled: () {},
+        onActivated: () => activated += 1,
       );
 
       expect(duplicate, isNull);
       expect(firstSuperseded, 0);
+      expect(activated, 1);
       expect(coordinator.isActive(first), isTrue);
     });
 
     test('다른 provider의 interactive 시도는 active owner를 선점한다', () {
       final coordinator = ProcessAuthAttemptCoordinator();
       var googleSuperseded = 0;
+      final callbackOrder = <String>[];
       final google = coordinator.tryBeginInteractive(
         attemptId: 'sso-google',
         deduplicationKey: 'KR:GOOGLE_SIGN_IN_LOGIN',
-        onSuperseded: () => googleSuperseded += 1,
+        onSuperseded: () {
+          googleSuperseded += 1;
+          callbackOrder.add('google-superseded');
+        },
         onSettled: () {},
       )!;
 
@@ -105,11 +113,112 @@ void main() {
         deduplicationKey: 'KR:KAKAO_SIGN_IN_LOGIN',
         onSuperseded: () {},
         onSettled: () {},
+        onActivated: () => callbackOrder.add('kakao-activated'),
       )!;
 
       expect(googleSuperseded, 1);
       expect(coordinator.isActive(google), isFalse);
       expect(coordinator.isActive(kakao), isTrue);
+      expect(callbackOrder, ['google-superseded', 'kakao-activated']);
+    });
+
+    test('중복 window가 지나면 동일 provider 재시도가 고착 owner를 선점한다', () {
+      var now = DateTime.utc(2026, 7, 18);
+      final coordinator = ProcessAuthAttemptCoordinator(now: () => now);
+      var firstSuperseded = 0;
+      final first = coordinator.tryBeginInteractive(
+        attemptId: 'sso-google-stuck',
+        deduplicationKey: 'KR:GOOGLE_SIGN_IN_LOGIN',
+        onSuperseded: () => firstSuperseded += 1,
+        onSettled: () {},
+      )!;
+
+      now = now.add(const Duration(seconds: 12));
+      final retry = coordinator.tryBeginInteractive(
+        attemptId: 'sso-google-retry',
+        deduplicationKey: 'KR:GOOGLE_SIGN_IN_LOGIN',
+        onSuperseded: () {},
+        onSettled: () {},
+      )!;
+
+      expect(firstSuperseded, 1);
+      expect(coordinator.isActive(first), isFalse);
+      expect(coordinator.isActive(retry), isTrue);
+    });
+
+    test('동일 attempt replay는 중복 window 뒤에도 기존 owner를 보존한다', () {
+      var now = DateTime.utc(2026, 7, 18);
+      final coordinator = ProcessAuthAttemptCoordinator(now: () => now);
+      var superseded = 0;
+      var activated = 0;
+      final owner = coordinator.tryBeginInteractive(
+        attemptId: 'sso-google-same',
+        deduplicationKey: 'KR:GOOGLE_SIGN_IN_LOGIN',
+        onSuperseded: () => superseded += 1,
+        onSettled: () {},
+        onActivated: () => activated += 1,
+      )!;
+
+      now = now.add(const Duration(minutes: 1));
+      final replay = coordinator.tryBeginInteractive(
+        attemptId: 'sso-google-same',
+        deduplicationKey: 'KR:GOOGLE_SIGN_IN_LOGIN',
+        onSuperseded: () {},
+        onSettled: () {},
+        onActivated: () => activated += 1,
+        forceSupersedeDuplicate: true,
+      );
+
+      expect(replay, isNull);
+      expect(superseded, 0);
+      expect(activated, 1);
+      expect(coordinator.isActive(owner), isTrue);
+    });
+
+    test('동일 attempt ID는 provider가 달라져도 새 lease로 재사용하지 않는다', () {
+      final coordinator = ProcessAuthAttemptCoordinator();
+      var superseded = 0;
+      final owner = coordinator.tryBeginInteractive(
+        attemptId: 'sso-reused-id',
+        deduplicationKey: 'KR:GOOGLE_SIGN_IN_LOGIN',
+        onSuperseded: () => superseded += 1,
+        onSettled: () {},
+      )!;
+
+      final corruptedReplay = coordinator.tryBeginInteractive(
+        attemptId: 'sso-reused-id',
+        deduplicationKey: 'KR:KAKAO_SIGN_IN_LOGIN',
+        onSuperseded: () {},
+        onSettled: () {},
+        forceSupersedeDuplicate: true,
+      );
+
+      expect(corruptedReplay, isNull);
+      expect(superseded, 0);
+      expect(coordinator.isActive(owner), isTrue);
+    });
+
+    test('timeout retry 표식은 새 attempt의 동일 provider 선점을 즉시 허용한다', () {
+      final coordinator = ProcessAuthAttemptCoordinator();
+      var firstSuperseded = 0;
+      final first = coordinator.tryBeginInteractive(
+        attemptId: 'sso-google-first',
+        deduplicationKey: 'KR:GOOGLE_SIGN_IN_LOGIN',
+        onSuperseded: () => firstSuperseded += 1,
+        onSettled: () {},
+      )!;
+
+      final retry = coordinator.tryBeginInteractive(
+        attemptId: 'sso-google-timeout-retry',
+        deduplicationKey: 'KR:GOOGLE_SIGN_IN_LOGIN',
+        onSuperseded: () {},
+        onSettled: () {},
+        forceSupersedeDuplicate: true,
+      )!;
+
+      expect(firstSuperseded, 1);
+      expect(coordinator.isActive(first), isFalse);
+      expect(coordinator.isActive(retry), isTrue);
     });
 
     test('stale lease 완료는 현재 active attempt를 지우지 않는다', () {

@@ -706,16 +706,21 @@ class FlutterWebViewBridgeJavaScriptChannel {
     WebViewBridgeFeatureType type,
     dynamic data,
   ) async {
-    _authEpoch += 1;
-    final transactionEpoch = _authEpoch;
     late final ProcessAuthAttemptLease processLease;
+    late final int transactionEpoch;
     final provider = _providerOfRequest(data) ?? _providerNameOf(type);
     final claimedLease = _processAuthCoordinator.tryBeginInteractive(
       attemptId:
-          _authSessionIdOf(data) ?? 'interactive-${type.value}-$_authEpoch',
+          _authSessionIdOf(data) ??
+          'interactive-${type.value}-${DateTime.now().microsecondsSinceEpoch}',
       onSuperseded: () => _handleProcessAuthAttemptSuperseded(processLease),
       onSettled: () => _handleProcessAuthAttemptSettled(processLease),
       deduplicationKey: '${serviceCountry ?? "KR"}:$provider',
+      forceSupersedeDuplicate: data is Map && data['retryAfterTimeout'] == true,
+      onActivated: () {
+        _authEpoch += 1;
+        transactionEpoch = _authEpoch;
+      },
     );
     if (claimedLease == null) {
       _emitAuthTrace(
