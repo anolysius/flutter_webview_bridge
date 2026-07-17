@@ -29,4 +29,37 @@ void main() {
     expect(revisions.toSet(), Set<int>.from(List.generate(20, (i) => i + 1)));
     expect(await const AuthRevisionStore().current(serviceCountry: 'KR'), 20);
   });
+
+  test('국가 전환 뒤 bootstrap read는 이전 국가 active revision 대신 대상 저장값을 채택한다', () {
+    expect(
+      resolveRefreshAuthRevision(
+        activeRevision: 7,
+        storedRevision: 2,
+        preserveInteractiveAttempt: false,
+      ),
+      2,
+    );
+  });
+
+  test('동일 interactive 로그인 수렴 중 read는 진행 중 revision을 보존한다', () {
+    expect(
+      resolveRefreshAuthRevision(
+        activeRevision: 7,
+        storedRevision: 6,
+        preserveInteractiveAttempt: true,
+      ),
+      7,
+    );
+  });
+
+  test('revision read snapshot은 await 중 country 또는 epoch가 바뀌면 stale이다', () {
+    const snapshot = AuthRevisionReadSnapshot(
+      epoch: 3,
+      serviceCountry: 'GLOBAL',
+    );
+
+    expect(snapshot.matches(epoch: 3, serviceCountry: 'GLOBAL'), isTrue);
+    expect(snapshot.matches(epoch: 4, serviceCountry: 'GLOBAL'), isFalse);
+    expect(snapshot.matches(epoch: 3, serviceCountry: 'KR'), isFalse);
+  });
 }

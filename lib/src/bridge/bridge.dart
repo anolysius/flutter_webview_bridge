@@ -34,6 +34,7 @@ import 'auth/auth_revision_store.dart';
 import 'auth/auth_terminal_store.dart';
 import 'auth/auth_ui_commit.dart';
 import 'auth/auto_auth_attempt.dart';
+import 'auth/interactive_refresh_convergence.dart';
 import 'auth/process_auth_attempt_coordinator.dart';
 
 typedef AuthTraceCallback = void Function(Map<String, Object?> event);
@@ -160,6 +161,13 @@ class FlutterWebViewBridgeJavaScriptChannel {
     _processAuthCoordinator.resetForAuthBoundary();
     _autoAuthAttempt.resetForAuthBoundary();
     _invalidateAuthTransaction(reason);
+    // revision/request/document는 service-country domain에 속한다. 이전 국가 값이 대상
+    // 국가 첫 read에 섞이면 정상 로그인 응답이 stale-revision으로 거부된다.
+    _activeAuthRevision = 0;
+    _activeProtocolVersion = 1;
+    _activeRequestId = null;
+    _activeDocumentId = null;
+    _emitAuthTrace('auth.boundary.reset', resultCode: reason);
   }
 
   void updateAppLifecycleState(AppLifecycleState state) {
@@ -266,6 +274,27 @@ class FlutterWebViewBridgeJavaScriptChannel {
   final ProcessAuthAttemptCoordinator _processAuthCoordinator =
       ProcessAuthAttemptCoordinator.shared;
   ProcessAuthAttemptLease? _processAuthLease;
+
+  bool get _ownsActiveInteractiveLease {
+    final lease = _processAuthLease;
+    return lease != null &&
+        lease.kind == ProcessAuthAttemptKind.interactive &&
+        _processAuthCoordinator.isActive(lease);
+  }
+
+  String? get _cachedAuthSessionId {
+    final data = _cachedSessionPayload?['data'];
+    return data is Map ? data['authSessionId'] as String? : null;
+  }
+
+  bool _canReplayInteractiveRefresh(dynamic data) =>
+      shouldReplayInteractiveRefresh(
+        ownsActiveInteractiveLease: _ownsActiveInteractiveLease,
+        isTerminalConvergence: _authAttemptPhase.shouldRunTerminalDeadline,
+        activeAuthSessionId: _activeAuthSessionId,
+        cachedAuthSessionId: _cachedAuthSessionId,
+        requestedAuthSessionId: _authSessionIdOf(data),
+      );
 
   String? _authSessionIdOf(dynamic data) =>
       data is Map ? data['authSessionId'] as String? : null;
@@ -1060,19 +1089,34 @@ class FlutterWebViewBridgeJavaScriptChannel {
               );
               break;
             case WebViewBridgeFeatureType.refreshTokenRead:
-              if (_protocolVersionOf(data) >= 2) {
+              final readSnapshot = AuthRevisionReadSnapshot(
+                epoch: _authEpoch,
+                serviceCountry: serviceCountry,
+              );
+              final preserveInteractiveAttempt =
+                  _ownsActiveInteractiveLease && _awaitingAuthTerminal;
+              final storedRevision = await const AuthRevisionStore().current(
+                serviceCountry: readSnapshot.serviceCountry,
+              );
+              if (!context.mounted ||
+                  !readSnapshot.matches(
+                    epoch: _authEpoch,
+                    serviceCountry: serviceCountry,
+                  )) {
+                return;
+              }
+              _activeAuthRevision = resolveRefreshAuthRevision(
+                activeRevision: _activeAuthRevision,
+                storedRevision: storedRevision,
+                preserveInteractiveAttempt: preserveInteractiveAttempt,
+              );
+              if (!preserveInteractiveAttempt &&
+                  _protocolVersionOf(data) >= 2) {
                 _activeProtocolVersion = _protocolVersionOf(data);
                 _activeRequestId = _requestIdOf(data);
                 _activeAuthSessionId =
                     _authSessionIdOf(data) ?? _activeAuthSessionId;
                 _activeDocumentId = _stringFieldOf(data, 'documentId');
-              }
-              final storedRevision = await const AuthRevisionStore().current(
-                serviceCountry: serviceCountry,
-              );
-              if (!context.mounted) return;
-              if (storedRevision > _activeAuthRevision) {
-                _activeAuthRevision = storedRevision;
               }
               sendData = await RefreshTokenEvent().process(
                 context,
@@ -1241,11 +1285,23 @@ class FlutterWebViewBridgeJavaScriptChannel {
 
         if (webViewBridgeFeatureType ==
             WebViewBridgeFeatureType.refreshTokenRead) {
-          processAutoAuthWork = _beginAutoAuthAttemptIfNeeded(data, sendData);
+          final isInteractiveReplay =
+              _protocolVersionOf(data) >= 2 &&
+              _canReplayInteractiveRefresh(data);
+          if (isInteractiveReplay) {
+            _emitAuthTrace('auth.refresh.interactive_replay', data: data);
+          }
+          if (!isInteractiveReplay) {
+            processAutoAuthWork = _beginAutoAuthAttemptIfNeeded(data, sendData);
+          }
           // protocol v2 자동 인증 응답은 process-wide 소유권이 있을 때만 진행한다.
           // 다른 bridge instance에서 수동 로그인이 진행 중이면 오래된 refresh 결과가
           // 사용자가 선택한 로그인 결과를 덮어쓰지 않도록 응답 자체를 중단한다.
-          if (_protocolVersionOf(data) >= 2 && processAutoAuthWork == null) {
+          // 단, 현재 bridge가 소유한 동일 interactive 시도의 session replay는 새 home
+          // document로 수렴하는 경로이므로 새 auto lease 없이 그대로 허용한다.
+          if (_protocolVersionOf(data) >= 2 &&
+              processAutoAuthWork == null &&
+              !isInteractiveReplay) {
             return;
           }
         }
@@ -1902,6 +1958,7 @@ class FlutterWebViewBridgeJavaScriptChannel {
       }
       replayData['authRevision'] = _activeAuthRevision;
       _activeRequestId = _requestIdOf(requestData);
+      _activeDocumentId = _stringFieldOf(requestData, 'documentId');
       return {
         'type': WebViewBridgeFeatureType.authTokensReady.value,
         'data': replayData,
