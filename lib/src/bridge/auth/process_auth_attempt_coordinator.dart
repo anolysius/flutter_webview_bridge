@@ -17,6 +17,7 @@ class ProcessAuthAttemptLease {
     required this.kind,
     required this.startedAt,
     this.deduplicationKey,
+    this.predecessorAttemptId,
   });
 
   final int generation;
@@ -24,6 +25,19 @@ class ProcessAuthAttemptLease {
   final ProcessAuthAttemptKind kind;
   final DateTime startedAt;
   final String? deduplicationKey;
+  final String? predecessorAttemptId;
+}
+
+class _PendingConvergenceHandoff {
+  const _PendingConvergenceHandoff({
+    required this.predecessorAttemptId,
+    required this.convergenceKey,
+    required this.createdAt,
+  });
+
+  final String predecessorAttemptId;
+  final String convergenceKey;
+  final DateTime createdAt;
 }
 
 /// async gap 전후에 같은 인증 작업이 유지되는지 판별하는 불변 identity.
@@ -88,6 +102,7 @@ class ProcessAuthAttemptCoordinator {
   bool _automaticBootstrapObserved = false;
   int _generation = 0;
   _ActiveProcessAuthAttempt? _active;
+  _PendingConvergenceHandoff? _pendingConvergenceHandoff;
   final Set<String> _terminalKeys = <String>{};
 
   bool claimAutomaticBootstrap() {
@@ -100,6 +115,7 @@ class ProcessAuthAttemptCoordinator {
   /// 모든 bridge의 active owner를 선점 종료하고 대상 국가 bootstrap을 새로 허용한다.
   void resetForAuthBoundary() {
     _automaticBootstrapObserved = false;
+    _pendingConvergenceHandoff = null;
     _supersedeActiveAttempt();
   }
 
@@ -109,6 +125,7 @@ class ProcessAuthAttemptCoordinator {
   /// lease만 완료해서는 안 된다. 반면 같은 국가의 cold-start bootstrap gate는 다시
   /// 열지 않아 로그아웃 직후 불필요한 자동 인증이 시작되지 않게 한다.
   void cancelActiveForExplicitLogout() {
+    _pendingConvergenceHandoff = null;
     _supersedeActiveAttempt();
   }
 
@@ -122,13 +139,21 @@ class ProcessAuthAttemptCoordinator {
     required String attemptId,
     required AuthAttemptSupersededCallback onSuperseded,
     required AuthAttemptSettledCallback onSettled,
+    String? predecessorAttemptId,
+    String? convergenceKey,
   }) {
     if (_active != null) return null;
+    final resolvedPredecessorAttemptId =
+        predecessorAttemptId ??
+        (convergenceKey == null
+            ? null
+            : takeConvergenceHandoff(convergenceKey: convergenceKey));
     return _activate(
       attemptId: attemptId,
       kind: ProcessAuthAttemptKind.automatic,
       onSuperseded: onSuperseded,
       onSettled: onSettled,
+      predecessorAttemptId: resolvedPredecessorAttemptId,
     );
   }
 
@@ -168,7 +193,8 @@ class ProcessAuthAttemptCoordinator {
     if (previous?.lease.kind == ProcessAuthAttemptKind.interactive &&
         previous?.lease.deduplicationKey == deduplicationKey) {
       final elapsed = _now().difference(previous!.lease.startedAt);
-      // Web의 12초 stuck escape hatch 전까지 도착한 동일 provider 요청만 중복으로 본다.
+      // 짧은 구간에 도착한 동일 provider 요청만 중복으로 본다. Web의 native 접수 ACK
+      // timeout 재시도는 forceSupersedeDuplicate로 명시되므로 이 window와 독립적이다.
       // window가 지나면 원 owner가 유실/고착됐다고 보고 새 시도가 선점할 수 있어야 한다.
       if (!forceSupersedeDuplicate &&
           (elapsed.isNegative || elapsed < interactiveDuplicateWindow)) {
@@ -182,6 +208,7 @@ class ProcessAuthAttemptCoordinator {
       onSettled: onSettled,
       deduplicationKey: deduplicationKey,
     );
+    _pendingConvergenceHandoff = null;
     previous?.onSuperseded();
     // 이전 owner callback이 bridge epoch를 무효화한 뒤 새 epoch를 발급해야 한다.
     // duplicate early-return 경로에서는 호출하지 않아 현재 owner identity를 보존한다.
@@ -195,6 +222,7 @@ class ProcessAuthAttemptCoordinator {
     required AuthAttemptSupersededCallback onSuperseded,
     required AuthAttemptSettledCallback onSettled,
     String? deduplicationKey,
+    String? predecessorAttemptId,
   }) {
     _generation += 1;
     final lease = ProcessAuthAttemptLease._(
@@ -203,6 +231,7 @@ class ProcessAuthAttemptCoordinator {
       kind: kind,
       startedAt: _now(),
       deduplicationKey: deduplicationKey,
+      predecessorAttemptId: predecessorAttemptId,
     );
     _active = _ActiveProcessAuthAttempt(
       lease: lease,
@@ -221,6 +250,54 @@ class ProcessAuthAttemptCoordinator {
     final active = _active?.lease;
     if (attemptId == null || active?.attemptId != attemptId) return null;
     return active!.generation;
+  }
+
+  String? activePredecessorForAttempt(String? attemptId) {
+    final active = _active?.lease;
+    if (attemptId == null || active?.attemptId != attemptId) return null;
+    return active!.predecessorAttemptId;
+  }
+
+  void recordConvergenceHandoff({
+    required ProcessAuthAttemptLease lease,
+    required String convergenceKey,
+  }) {
+    if (!isActive(lease)) return;
+    _pendingConvergenceHandoff = _PendingConvergenceHandoff(
+      predecessorAttemptId: lease.attemptId,
+      convergenceKey: convergenceKey,
+      createdAt: _now(),
+    );
+  }
+
+  String? takeConvergenceHandoff({
+    required String convergenceKey,
+    Duration maxAge = const Duration(seconds: 60),
+  }) {
+    final pending = _pendingConvergenceHandoff;
+    if (pending == null) return null;
+    final age = _now().difference(pending.createdAt);
+    if (age.isNegative || age > maxAge) {
+      _pendingConvergenceHandoff = null;
+      return null;
+    }
+    if (pending.convergenceKey != convergenceKey) return null;
+    _pendingConvergenceHandoff = null;
+    return pending.predecessorAttemptId;
+  }
+
+  bool hasConvergenceHandoff({
+    required String convergenceKey,
+    Duration maxAge = const Duration(seconds: 60),
+  }) {
+    final pending = _pendingConvergenceHandoff;
+    if (pending == null) return false;
+    final age = _now().difference(pending.createdAt);
+    if (age.isNegative || age > maxAge) {
+      _pendingConvergenceHandoff = null;
+      return false;
+    }
+    return pending.convergenceKey == convergenceKey;
   }
 
   bool isCurrentTerminalWork(

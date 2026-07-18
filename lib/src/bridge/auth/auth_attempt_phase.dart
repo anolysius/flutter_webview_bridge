@@ -13,6 +13,10 @@ class AuthAttemptPhaseController {
   bool get shouldRunTerminalDeadline =>
       _phase == AuthAttemptPhase.terminalConvergence;
 
+  bool shouldEmitConvergenceHandoffOnDispose({
+    required bool hasActiveProcessLease,
+  }) => hasActiveProcessLease && isAwaitingTerminal;
+
   void beginProviderInteraction({required bool tracksTerminal}) {
     _phase = tracksTerminal
         ? AuthAttemptPhase.providerInteraction

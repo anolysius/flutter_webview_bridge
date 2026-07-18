@@ -189,6 +189,24 @@ class FlutterWebViewBridgeJavaScriptChannel {
   }
 
   void dispose() {
+    final processLease = _processAuthLease;
+    final shouldEmitConvergenceHandoff = _authAttemptPhase
+        .shouldEmitConvergenceHandoffOnDispose(
+          hasActiveProcessLease:
+              processLease != null &&
+              _processAuthCoordinator.isActive(processLease),
+        );
+    if (shouldEmitConvergenceHandoff) {
+      // 인증 시작 document가 home/account document로 교체되면 이 bridge의 timer와
+      // process owner가 함께 사라져 원 시도가 terminal 없이 남을 수 있다. 새 document의
+      // 자동 인증이 같은 revision에서 UI 성공을 증명하도록 명시적인 handoff로 닫는다.
+      // 집계기는 후속 UI 성공이 없는 handoff를 실패로 계산하므로 누락을 숨기지 않는다.
+      _processAuthCoordinator.recordConvergenceHandoff(
+        lease: processLease!,
+        convergenceKey: '${serviceCountry ?? "KR"}:$_activeAuthRevision',
+      );
+      _emitAuthTerminal('convergence_handoff', data: _activeAuthProtocolData());
+    }
     _isDisposed = true;
     final abortCompleter = _activeAuthAbortCompleter;
     if (abortCompleter != null && !abortCompleter.isCompleted) {
@@ -325,10 +343,17 @@ class FlutterWebViewBridgeJavaScriptChannel {
       : null;
 
   void _emitAuthTrace(String event, {String? resultCode, dynamic data}) {
+    final attemptId = _effectiveAuthSessionIdOf(data);
+    final predecessorAttemptId =
+        data is Map && data['predecessorAttemptId'] is String
+        ? data['predecessorAttemptId'] as String
+        : _processAuthCoordinator.activePredecessorForAttempt(attemptId);
     onAuthTrace?.call({
       'traceSchemaVersion': 2,
       'protocolVersion': _activeProtocolVersion,
-      'loginAttemptId': _effectiveAuthSessionIdOf(data),
+      'loginAttemptId': attemptId,
+      if (predecessorAttemptId != null)
+        'predecessorAttemptId': predecessorAttemptId,
       'requestId': _requestIdOf(data) ?? _activeRequestId,
       'authRevision': _authRevisionOf(data) ?? _activeAuthRevision,
       if (data is Map && data['documentId'] is String)
@@ -473,9 +498,19 @@ class FlutterWebViewBridgeJavaScriptChannel {
   }
 
   void _emitAuthTerminal(String resultCode, {dynamic data}) {
-    final key = _terminalKeyOf(data);
     final attemptId = _effectiveAuthSessionIdOf(data);
-    final revision = _authRevisionOf(data) ?? _activeAuthRevision;
+    final predecessorAttemptId = _processAuthCoordinator
+        .activePredecessorForAttempt(attemptId);
+    final terminalData = predecessorAttemptId == null
+        ? data
+        : <String, Object?>{
+            if (data is Map)
+              for (final entry in data.entries)
+                if (entry.key is String) entry.key as String: entry.value,
+            'predecessorAttemptId': predecessorAttemptId,
+          };
+    final key = _terminalKeyOf(terminalData);
+    final revision = _authRevisionOf(terminalData) ?? _activeAuthRevision;
     final isFirstProcessTerminal = _processAuthCoordinator.settleTerminal(
       attemptId: attemptId,
       revision: revision,
@@ -484,14 +519,14 @@ class FlutterWebViewBridgeJavaScriptChannel {
       _emitAuthTrace(
         'auth.terminal.duplicate_ignored',
         resultCode: resultCode,
-        data: data,
+        data: terminalData,
       );
       _settleAuthTerminalTracking();
       _completeProcessAuthLease();
       return;
     }
     _settleAuthTerminalTracking();
-    _emitAuthTrace('auth.terminal', resultCode: resultCode, data: data);
+    _emitAuthTrace('auth.terminal', resultCode: resultCode, data: terminalData);
     _completeProcessAuthLease();
   }
 
@@ -711,9 +746,15 @@ class FlutterWebViewBridgeJavaScriptChannel {
     if (_protocolVersionOf(requestData) < 2) return null;
 
     final fallbackNonce = DateTime.now().microsecondsSinceEpoch;
+    final convergenceKey = '${serviceCountry ?? "KR"}:$_activeAuthRevision';
+    final hasConvergenceHandoff = _processAuthCoordinator.hasConvergenceHandoff(
+      convergenceKey: convergenceKey,
+    );
     final isInitialBootstrap = _processAuthCoordinator
         .claimAutomaticBootstrap();
-    final trackedAttemptId = isInitialBootstrap
+    // process bootstrap을 이미 관측했더라도 document dispose handoff의 후속 read는
+    // 별도 tracked AUTO attempt로 승격해야 원 시도의 UI 수렴을 증명할 수 있다.
+    final trackedAttemptId = isInitialBootstrap || hasConvergenceHandoff
         ? _autoAuthAttempt.beginInitialRefresh(
             requestData: requestData,
             readResponse: readResponse,
@@ -735,6 +776,7 @@ class FlutterWebViewBridgeJavaScriptChannel {
         if (tracksTerminal) _handleProcessAuthAttemptSuperseded(lease);
       },
       onSettled: () => _handleProcessAuthAttemptSettled(lease),
+      convergenceKey: tracksTerminal ? convergenceKey : null,
     );
     if (claimed == null) {
       if (tracksTerminal) _autoAuthAttempt.clearActiveAttempt();

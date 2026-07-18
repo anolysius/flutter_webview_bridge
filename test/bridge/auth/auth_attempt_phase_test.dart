@@ -47,5 +47,34 @@ void main() {
       expect(controller.isAwaitingTerminal, isFalse);
       expect(controller.shouldRunTerminalDeadline, isFalse);
     });
+
+    test(
+      'active process owner가 terminal 대기 중 dispose되면 convergence handoff한다',
+      () {
+        final controller = AuthAttemptPhaseController()
+          ..beginProviderInteraction(tracksTerminal: true);
+
+        expect(
+          controller.shouldEmitConvergenceHandoffOnDispose(
+            hasActiveProcessLease: true,
+          ),
+          isTrue,
+        );
+        expect(
+          controller.shouldEmitConvergenceHandoffOnDispose(
+            hasActiveProcessLease: false,
+          ),
+          isFalse,
+        );
+
+        controller.settle();
+        expect(
+          controller.shouldEmitConvergenceHandoffOnDispose(
+            hasActiveProcessLease: true,
+          ),
+          isFalse,
+        );
+      },
+    );
   });
 }

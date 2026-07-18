@@ -424,6 +424,75 @@ void main() {
       expect(coordinator.claimAutomaticBootstrap(), isFalse);
     });
 
+    test(
+      'convergence handoff는 같은 key의 다음 auto lease에 predecessor를 한 번만 전달한다',
+      () {
+        var now = DateTime(2026, 7, 18, 9);
+        final coordinator = ProcessAuthAttemptCoordinator(now: () => now);
+        final interactive = coordinator.beginInteractive(
+          attemptId: 'interactive-1',
+          onSuperseded: () {},
+          onSettled: () {},
+        );
+        coordinator.recordConvergenceHandoff(
+          lease: interactive,
+          convergenceKey: 'KR:7',
+        );
+        coordinator.settleTerminal(attemptId: 'interactive-1', revision: 7);
+
+        expect(
+          coordinator.hasConvergenceHandoff(convergenceKey: 'KR:7'),
+          isTrue,
+        );
+
+        final automatic = coordinator.tryBeginAutomatic(
+          attemptId: 'auto-1',
+          convergenceKey: 'KR:7',
+          onSuperseded: () {},
+          onSettled: () {},
+        );
+
+        expect(automatic?.predecessorAttemptId, 'interactive-1');
+        expect(
+          coordinator.activePredecessorForAttempt('auto-1'),
+          'interactive-1',
+        );
+        expect(
+          coordinator.takeConvergenceHandoff(convergenceKey: 'KR:7'),
+          isNull,
+        );
+      },
+    );
+
+    test('convergence handoff는 다른 key나 60초 초과 auto에 연결되지 않는다', () {
+      var now = DateTime(2026, 7, 18, 9);
+      final coordinator = ProcessAuthAttemptCoordinator(now: () => now);
+      final interactive = coordinator.beginInteractive(
+        attemptId: 'interactive-1',
+        onSuperseded: () {},
+        onSettled: () {},
+      );
+      coordinator.recordConvergenceHandoff(
+        lease: interactive,
+        convergenceKey: 'KR:7',
+      );
+
+      expect(
+        coordinator.takeConvergenceHandoff(convergenceKey: 'GLOBAL:7'),
+        isNull,
+      );
+      expect(coordinator.hasConvergenceHandoff(convergenceKey: 'KR:7'), isTrue);
+      now = now.add(const Duration(seconds: 61));
+      expect(
+        coordinator.hasConvergenceHandoff(convergenceKey: 'KR:7'),
+        isFalse,
+      );
+      expect(
+        coordinator.takeConvergenceHandoff(convergenceKey: 'KR:7'),
+        isNull,
+      );
+    });
+
     test('superseded callback의 stale 완료가 callback 중 생성된 새 owner를 지우지 않는다', () {
       final coordinator = ProcessAuthAttemptCoordinator();
       late ProcessAuthAttemptLease old;
