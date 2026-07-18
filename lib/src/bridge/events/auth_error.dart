@@ -15,7 +15,12 @@ class AuthError implements Exception {
   /// 디버깅용 raw message (사용자 노출 X). SDK 가 던진 exception 의 toString().
   final String message;
 
-  const AuthError(this.code, this.message);
+  /// Provider-prefixed, allowlisted SDK reason. Raw SDK messages/codes are not
+  /// persisted because they may contain account or response details.
+  final String nativeSdkErrorCode;
+
+  const AuthError(this.code, this.message, {String? nativeSdkErrorCode})
+    : nativeSdkErrorCode = nativeSdkErrorCode ?? code;
 
   @override
   String toString() => 'AuthError($code): $message';

@@ -1,0 +1,571 @@
+import 'package:flutter_test/flutter_test.dart';
+import 'package:flutter_webview_bridge/src/bridge/auth/process_auth_attempt_coordinator.dart';
+
+void main() {
+  group('ProcessAuthAttemptCoordinator', () {
+    test('auto bootstrap은 여러 bridge instance를 통틀어 process당 한 번만 claim된다', () {
+      final coordinator = ProcessAuthAttemptCoordinator();
+
+      expect(coordinator.claimAutomaticBootstrap(), isTrue);
+      expect(coordinator.claimAutomaticBootstrap(), isFalse);
+    });
+
+    test('active interactive 시도는 새 auto attempt를 억제한다', () {
+      final coordinator = ProcessAuthAttemptCoordinator();
+      final interactive = coordinator.beginInteractive(
+        attemptId: 'sso-1',
+        onSuperseded: () {},
+        onSettled: () {},
+      );
+
+      final automatic = coordinator.tryBeginAutomatic(
+        attemptId: 'auto-1',
+        onSuperseded: () {},
+        onSettled: () {},
+      );
+
+      expect(coordinator.isActive(interactive), isTrue);
+      expect(automatic, isNull);
+    });
+
+    test('interactive 시도는 active auto를 선점하고 callback을 정확히 한 번 호출한다', () {
+      final coordinator = ProcessAuthAttemptCoordinator();
+      var superseded = 0;
+      final automatic = coordinator.tryBeginAutomatic(
+        attemptId: 'auto-1',
+        onSuperseded: () => superseded += 1,
+        onSettled: () {},
+      )!;
+
+      final interactive = coordinator.beginInteractive(
+        attemptId: 'sso-1',
+        onSuperseded: () {},
+        onSettled: () {},
+      );
+
+      expect(superseded, 1);
+      expect(coordinator.isActive(automatic), isFalse);
+      expect(coordinator.isActive(interactive), isTrue);
+    });
+
+    test('새 interactive 시도는 이전 interactive 시도를 선점한다', () {
+      final coordinator = ProcessAuthAttemptCoordinator();
+      var firstSuperseded = 0;
+      final first = coordinator.beginInteractive(
+        attemptId: 'sso-1',
+        onSuperseded: () => firstSuperseded += 1,
+        onSettled: () {},
+      );
+
+      final second = coordinator.beginInteractive(
+        attemptId: 'sso-2',
+        onSuperseded: () {},
+        onSettled: () {},
+      );
+
+      expect(firstSuperseded, 1);
+      expect(coordinator.isActive(first), isFalse);
+      expect(coordinator.isActive(second), isTrue);
+    });
+
+    test('동일 provider의 중복 interactive 시도는 active owner를 유지한다', () {
+      final coordinator = ProcessAuthAttemptCoordinator();
+      var firstSuperseded = 0;
+      var activated = 0;
+      final first = coordinator.tryBeginInteractive(
+        attemptId: 'sso-google-1',
+        deduplicationKey: 'KR:GOOGLE_SIGN_IN_LOGIN',
+        onSuperseded: () => firstSuperseded += 1,
+        onSettled: () {},
+        onActivated: () => activated += 1,
+      )!;
+
+      final duplicate = coordinator.tryBeginInteractive(
+        attemptId: 'sso-google-2',
+        deduplicationKey: 'KR:GOOGLE_SIGN_IN_LOGIN',
+        onSuperseded: () {},
+        onSettled: () {},
+        onActivated: () => activated += 1,
+      );
+
+      expect(duplicate, isNull);
+      expect(firstSuperseded, 0);
+      expect(activated, 1);
+      expect(coordinator.isActive(first), isTrue);
+    });
+
+    test('다른 provider의 interactive 시도는 active owner를 선점한다', () {
+      final coordinator = ProcessAuthAttemptCoordinator();
+      var googleSuperseded = 0;
+      final callbackOrder = <String>[];
+      final google = coordinator.tryBeginInteractive(
+        attemptId: 'sso-google',
+        deduplicationKey: 'KR:GOOGLE_SIGN_IN_LOGIN',
+        onSuperseded: () {
+          googleSuperseded += 1;
+          callbackOrder.add('google-superseded');
+        },
+        onSettled: () {},
+      )!;
+
+      final kakao = coordinator.tryBeginInteractive(
+        attemptId: 'sso-kakao',
+        deduplicationKey: 'KR:KAKAO_SIGN_IN_LOGIN',
+        onSuperseded: () {},
+        onSettled: () {},
+        onActivated: () => callbackOrder.add('kakao-activated'),
+      )!;
+
+      expect(googleSuperseded, 1);
+      expect(coordinator.isActive(google), isFalse);
+      expect(coordinator.isActive(kakao), isTrue);
+      expect(callbackOrder, ['google-superseded', 'kakao-activated']);
+    });
+
+    test('중복 window가 지나면 동일 provider 재시도가 고착 owner를 선점한다', () {
+      var now = DateTime.utc(2026, 7, 18);
+      final coordinator = ProcessAuthAttemptCoordinator(now: () => now);
+      var firstSuperseded = 0;
+      final first = coordinator.tryBeginInteractive(
+        attemptId: 'sso-google-stuck',
+        deduplicationKey: 'KR:GOOGLE_SIGN_IN_LOGIN',
+        onSuperseded: () => firstSuperseded += 1,
+        onSettled: () {},
+      )!;
+
+      now = now.add(const Duration(seconds: 12));
+      final retry = coordinator.tryBeginInteractive(
+        attemptId: 'sso-google-retry',
+        deduplicationKey: 'KR:GOOGLE_SIGN_IN_LOGIN',
+        onSuperseded: () {},
+        onSettled: () {},
+      )!;
+
+      expect(firstSuperseded, 1);
+      expect(coordinator.isActive(first), isFalse);
+      expect(coordinator.isActive(retry), isTrue);
+    });
+
+    test('동일 attempt replay는 중복 window 뒤에도 기존 owner를 보존한다', () {
+      var now = DateTime.utc(2026, 7, 18);
+      final coordinator = ProcessAuthAttemptCoordinator(now: () => now);
+      var superseded = 0;
+      var activated = 0;
+      final owner = coordinator.tryBeginInteractive(
+        attemptId: 'sso-google-same',
+        deduplicationKey: 'KR:GOOGLE_SIGN_IN_LOGIN',
+        onSuperseded: () => superseded += 1,
+        onSettled: () {},
+        onActivated: () => activated += 1,
+      )!;
+
+      now = now.add(const Duration(minutes: 1));
+      final replay = coordinator.tryBeginInteractive(
+        attemptId: 'sso-google-same',
+        deduplicationKey: 'KR:GOOGLE_SIGN_IN_LOGIN',
+        onSuperseded: () {},
+        onSettled: () {},
+        onActivated: () => activated += 1,
+        forceSupersedeDuplicate: true,
+      );
+
+      expect(replay, isNull);
+      expect(superseded, 0);
+      expect(activated, 1);
+      expect(coordinator.isActive(owner), isTrue);
+    });
+
+    test('동일 attempt ID는 provider가 달라져도 새 lease로 재사용하지 않는다', () {
+      final coordinator = ProcessAuthAttemptCoordinator();
+      var superseded = 0;
+      final owner = coordinator.tryBeginInteractive(
+        attemptId: 'sso-reused-id',
+        deduplicationKey: 'KR:GOOGLE_SIGN_IN_LOGIN',
+        onSuperseded: () => superseded += 1,
+        onSettled: () {},
+      )!;
+
+      final corruptedReplay = coordinator.tryBeginInteractive(
+        attemptId: 'sso-reused-id',
+        deduplicationKey: 'KR:KAKAO_SIGN_IN_LOGIN',
+        onSuperseded: () {},
+        onSettled: () {},
+        forceSupersedeDuplicate: true,
+      );
+
+      expect(corruptedReplay, isNull);
+      expect(superseded, 0);
+      expect(coordinator.isActive(owner), isTrue);
+    });
+
+    test('timeout retry 표식은 새 attempt의 동일 provider 선점을 즉시 허용한다', () {
+      final coordinator = ProcessAuthAttemptCoordinator();
+      var firstSuperseded = 0;
+      final first = coordinator.tryBeginInteractive(
+        attemptId: 'sso-google-first',
+        deduplicationKey: 'KR:GOOGLE_SIGN_IN_LOGIN',
+        onSuperseded: () => firstSuperseded += 1,
+        onSettled: () {},
+      )!;
+
+      final retry = coordinator.tryBeginInteractive(
+        attemptId: 'sso-google-timeout-retry',
+        deduplicationKey: 'KR:GOOGLE_SIGN_IN_LOGIN',
+        onSuperseded: () {},
+        onSettled: () {},
+        forceSupersedeDuplicate: true,
+      )!;
+
+      expect(firstSuperseded, 1);
+      expect(coordinator.isActive(first), isFalse);
+      expect(coordinator.isActive(retry), isTrue);
+    });
+
+    test('stale lease 완료는 현재 active attempt를 지우지 않는다', () {
+      final coordinator = ProcessAuthAttemptCoordinator();
+      final automatic = coordinator.tryBeginAutomatic(
+        attemptId: 'auto-1',
+        onSuperseded: () {},
+        onSettled: () {},
+      )!;
+      final interactive = coordinator.beginInteractive(
+        attemptId: 'sso-1',
+        onSuperseded: () {},
+        onSettled: () {},
+      );
+
+      coordinator.complete(automatic);
+
+      expect(coordinator.isActive(interactive), isTrue);
+      coordinator.complete(interactive);
+      expect(coordinator.isActive(interactive), isFalse);
+    });
+
+    test('active auto가 있으면 두 번째 bridge의 auto attempt를 억제한다', () {
+      final coordinator = ProcessAuthAttemptCoordinator();
+      final first = coordinator.tryBeginAutomatic(
+        attemptId: 'auto-1',
+        onSuperseded: () {},
+        onSettled: () {},
+      );
+
+      final second = coordinator.tryBeginAutomatic(
+        attemptId: 'auto-2',
+        onSuperseded: () {},
+        onSettled: () {},
+      );
+
+      expect(first, isNotNull);
+      expect(second, isNull);
+    });
+
+    test('다른 bridge의 terminal 확정은 원 소유자의 deadline을 즉시 정지시킨다', () {
+      final coordinator = ProcessAuthAttemptCoordinator();
+      var settled = 0;
+      final owner = coordinator.beginInteractive(
+        attemptId: 'sso-1',
+        onSuperseded: () {},
+        onSettled: () => settled += 1,
+      );
+
+      expect(
+        coordinator.settleTerminal(attemptId: 'sso-1', revision: 7),
+        isTrue,
+      );
+
+      expect(settled, 1);
+      expect(coordinator.isActive(owner), isFalse);
+    });
+
+    test('동일 attempt는 revision이 달라도 process terminal이 한 번만 승인된다', () {
+      final coordinator = ProcessAuthAttemptCoordinator();
+
+      expect(
+        coordinator.settleTerminal(attemptId: 'sso-1', revision: 7),
+        isTrue,
+      );
+      expect(
+        coordinator.settleTerminal(attemptId: 'sso-1', revision: 8),
+        isFalse,
+      );
+      expect(
+        coordinator.isTerminalSettled(attemptId: 'sso-1', revision: 99),
+        isTrue,
+      );
+    });
+
+    test('관련 없는 terminal은 현재 active attempt를 종료하지 않는다', () {
+      final coordinator = ProcessAuthAttemptCoordinator();
+      var settled = 0;
+      final active = coordinator.beginInteractive(
+        attemptId: 'sso-active',
+        onSuperseded: () {},
+        onSettled: () => settled += 1,
+      );
+
+      coordinator.settleTerminal(attemptId: 'sso-other', revision: 1);
+
+      expect(settled, 0);
+      expect(coordinator.isActive(active), isTrue);
+    });
+
+    test('auth boundary reset은 active owner를 종료하고 bootstrap gate를 다시 연다', () {
+      final coordinator = ProcessAuthAttemptCoordinator();
+      var superseded = 0;
+      final active = coordinator.beginInteractive(
+        attemptId: 'global-sso',
+        onSuperseded: () => superseded += 1,
+        onSettled: () {},
+      );
+      expect(coordinator.claimAutomaticBootstrap(), isTrue);
+      expect(coordinator.claimAutomaticBootstrap(), isFalse);
+
+      coordinator.resetForAuthBoundary();
+
+      expect(superseded, 1);
+      expect(coordinator.isActive(active), isFalse);
+      expect(coordinator.claimAutomaticBootstrap(), isTrue);
+    });
+
+    test('명시적 로그아웃은 shared owner만 즉시 종료하고 bootstrap gate는 유지한다', () {
+      final coordinator = ProcessAuthAttemptCoordinator();
+      var superseded = 0;
+      expect(coordinator.claimAutomaticBootstrap(), isTrue);
+      final active = coordinator.tryBeginInteractive(
+        attemptId: 'sso-kakao-old',
+        deduplicationKey: 'KR:KAKAO_SIGN_IN_LOGIN',
+        onSuperseded: () => superseded += 1,
+        onSettled: () {},
+      )!;
+
+      coordinator.cancelActiveForExplicitLogout();
+
+      expect(superseded, 1);
+      expect(coordinator.isActive(active), isFalse);
+      expect(coordinator.claimAutomaticBootstrap(), isFalse);
+      final immediateRelogin = coordinator.tryBeginInteractive(
+        attemptId: 'sso-kakao-new',
+        deduplicationKey: 'KR:KAKAO_SIGN_IN_LOGIN',
+        onSuperseded: () {},
+        onSettled: () {},
+      );
+      expect(immediateRelogin, isNotNull);
+    });
+
+    test('다른 bridge도 active attempt generation을 동일하게 관측한다', () {
+      final coordinator = ProcessAuthAttemptCoordinator();
+      final active = coordinator.beginInteractive(
+        attemptId: 'sso-cross-document',
+        onSuperseded: () {},
+        onSettled: () {},
+      );
+
+      expect(
+        coordinator.activeGenerationForAttempt('sso-cross-document'),
+        active.generation,
+      );
+      expect(coordinator.activeGenerationForAttempt('sso-other'), isNull);
+
+      final observerSnapshot = AuthTerminalWorkSnapshot(
+        epoch: 5,
+        attemptId: 'sso-cross-document',
+        revision: 9,
+        leaseGeneration: active.generation,
+      );
+      expect(
+        coordinator.isCurrentTerminalWork(
+          observerSnapshot,
+          epoch: 5,
+          revision: 9,
+        ),
+        isTrue,
+      );
+      expect(
+        coordinator.isCurrentTerminalWork(
+          AuthTerminalWorkSnapshot(
+            epoch: 5,
+            attemptId: 'sso-other',
+            revision: 9,
+            leaseGeneration: active.generation,
+          ),
+          epoch: 5,
+          revision: 9,
+        ),
+        isFalse,
+      );
+    });
+
+    test('boundary 이전 stale lease 완료가 대상 국가의 새 auto owner를 지우지 않는다', () {
+      final coordinator = ProcessAuthAttemptCoordinator();
+      final old = coordinator.beginInteractive(
+        attemptId: 'global-sso',
+        onSuperseded: () {},
+        onSettled: () {},
+      );
+      coordinator.resetForAuthBoundary();
+      final target = coordinator.tryBeginAutomatic(
+        attemptId: 'kr-bootstrap',
+        onSuperseded: () {},
+        onSettled: () {},
+      )!;
+
+      coordinator.complete(old);
+
+      expect(coordinator.isActive(target), isTrue);
+    });
+
+    test('active owner가 없는 auth boundary reset은 반복 호출해도 안전하다', () {
+      final coordinator = ProcessAuthAttemptCoordinator();
+
+      coordinator.resetForAuthBoundary();
+      coordinator.resetForAuthBoundary();
+
+      expect(coordinator.claimAutomaticBootstrap(), isTrue);
+      expect(coordinator.claimAutomaticBootstrap(), isFalse);
+    });
+
+    test(
+      'convergence handoff는 같은 key의 다음 auto lease에 predecessor를 한 번만 전달한다',
+      () {
+        var now = DateTime(2026, 7, 18, 9);
+        final coordinator = ProcessAuthAttemptCoordinator(now: () => now);
+        final interactive = coordinator.beginInteractive(
+          attemptId: 'interactive-1',
+          onSuperseded: () {},
+          onSettled: () {},
+        );
+        coordinator.recordConvergenceHandoff(
+          lease: interactive,
+          convergenceKey: 'KR:7',
+        );
+        coordinator.settleTerminal(attemptId: 'interactive-1', revision: 7);
+
+        expect(
+          coordinator.hasConvergenceHandoff(convergenceKey: 'KR:7'),
+          isTrue,
+        );
+
+        final automatic = coordinator.tryBeginAutomatic(
+          attemptId: 'auto-1',
+          convergenceKey: 'KR:7',
+          onSuperseded: () {},
+          onSettled: () {},
+        );
+
+        expect(automatic?.predecessorAttemptId, 'interactive-1');
+        expect(
+          coordinator.activePredecessorForAttempt('auto-1'),
+          'interactive-1',
+        );
+        expect(
+          coordinator.takeConvergenceHandoff(convergenceKey: 'KR:7'),
+          isNull,
+        );
+      },
+    );
+
+    test('convergence handoff는 다른 key나 60초 초과 auto에 연결되지 않는다', () {
+      var now = DateTime(2026, 7, 18, 9);
+      final coordinator = ProcessAuthAttemptCoordinator(now: () => now);
+      final interactive = coordinator.beginInteractive(
+        attemptId: 'interactive-1',
+        onSuperseded: () {},
+        onSettled: () {},
+      );
+      coordinator.recordConvergenceHandoff(
+        lease: interactive,
+        convergenceKey: 'KR:7',
+      );
+
+      expect(
+        coordinator.takeConvergenceHandoff(convergenceKey: 'GLOBAL:7'),
+        isNull,
+      );
+      expect(coordinator.hasConvergenceHandoff(convergenceKey: 'KR:7'), isTrue);
+      now = now.add(const Duration(seconds: 61));
+      expect(
+        coordinator.hasConvergenceHandoff(convergenceKey: 'KR:7'),
+        isFalse,
+      );
+      expect(
+        coordinator.takeConvergenceHandoff(convergenceKey: 'KR:7'),
+        isNull,
+      );
+    });
+
+    test('superseded callback의 stale 완료가 callback 중 생성된 새 owner를 지우지 않는다', () {
+      final coordinator = ProcessAuthAttemptCoordinator();
+      late ProcessAuthAttemptLease old;
+      late ProcessAuthAttemptLease target;
+      old = coordinator.beginInteractive(
+        attemptId: 'global-sso',
+        onSuperseded: () {
+          target = coordinator.tryBeginAutomatic(
+            attemptId: 'kr-bootstrap',
+            onSuperseded: () {},
+            onSettled: () {},
+          )!;
+          coordinator.complete(old);
+        },
+        onSettled: () {},
+      );
+
+      coordinator.resetForAuthBoundary();
+
+      expect(coordinator.isActive(target), isTrue);
+    });
+  });
+
+  group('AuthTerminalWorkSnapshot', () {
+    const snapshot = AuthTerminalWorkSnapshot(
+      epoch: 3,
+      attemptId: 'sso-1',
+      revision: 7,
+      leaseGeneration: 11,
+    );
+
+    test('다른 bridge도 같은 process generation/revision이면 현재 작업이다', () {
+      expect(
+        snapshot.matchesProcessOwner(
+          epoch: 3,
+          revision: 7,
+          leaseGeneration: 11,
+        ),
+        isTrue,
+      );
+    });
+
+    test('await 중 epoch/revision/lease가 바뀌면 stale로 판정한다', () {
+      expect(
+        snapshot.matchesProcessOwner(
+          epoch: 4,
+          revision: 8,
+          leaseGeneration: 12,
+        ),
+        isFalse,
+      );
+    });
+
+    test('같은 attempt/revision이어도 process generation이 바뀌면 stale이다', () {
+      expect(
+        snapshot.matchesProcessOwner(
+          epoch: 3,
+          revision: 7,
+          leaseGeneration: 12,
+        ),
+        isFalse,
+      );
+    });
+
+    test('active process owner가 사라지면 null generation끼리도 현재 작업이 아니다', () {
+      expect(
+        snapshot.matchesProcessOwner(
+          epoch: 3,
+          revision: 7,
+          leaseGeneration: null,
+        ),
+        isFalse,
+      );
+    });
+  });
+}

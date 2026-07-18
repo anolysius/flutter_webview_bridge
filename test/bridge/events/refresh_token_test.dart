@@ -126,6 +126,70 @@ void main() {
         isNull,
       );
     });
+
+    testWidgets(
+      'v2 read는 request/document/revision을 echo하고 absent를 logout으로 표현하지 않는다',
+      (tester) async {
+        SharedPreferences.setMockInitialValues({});
+        ctx = await pumpCtx(tester);
+
+        final response = await RefreshTokenEvent().process(
+          ctx,
+          action: 'read',
+          data: {
+            'protocolVersion': 2,
+            'requestId': 'request-1',
+            'authSessionId': 'attempt-1',
+            'documentId': 'doc-1',
+            'pageGeneration': 1,
+          },
+          serviceCountry: 'KR',
+          authRevision: 9,
+        );
+
+        expect(response['error'], isNull);
+        expect(response['data'], {
+          'status': 'absent',
+          'protocolVersion': 2,
+          'requestId': 'request-1',
+          'authSessionId': 'attempt-1',
+          'documentId': 'doc-1',
+          'pageGeneration': 1,
+          'authRevision': 9,
+        });
+      },
+    );
+
+    testWidgets(
+      'v2 write는 저장 read-back 검증 뒤 token 원문 없이 stored receipt만 반환한다',
+      (tester) async {
+        SharedPreferences.setMockInitialValues({});
+        ctx = await pumpCtx(tester);
+
+        final response = await RefreshTokenEvent().process(
+          ctx,
+          action: 'write',
+          data: {
+            'protocolVersion': 2,
+            'requestId': 'request-2',
+            'documentId': 'doc-2',
+            'refreshToken': 'secret-refresh-token',
+          },
+          serviceCountry: 'KR',
+          authRevision: 10,
+        );
+
+        expect((response['data'] as Map)['status'], 'stored');
+        expect(
+          (response['data'] as Map).containsValue('secret-refresh-token'),
+          isFalse,
+        );
+        expect(
+          (await SharedPreferences.getInstance()).getString(kRefreshTokenKey),
+          'secret-refresh-token',
+        );
+      },
+    );
   });
 
   group('clearAllRefreshTokens — staff 국가 전환 = 완전 로그아웃', () {

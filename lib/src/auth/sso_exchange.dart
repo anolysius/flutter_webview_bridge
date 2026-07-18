@@ -27,7 +27,17 @@ class SsoExchangeResult {
 
 class SsoExchangeException implements Exception {
   final String message;
-  const SsoExchangeException(this.message);
+  final String failureStage;
+  final String failureCode;
+  final bool externalFailure;
+  final int? statusCode;
+  const SsoExchangeException(
+    this.message, {
+    required this.failureStage,
+    required this.failureCode,
+    this.externalFailure = false,
+    this.statusCode,
+  });
 
   @override
   String toString() => 'SsoExchangeException: $message';
@@ -106,14 +116,29 @@ class SsoExchange {
     );
     if (idRes.statusCode < 200 || idRes.statusCode >= 300) {
       throw SsoExchangeException(
-        'id-token ${idRes.statusCode}: ${_preview(idRes.body)}',
+        'id-token HTTP ${idRes.statusCode}',
+        failureStage: 'id_token_exchange',
+        failureCode: 'SSO_ID_TOKEN_HTTP',
+        externalFailure: _isExternalStatus(idRes.statusCode),
+        statusCode: idRes.statusCode,
       );
     }
-    final idBody = _decode(idRes.body);
+    final Map<String, dynamic> idBody;
+    try {
+      idBody = _decode(idRes.body);
+    } on FormatException {
+      throw const SsoExchangeException(
+        'id-token response invalid JSON',
+        failureStage: 'id_token_exchange',
+        failureCode: 'SSO_ID_TOKEN_INVALID_RESPONSE',
+      );
+    }
     final refreshToken = idBody['refreshToken'] as String?;
     if (refreshToken == null || refreshToken.isEmpty) {
-      throw SsoExchangeException(
-        'id-token 응답 refreshToken 부재: ${_preview(idRes.body)}',
+      throw const SsoExchangeException(
+        'id-token response missing refreshToken',
+        failureStage: 'id_token_exchange',
+        failureCode: 'SSO_ID_TOKEN_MISSING_REFRESH',
       );
     }
 
@@ -141,17 +166,32 @@ class SsoExchange {
     );
     if (rfRes.statusCode < 200 || rfRes.statusCode >= 300) {
       throw SsoExchangeException(
-        'refresh ${rfRes.statusCode}: ${_preview(rfRes.body)}',
+        'refresh HTTP ${rfRes.statusCode}',
+        failureStage: 'refresh_exchange',
+        failureCode: 'SSO_REFRESH_HTTP',
+        externalFailure: _isExternalStatus(rfRes.statusCode),
+        statusCode: rfRes.statusCode,
       );
     }
-    final rfBody = _decode(rfRes.body);
+    final Map<String, dynamic> rfBody;
+    try {
+      rfBody = _decode(rfRes.body);
+    } on FormatException {
+      throw const SsoExchangeException(
+        'refresh response invalid JSON',
+        failureStage: 'refresh_exchange',
+        failureCode: 'SSO_REFRESH_INVALID_RESPONSE',
+      );
+    }
     final data = rfBody['data'];
     final accessToken = data is Map ? data['accessToken'] as String? : null;
     final finalRefresh =
         (data is Map ? data['refreshToken'] as String? : null) ?? refreshToken;
     if (accessToken == null || accessToken.isEmpty) {
-      throw SsoExchangeException(
-        'refresh 응답 accessToken 부재: ${_preview(rfRes.body)}',
+      throw const SsoExchangeException(
+        'refresh response missing accessToken',
+        failureStage: 'refresh_exchange',
+        failureCode: 'SSO_REFRESH_MISSING_ACCESS',
       );
     }
     return SsoExchangeResult(
@@ -201,6 +241,6 @@ class SsoExchange {
     return <String, dynamic>{};
   }
 
-  String _preview(String body) =>
-      body.length <= 200 ? body : '${body.substring(0, 200)}…';
+  bool _isExternalStatus(int statusCode) =>
+      statusCode == 408 || statusCode == 429 || statusCode >= 500;
 }

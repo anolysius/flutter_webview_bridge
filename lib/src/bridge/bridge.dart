@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:collection';
 import 'dart:convert';
+import 'dart:io';
 
 import 'package:flutter/material.dart';
 import 'package:flutter_webview_bridge/src/utils/utils.dart';
@@ -28,6 +29,36 @@ import 'events/set_clipboard.dart';
 import 'events/sign_in_apple.dart';
 import 'events/sign_in_google.dart';
 import 'events/sign_in_kakao.dart';
+import 'auth/auth_attempt_phase.dart';
+import 'auth/auth_revision_store.dart';
+import 'auth/auth_terminal_store.dart';
+import 'auth/auth_ui_commit.dart';
+import 'auth/auto_auth_attempt.dart';
+import 'auth/interactive_refresh_convergence.dart';
+import 'auth/pending_auth_attempt_store.dart';
+import 'auth/process_auth_attempt_coordinator.dart';
+import 'auth/unexpected_auth_failure.dart';
+
+typedef AuthTraceCallback = void Function(Map<String, Object?> event);
+
+class _ProcessAutoAuthWork {
+  const _ProcessAutoAuthWork({
+    required this.lease,
+    required this.tracksTerminal,
+  });
+
+  final ProcessAuthAttemptLease lease;
+  final bool tracksTerminal;
+}
+
+class _AuthOperationValue<T> {
+  const _AuthOperationValue(this.value);
+  final T value;
+}
+
+class _AuthOperationAborted {
+  const _AuthOperationAborted();
+}
 
 class FlutterWebViewBridgeJavaScriptChannel {
   BuildContext context;
@@ -40,6 +71,7 @@ class FlutterWebViewBridgeJavaScriptChannel {
   /// 주입 시 SSO 로그인 교환을 네이티브가 수행(AUTH_TOKENS_READY) — WKWebView throttling 우회.
   /// 미주입(null) 시 기존 경로(SIGN_IN_LOGIN → web 교환 + watchdog) fallback.
   final String? apiBaseUrl;
+  final String? bridgeRevision;
 
   /// 서비스 국가 코드 (APP-300 R5 — 'KR' / 'GLOBAL'). 미주입(null)=KR/레거시 동작.
   /// RefreshToken 키 + SSO domainType 분기에 사용. KR/null 은 현행과 byte-identical.
@@ -51,11 +83,13 @@ class FlutterWebViewBridgeJavaScriptChannel {
 
   /// 웹의 SERVICE_COUNTRY_CHANGE 수신 시 앱이 override+reload 하도록 위임하는 콜백.
   final void Function(String requestedCountry)? onServiceCountryChange;
+  final AuthTraceCallback? onAuthTrace;
   bool _isDisposed = false;
   bool _pendingSsoRecovery = false;
   AppLifecycleState _appLifecycleState = AppLifecycleState.resumed;
   final Queue<String> _pendingPostMessages = Queue<String>();
   bool _isFlushingPendingPostMessages = false;
+  Future<void> _messageSerial = Future<void>.value();
   static const int _maxPendingPostMessages = 20;
 
   FlutterWebViewBridgeJavaScriptChannel({
@@ -65,8 +99,10 @@ class FlutterWebViewBridgeJavaScriptChannel {
     required this.googleServerClientId,
     required this.kakaoNativeAppKey,
     this.apiBaseUrl,
+    this.bridgeRevision,
     String? serviceCountry,
     this.onServiceCountryChange,
+    this.onAuthTrace,
   }) : _serviceCountry = serviceCountry {
     if (googleServerClientId != null) {
       SignInGoogle.shared.initialize(
@@ -123,17 +159,66 @@ class FlutterWebViewBridgeJavaScriptChannel {
   /// 안 된다. 전환 경로에서 reload 전에 호출해 replay window 를 제거한다.
   void clearSsoTransientState(String reason) => _clearSsoTransientState(reason);
 
+  /// 서비스 국가 전환은 token/replay뿐 아니라 process-wide 인증 소유권까지 끊는 경계다.
+  /// 남은 interactive lease가 새 origin의 REFRESH_TOKEN_READ를 막지 않게 reload 전에 호출한다.
+  void resetAuthStateForServiceCountrySwitch(String reason) {
+    _processAuthCoordinator.resetForAuthBoundary();
+    _autoAuthAttempt.resetForAuthBoundary();
+    _invalidateAuthTransaction(reason);
+    // revision/request/document는 service-country domain에 속한다. 이전 국가 값이 대상
+    // 국가 첫 read에 섞이면 정상 로그인 응답이 stale-revision으로 거부된다.
+    _activeAuthRevision = 0;
+    _activeProtocolVersion = 1;
+    _activeRequestId = null;
+    _activeDocumentId = null;
+    _emitAuthTrace('auth.boundary.reset', resultCode: reason);
+  }
+
   void updateAppLifecycleState(AppLifecycleState state) {
     if (_isDisposed) return;
 
     _appLifecycleState = state;
     if (_isAppResumed) {
+      if (_authAttemptPhase.shouldRunTerminalDeadline) {
+        _armAttemptTerminalTimer();
+      }
       unawaited(_runResumedPendingWork());
+    } else {
+      _attemptTerminalTimer?.cancel();
+      _attemptTerminalTimer = null;
     }
   }
 
   void dispose() {
+    final processLease = _processAuthLease;
+    final shouldEmitConvergenceHandoff = _authAttemptPhase
+        .shouldEmitConvergenceHandoffOnDispose(
+          hasActiveProcessLease:
+              processLease != null &&
+              _processAuthCoordinator.isActive(processLease),
+        );
+    if (shouldEmitConvergenceHandoff) {
+      // 인증 시작 document가 home/account document로 교체되면 이 bridge의 timer와
+      // process owner가 함께 사라져 원 시도가 terminal 없이 남을 수 있다. 새 document의
+      // 자동 인증이 같은 revision에서 UI 성공을 증명하도록 명시적인 handoff로 닫는다.
+      // 집계기는 후속 UI 성공이 없는 handoff를 실패로 계산하므로 누락을 숨기지 않는다.
+      _processAuthCoordinator.recordConvergenceHandoff(
+        lease: processLease!,
+        convergenceKey: '${serviceCountry ?? "KR"}:$_activeAuthRevision',
+      );
+      _emitAuthTerminal('convergence_handoff', data: _activeAuthProtocolData());
+    }
     _isDisposed = true;
+    final abortCompleter = _activeAuthAbortCompleter;
+    if (abortCompleter != null && !abortCompleter.isCompleted) {
+      abortCompleter.complete();
+    }
+    _activeAuthAbortCompleter = null;
+    _authAttemptPhase.settle();
+    _autoAuthAttempt.clearActiveAttempt();
+    _completeProcessAuthLease();
+    _attemptTerminalTimer?.cancel();
+    _attemptTerminalTimer = null;
     _pendingSsoRecovery = false;
     _pendingPostMessages.clear();
     cancelSsoWatchdog('channel-dispose');
@@ -170,7 +255,13 @@ class FlutterWebViewBridgeJavaScriptChannel {
   // B2(네이티브 교환) 경로 watchdog timeout — signin 문서 confirm 이후 native home load 와
   // fresh home document replay confirm 까지 허용하되, home 이 끝내 갱신되지 않으면 복구.
   static const Duration _ssoWatchdogTimeoutB2 = Duration(seconds: 8);
+  static const Duration _attemptTerminalTimeout = Duration(seconds: 15);
   Timer? _ssoWatchdog;
+  Timer? _attemptTerminalTimer;
+  final AuthAttemptPhaseController _authAttemptPhase =
+      AuthAttemptPhaseController();
+  bool get _awaitingAuthTerminal => _authAttemptPhase.isAwaitingTerminal;
+  Completer<void>? _activeAuthAbortCompleter;
   int _ssoReloadCount = 0;
   // B2 watchdog 여부 — timeout 시 raw 재전송(B1) 대신 reload→세션 replay(B2) 로 복구.
   bool _ssoWatchdogB2 = false;
@@ -193,19 +284,403 @@ class FlutterWebViewBridgeJavaScriptChannel {
   Map<String, Object?>? _cachedSessionPayload;
   DateTime? _cachedSessionAt;
   int _authEpoch = 0;
+  int _activeAuthRevision = 0;
+  int _activeProtocolVersion = 1;
   String? _activeAuthSessionId;
   String? _activeAuthProvider;
+  String? _activeRequestId;
+  String? _activeDocumentId;
+  final Set<String> _terminalAuthSessionIds = <String>{};
+  final Set<String> _interruptedAttemptRecoveryChecked = <String>{};
+  final AutoAuthAttemptController _autoAuthAttempt =
+      AutoAuthAttemptController();
+  final ProcessAuthAttemptCoordinator _processAuthCoordinator =
+      ProcessAuthAttemptCoordinator.shared;
+  ProcessAuthAttemptLease? _processAuthLease;
+
+  bool get _ownsActiveInteractiveLease {
+    final lease = _processAuthLease;
+    return lease != null &&
+        lease.kind == ProcessAuthAttemptKind.interactive &&
+        _processAuthCoordinator.isActive(lease);
+  }
+
+  String? get _cachedAuthSessionId {
+    final data = _cachedSessionPayload?['data'];
+    return data is Map ? data['authSessionId'] as String? : null;
+  }
+
+  bool _canReplayInteractiveRefresh(dynamic data) =>
+      shouldReplayInteractiveRefresh(
+        ownsActiveInteractiveLease: _ownsActiveInteractiveLease,
+        isTerminalConvergence: _authAttemptPhase.shouldRunTerminalDeadline,
+        activeAuthSessionId: _activeAuthSessionId,
+        cachedAuthSessionId: _cachedAuthSessionId,
+        requestedAuthSessionId: _authSessionIdOf(data),
+      );
 
   String? _authSessionIdOf(dynamic data) =>
       data is Map ? data['authSessionId'] as String? : null;
 
+  String? _effectiveAuthSessionIdOf(dynamic data) =>
+      _autoAuthAttempt.effectiveAttemptId(
+        messageAttemptId: _authSessionIdOf(data),
+        activeAttemptId: _activeAuthSessionId,
+      );
+
   String? _providerOfRequest(dynamic data) =>
       data is Map ? data['provider'] as String? : null;
+
+  String? _requestIdOf(dynamic data) =>
+      data is Map ? data['requestId'] as String? : null;
+
+  int _protocolVersionOf(dynamic data) =>
+      data is Map && data['protocolVersion'] is int
+      ? data['protocolVersion'] as int
+      : 1;
+
+  int? _authRevisionOf(dynamic data) =>
+      data is Map && data['authRevision'] is int
+      ? data['authRevision'] as int
+      : null;
+
+  void _emitAuthTrace(String event, {String? resultCode, dynamic data}) {
+    final attemptId = _effectiveAuthSessionIdOf(data);
+    final predecessorAttemptId =
+        data is Map && data['predecessorAttemptId'] is String
+        ? data['predecessorAttemptId'] as String
+        : _processAuthCoordinator.activePredecessorForAttempt(attemptId);
+    onAuthTrace?.call({
+      'traceSchemaVersion': 2,
+      'protocolVersion': _activeProtocolVersion,
+      'loginAttemptId': attemptId,
+      if (predecessorAttemptId != null)
+        'predecessorAttemptId': predecessorAttemptId,
+      'requestId': _requestIdOf(data) ?? _activeRequestId,
+      'authRevision': _authRevisionOf(data) ?? _activeAuthRevision,
+      if (data is Map && data['documentId'] is String)
+        'documentId': data['documentId'] as String,
+      if (data is Map && data['pathname'] is String)
+        'pathname': data['pathname'] as String,
+      if (data is Map && data['visibilityState'] is String)
+        'visibilityState': data['visibilityState'] as String,
+      'provider': _providerOfRequest(data) ?? _activeAuthProvider,
+      'serviceCountry': serviceCountry,
+      'event': event,
+      if (resultCode != null) 'resultCode': resultCode,
+      if (data is Map && data['failureStage'] is String)
+        'failureStage': data['failureStage'] as String,
+      if (data is Map && data['failureCode'] is String)
+        'failureCode': data['failureCode'] as String,
+      if (data is Map && data['httpStatus'] is int)
+        'httpStatus': data['httpStatus'] as int,
+      if (data is Map && data['nativeSdkErrorCode'] is String)
+        'nativeSdkErrorCode': data['nativeSdkErrorCode'] as String,
+      if (data is Map && data['success'] is bool)
+        'success': data['success'] as bool,
+      if (data is Map && data['uiAuthCommitted'] is bool)
+        'uiAuthCommitted': data['uiAuthCommitted'] as bool,
+    });
+  }
+
+  Map<String, Object?> _failureData(
+    dynamic data, {
+    required String failureStage,
+    required String failureCode,
+    int? httpStatus,
+  }) => <String, Object?>{
+    if (data is Map)
+      for (final entry in data.entries)
+        if (entry.key is String) entry.key as String: entry.value,
+    'failureStage': failureStage,
+    'failureCode': failureCode,
+    if (httpStatus != null) 'httpStatus': httpStatus,
+  };
+
+  String _failureStageOf(Object error, String fallback) {
+    if (error is SsoExchangeException) return error.failureStage;
+    if (error is StateError &&
+        error.message == 'REFRESH_TOKEN_PERSIST_FAILED') {
+      return 'refresh_persist';
+    }
+    return fallback;
+  }
+
+  String _failureCodeOf(Object error, String fallback) {
+    if (error is SsoExchangeException) return error.failureCode;
+    if (error is StateError &&
+        error.message == 'REFRESH_TOKEN_PERSIST_FAILED') {
+      return 'REFRESH_TOKEN_PERSIST_FAILED';
+    }
+    if (error is SocketException || error is TimeoutException) {
+      return 'NETWORK_ERROR';
+    }
+    return fallback;
+  }
+
+  String _terminalKeyOf(dynamic data) => authTerminalKey(
+    authSessionId: _effectiveAuthSessionIdOf(data),
+    authRevision: _authRevisionOf(data) ?? _activeAuthRevision,
+  );
+
+  AuthTerminalWorkSnapshot _captureAuthTerminalWork(dynamic data) {
+    final attemptId = _effectiveAuthSessionIdOf(data);
+    return AuthTerminalWorkSnapshot(
+      epoch: _authEpoch,
+      attemptId: attemptId,
+      revision: _authRevisionOf(data) ?? _activeAuthRevision,
+      leaseGeneration: _processAuthCoordinator.activeGenerationForAttempt(
+        attemptId,
+      ),
+    );
+  }
+
+  bool _isCurrentAuthTerminalWork(AuthTerminalWorkSnapshot snapshot) {
+    return !_isDisposed &&
+        _processAuthCoordinator.isCurrentTerminalWork(
+          snapshot,
+          epoch: _authEpoch,
+          revision: _activeAuthRevision,
+        );
+  }
+
+  bool _rememberTerminalKey(String key) {
+    if (!_terminalAuthSessionIds.add(key)) return false;
+    if (_terminalAuthSessionIds.length > 200) {
+      _terminalAuthSessionIds.remove(_terminalAuthSessionIds.first);
+    }
+    return true;
+  }
+
+  void _settleAuthTerminalTracking() {
+    _authAttemptPhase.settle();
+    final abortCompleter = _activeAuthAbortCompleter;
+    if (abortCompleter != null && !abortCompleter.isCompleted) {
+      abortCompleter.complete();
+    }
+    _attemptTerminalTimer?.cancel();
+    _attemptTerminalTimer = null;
+  }
+
+  Future<bool> _hasCompletedAuthTerminal(dynamic data) async {
+    final key = _terminalKeyOf(data);
+    final attemptId = _effectiveAuthSessionIdOf(data);
+    final revision = _authRevisionOf(data) ?? _activeAuthRevision;
+    if (_processAuthCoordinator.isTerminalSettled(
+      attemptId: attemptId,
+      revision: revision,
+    )) {
+      _rememberTerminalKey(key);
+      return true;
+    }
+    if (_terminalAuthSessionIds.contains(key)) return true;
+
+    try {
+      final matchesPersistedSuccess = await const AuthTerminalStore()
+          .matchesSuccess(
+            authSessionId: _effectiveAuthSessionIdOf(data),
+            authRevision: _authRevisionOf(data) ?? _activeAuthRevision,
+            serviceCountry: serviceCountry,
+          );
+      if (!matchesPersistedSuccess) return false;
+      _rememberTerminalKey(key);
+      _processAuthCoordinator.settleTerminal(
+        attemptId: attemptId,
+        revision: revision,
+      );
+      return true;
+    } catch (error) {
+      // 영속 marker 조회 실패가 실제 로그인 수렴을 방해하면 안 된다.
+      // ignore: avoid_print
+      print(
+        '[SsoExchange] auth terminal marker read FAIL: ${error.runtimeType}',
+      );
+      return false;
+    }
+  }
+
+  void _emitAuthTerminal(String resultCode, {dynamic data}) {
+    final attemptId = _effectiveAuthSessionIdOf(data);
+    final predecessorAttemptId = _processAuthCoordinator
+        .activePredecessorForAttempt(attemptId);
+    final terminalData = predecessorAttemptId == null
+        ? data
+        : <String, Object?>{
+            if (data is Map)
+              for (final entry in data.entries)
+                if (entry.key is String) entry.key as String: entry.value,
+            'predecessorAttemptId': predecessorAttemptId,
+          };
+    final key = _terminalKeyOf(terminalData);
+    final revision = _authRevisionOf(terminalData) ?? _activeAuthRevision;
+    if (attemptId != null) {
+      unawaited(
+        const PendingAuthAttemptStore().clearIfMatches(
+          attemptId: attemptId,
+          authRevision: revision,
+          serviceCountry: serviceCountry,
+        ),
+      );
+    }
+    final isFirstProcessTerminal = _processAuthCoordinator.settleTerminal(
+      attemptId: attemptId,
+      revision: revision,
+    );
+    if (!isFirstProcessTerminal || !_rememberTerminalKey(key)) {
+      _emitAuthTrace(
+        'auth.terminal.duplicate_ignored',
+        resultCode: resultCode,
+        data: terminalData,
+      );
+      _settleAuthTerminalTracking();
+      _completeProcessAuthLease();
+      return;
+    }
+    _settleAuthTerminalTracking();
+    _emitAuthTrace('auth.terminal', resultCode: resultCode, data: terminalData);
+    _completeProcessAuthLease();
+  }
+
+  void _completeProcessAuthLease() {
+    final lease = _processAuthLease;
+    _processAuthLease = null;
+    if (lease != null) _processAuthCoordinator.complete(lease);
+  }
+
+  void _handleProcessAuthAttemptSuperseded(ProcessAuthAttemptLease lease) {
+    if (_isDisposed || !identical(_processAuthLease, lease)) return;
+    final supersededData = _activeAuthProtocolData();
+    _emitAuthTerminal('user_superseded', data: supersededData);
+    _authEpoch += 1;
+    _autoAuthAttempt.clearActiveAttempt();
+    _clearSsoTransientState('process-auth-superseded');
+  }
+
+  void _handleProcessAuthAttemptSettled(ProcessAuthAttemptLease lease) {
+    if (_isDisposed || !identical(_processAuthLease, lease)) return;
+    _processAuthLease = null;
+    _settleAuthTerminalTracking();
+    cancelSsoWatchdog('process-auth-terminal-settled');
+    _autoAuthAttempt.clearActiveAttempt();
+  }
+
+  void _armAttemptTerminalTimer() {
+    if (!_authAttemptPhase.shouldRunTerminalDeadline ||
+        !_isAppResumed ||
+        _isDisposed) {
+      return;
+    }
+    _attemptTerminalTimer?.cancel();
+    final timeoutData = _activeAuthProtocolData();
+    final snapshot = _captureAuthTerminalWork(timeoutData);
+    late final Timer timer;
+    timer = Timer(_attemptTerminalTimeout, () {
+      // 취소 직전 이미 event queue에 들어온 옛 callback이 새 timer reference를
+      // 지우지 못하게 자신이 아직 owner일 때만 해제한다.
+      if (identical(_attemptTerminalTimer, timer)) {
+        _attemptTerminalTimer = null;
+      }
+      unawaited(_onAttemptTerminalTimeout(snapshot, timeoutData));
+    });
+    _attemptTerminalTimer = timer;
+  }
+
+  Future<void> _onAttemptTerminalTimeout(
+    AuthTerminalWorkSnapshot snapshot,
+    dynamic timeoutData,
+  ) async {
+    if (!_isCurrentAuthTerminalWork(snapshot) ||
+        !_authAttemptPhase.shouldRunTerminalDeadline) {
+      _emitAuthTrace(
+        'auth.terminal.timeout_stale_ignored',
+        resultCode: 'attempt_changed_before_check',
+        data: timeoutData,
+      );
+      return;
+    }
+    final hasCompletedTerminal = await _hasCompletedAuthTerminal(timeoutData);
+    if (hasCompletedTerminal) {
+      if (_isCurrentAuthTerminalWork(snapshot)) {
+        _settleAuthTerminalTracking();
+        _completeProcessAuthLease();
+      }
+      _emitAuthTrace(
+        'auth.terminal.timeout_ignored',
+        resultCode: 'terminal_already_emitted',
+        data: timeoutData,
+      );
+      return;
+    }
+    // marker 조회 중 다른 bridge가 성공을 확정했거나 새 시도로 교체될 수 있다.
+    if (!_isCurrentAuthTerminalWork(snapshot) ||
+        !_authAttemptPhase.shouldRunTerminalDeadline ||
+        _processAuthCoordinator.isTerminalSettled(
+          attemptId: snapshot.attemptId,
+          revision: snapshot.revision,
+        )) {
+      _emitAuthTrace(
+        'auth.terminal.timeout_stale_ignored',
+        resultCode: 'attempt_changed_during_check',
+        data: timeoutData,
+      );
+      return;
+    }
+    _terminateAuthAttemptWithError(
+      resultCode: 'code_failure:auth_terminal_timeout',
+      code: 'AUTH_TERMINAL_TIMEOUT',
+    );
+  }
+
+  Map<String, Object?> _activeAuthProtocolData() => <String, Object?>{
+    'protocolVersion': _activeProtocolVersion,
+    if (_activeRequestId != null) 'requestId': _activeRequestId,
+    if (_activeAuthSessionId != null) 'authSessionId': _activeAuthSessionId,
+    if (_activeDocumentId != null) 'documentId': _activeDocumentId,
+    'authRevision': _activeAuthRevision,
+  };
+
+  void _terminateAuthAttemptWithError({
+    required String resultCode,
+    required String code,
+  }) {
+    if (!_authAttemptPhase.shouldRunTerminalDeadline) return;
+    final timeoutData = _failureData(
+      _activeAuthProtocolData(),
+      failureStage: 'terminal_deadline',
+      failureCode: code,
+    );
+    _emitAuthTerminal(resultCode, data: timeoutData);
+    _invalidateAuthTransaction(code);
+    unawaited(
+      runJavaScriptPostMessage(
+        jsonEncode({
+          'type': WebViewBridgeFeatureType.authError.value,
+          'data': {...timeoutData, 'code': code, 'message': ''},
+        }),
+      ),
+    );
+  }
 
   bool _isSsoLogin(WebViewBridgeFeatureType type) =>
       type == WebViewBridgeFeatureType.googleSignInLogin ||
       type == WebViewBridgeFeatureType.appleSignInLogin ||
       type == WebViewBridgeFeatureType.kakaoSignInLogin;
+
+  void _emitMeFetchResult(Map<String, dynamic>? me, dynamic data) {
+    if (me != null) {
+      _emitAuthTrace('auth.me.fetched', resultCode: 'success', data: data);
+      return;
+    }
+    _emitAuthTrace(
+      'auth.me.fetch_fallback',
+      resultCode: 'fallback',
+      data: _failureData(
+        data,
+        failureStage: 'me_fetch',
+        failureCode: 'ME_FETCH_FALLBACK',
+      ),
+    );
+  }
 
   String _providerNameOf(WebViewBridgeFeatureType type) {
     if (type == WebViewBridgeFeatureType.googleSignInLogin ||
@@ -255,7 +730,7 @@ class FlutterWebViewBridgeJavaScriptChannel {
         'pathname=${data['pathname'] ?? data['webPathname'] ?? "null"} '
         'authSessionId=${data['authSessionId'] ?? "null"} '
         'isHomeDocument=${data['isHomeDocument'] ?? "null"} '
-        'error=${data['errorMessage'] ?? "null"}';
+        'errorType=${data['errorType'] ?? "null"}';
   }
 
   void _clearSessionReplay(String reason) {
@@ -275,24 +750,252 @@ class FlutterWebViewBridgeJavaScriptChannel {
     _clearSessionReplay(reason);
   }
 
-  int _beginAuthTransaction(WebViewBridgeFeatureType type, dynamic data) {
-    _authEpoch += 1;
+  _ProcessAutoAuthWork? _beginAutoAuthAttemptIfNeeded(
+    dynamic requestData,
+    Map<String, Object?> readResponse,
+  ) {
+    if (_protocolVersionOf(requestData) < 2) return null;
+
+    final fallbackNonce = DateTime.now().microsecondsSinceEpoch;
+    final convergenceKey = '${serviceCountry ?? "KR"}:$_activeAuthRevision';
+    final hasConvergenceHandoff = _processAuthCoordinator.hasConvergenceHandoff(
+      convergenceKey: convergenceKey,
+    );
+    final isInitialBootstrap = _processAuthCoordinator
+        .claimAutomaticBootstrap();
+    // process bootstrap을 이미 관측했더라도 document dispose handoff의 후속 read는
+    // 별도 tracked AUTO attempt로 승격해야 원 시도의 UI 수렴을 증명할 수 있다.
+    final trackedAttemptId = isInitialBootstrap || hasConvergenceHandoff
+        ? _autoAuthAttempt.beginInitialRefresh(
+            requestData: requestData,
+            readResponse: readResponse,
+            interactiveAttemptActive: _awaitingAuthTerminal,
+            fallbackNonce: fallbackNonce,
+          )
+        : null;
+    final tracksTerminal = trackedAttemptId != null;
+    final attemptId =
+        trackedAttemptId ??
+        _authSessionIdOf(requestData) ??
+        _requestIdOf(requestData) ??
+        'auto-work-$fallbackNonce';
+
+    late final ProcessAuthAttemptLease lease;
+    final claimed = _processAuthCoordinator.tryBeginAutomatic(
+      attemptId: attemptId,
+      onSuperseded: () {
+        if (tracksTerminal) _handleProcessAuthAttemptSuperseded(lease);
+      },
+      onSettled: () => _handleProcessAuthAttemptSettled(lease),
+      convergenceKey: tracksTerminal ? convergenceKey : null,
+    );
+    if (claimed == null) {
+      if (tracksTerminal) _autoAuthAttempt.clearActiveAttempt();
+      return null;
+    }
+    lease = claimed;
+    _processAuthLease = lease;
+
+    if (tracksTerminal) {
+      _activeAuthSessionId = attemptId;
+      _activeAuthProvider = autoAuthProvider;
+      _activeRequestId = _requestIdOf(requestData);
+      _activeDocumentId = _stringFieldOf(requestData, 'documentId');
+      _activeProtocolVersion = 2;
+      _activeAuthAbortCompleter = null;
+      // refresh 교환 중에는 network/provider 응답을 기다리므로 짧은 UI deadline을
+      // 적용하지 않는다. AUTH_TOKENS_READY 송신 직전에 terminal convergence로 전환한다.
+      _authAttemptPhase.beginProviderInteraction(tracksTerminal: true);
+      _emitAuthTrace('auth.attempt.started', data: requestData);
+    }
+    return _ProcessAutoAuthWork(lease: lease, tracksTerminal: tracksTerminal);
+  }
+
+  Future<void> _recoverInterruptedAuthAttemptIfNeeded() async {
+    final country = serviceCountry ?? 'KR';
+    if (_interruptedAttemptRecoveryChecked.contains(country)) return;
+
+    PendingAuthAttempt? interrupted;
+    try {
+      interrupted = await const PendingAuthAttemptStore().takeInterrupted(
+        currentProcessInstanceId: authProcessInstanceId,
+        serviceCountry: serviceCountry,
+      );
+      _interruptedAttemptRecoveryChecked.add(country);
+    } catch (_) {
+      _emitAuthTrace(
+        'auth.interrupted.recovery_failed',
+        resultCode: 'pending_attempt_read_failed',
+        data: _failureData(
+          const <String, Object?>{},
+          failureStage: 'attempt_recovery',
+          failureCode: 'PENDING_ATTEMPT_READ_FAILED',
+        ),
+      );
+      return;
+    }
+    if (interrupted == null) return;
+
+    try {
+      final alreadySucceeded = await const AuthTerminalStore().matchesSuccess(
+        authSessionId: interrupted.attemptId,
+        authRevision: interrupted.authRevision,
+        serviceCountry: serviceCountry,
+      );
+      if (alreadySucceeded) return;
+    } catch (_) {
+      // 성공 marker 조회 실패만으로 회수를 누락하면 missing terminal이 다시 생긴다.
+      // pending attempt 자체가 이전 process 소유라는 영속 증거를 우선한다.
+    }
+
+    // 이전 process는 계정 선택/동의 화면에서 강제 종료되어 callback을 실행할 수 없었다.
+    // 다음 process의 첫 v2 refresh read가 사용자 중단 terminal을 한 번만 보충한다.
+    _emitAuthTrace(
+      'auth.terminal',
+      resultCode: 'process_interrupted',
+      data: <String, Object?>{
+        'protocolVersion': interrupted.protocolVersion,
+        'authSessionId': interrupted.attemptId,
+        'authRevision': interrupted.authRevision,
+        'provider': interrupted.provider,
+        if (interrupted.requestId != null) 'requestId': interrupted.requestId,
+        if (interrupted.documentId != null)
+          'documentId': interrupted.documentId,
+      },
+    );
+  }
+
+  void _completeUntrackedAutoAuthWork(_ProcessAutoAuthWork? work) {
+    if (work == null || work.tracksTerminal) return;
+    if (identical(_processAuthLease, work.lease)) {
+      _processAuthLease = null;
+    }
+    _processAuthCoordinator.complete(work.lease);
+  }
+
+  void _bindAutoAuthAttemptToResponse(Map<String, Object?> response) {
+    _autoAuthAttempt.bindToResponse(response);
+  }
+
+  Future<int> _beginAuthTransaction(
+    WebViewBridgeFeatureType type,
+    dynamic data,
+  ) async {
+    late final ProcessAuthAttemptLease processLease;
+    late final int transactionEpoch;
+    final provider = _providerOfRequest(data) ?? _providerNameOf(type);
+    final claimedLease = _processAuthCoordinator.tryBeginInteractive(
+      attemptId:
+          _authSessionIdOf(data) ??
+          'interactive-${type.value}-${DateTime.now().microsecondsSinceEpoch}',
+      onSuperseded: () => _handleProcessAuthAttemptSuperseded(processLease),
+      onSettled: () => _handleProcessAuthAttemptSettled(processLease),
+      deduplicationKey: '${serviceCountry ?? "KR"}:$provider',
+      forceSupersedeDuplicate: data is Map && data['retryAfterTimeout'] == true,
+      onActivated: () {
+        _authEpoch += 1;
+        transactionEpoch = _authEpoch;
+      },
+    );
+    if (claimedLease == null) {
+      _emitAuthTrace(
+        'auth.attempt.duplicate_ignored',
+        resultCode: 'duplicate_in_flight',
+        data: data,
+      );
+      throw const _AuthOperationAborted();
+    }
+    processLease = claimedLease;
+    _processAuthLease = processLease;
+    _autoAuthAttempt.clearActiveAttempt();
+    _ssoReloadCount = 0;
     _clearSsoTransientState('ssoStart:${type.value}');
     _activeAuthSessionId = _authSessionIdOf(data);
-    _activeAuthProvider = _providerOfRequest(data) ?? _providerNameOf(type);
+    _activeAuthProvider = provider;
+    _activeRequestId = _requestIdOf(data);
+    _activeDocumentId = _stringFieldOf(data, 'documentId');
+    _activeProtocolVersion = _protocolVersionOf(data);
+    final nextRevision = await const AuthRevisionStore().nextIfCurrent(
+      serviceCountry: serviceCountry,
+      isCurrent: () =>
+          !_isDisposed &&
+          transactionEpoch == _authEpoch &&
+          identical(_processAuthLease, processLease) &&
+          _processAuthCoordinator.isActive(processLease),
+    );
+    // revision 저장을 기다리는 동안 다른 bridge의 interactive 시도가 이 lease를
+    // 선점할 수 있다. 옛 초기화가 복귀해 새 시도의 phase/revision을 덮지 못하게 한다.
+    if (_isDisposed ||
+        transactionEpoch != _authEpoch ||
+        !identical(_processAuthLease, processLease) ||
+        nextRevision == null ||
+        !_processAuthCoordinator.isActive(processLease)) {
+      throw const _AuthOperationAborted();
+    }
+    _activeAuthRevision = nextRevision;
+    _activeAuthAbortCompleter = _activeProtocolVersion >= 2
+        ? Completer<void>()
+        : null;
+    _authAttemptPhase.beginProviderInteraction(
+      tracksTerminal: _activeProtocolVersion >= 2,
+    );
+    if (_activeProtocolVersion >= 2) {
+      try {
+        await const PendingAuthAttemptStore().markStarted(
+          attempt: PendingAuthAttempt(
+            attemptId: processLease.attemptId,
+            authRevision: _activeAuthRevision,
+            provider: provider,
+            protocolVersion: _activeProtocolVersion,
+            startedAt: DateTime.now().toUtc(),
+            processInstanceId: authProcessInstanceId,
+            requestId: _activeRequestId,
+            documentId: _activeDocumentId,
+          ),
+          serviceCountry: serviceCountry,
+        );
+      } catch (_) {
+        _emitAuthTrace(
+          'auth.attempt.persistence_failed',
+          resultCode: 'pending_attempt_write_failed',
+          data: _failureData(
+            data,
+            failureStage: 'attempt_persistence',
+            failureCode: 'PENDING_ATTEMPT_PERSIST_FAILED',
+          ),
+        );
+      }
+    }
+    _emitAuthTrace('auth.attempt.started', data: data);
+    await runJavaScriptPostMessage(
+      jsonEncode({
+        'type': WebViewBridgeFeatureType.authAttemptStarted.value,
+        'data': {
+          ..._activeAuthProtocolData(),
+          if (_activeAuthProvider != null) 'provider': _activeAuthProvider,
+        },
+      }),
+    );
     // ignore: avoid_print
     print(
       '[SsoExchange] auth transaction begin '
       'epoch=$_authEpoch provider=${_activeAuthProvider ?? "null"} '
-      'authSessionId=${_activeAuthSessionId ?? "null"}',
+      'authSessionId=${_activeAuthSessionId ?? "null"} '
+      'authRevision=$_activeAuthRevision protocol=$_activeProtocolVersion',
     );
-    return _authEpoch;
+    return transactionEpoch;
   }
 
   void _invalidateAuthTransaction(String reason) {
     _authEpoch += 1;
+    _completeProcessAuthLease();
     _activeAuthSessionId = null;
     _activeAuthProvider = null;
+    _autoAuthAttempt.clearActiveAttempt();
+    _authAttemptPhase.settle();
+    _attemptTerminalTimer?.cancel();
+    _attemptTerminalTimer = null;
+    _activeAuthAbortCompleter = null;
     _clearSsoTransientState(reason);
     // ignore: avoid_print
     print(
@@ -311,12 +1014,33 @@ class FlutterWebViewBridgeJavaScriptChannel {
     return true;
   }
 
+  Future<T> _awaitAuthOperation<T>(Future<T> operation) async {
+    final abort = _activeAuthAbortCompleter;
+    if (abort == null) return operation;
+    final outcome = await Future.any<Object?>([
+      operation.then<Object?>((value) => _AuthOperationValue<T>(value)),
+      abort.future.then<Object?>((_) => const _AuthOperationAborted()),
+    ]);
+    if (outcome is _AuthOperationAborted) throw outcome;
+    return (outcome as _AuthOperationValue<T>).value;
+  }
+
   bool _isStaleAuthSessionMessage(dynamic data) {
     final requestedAuthSessionId = _authSessionIdOf(data);
     return requestedAuthSessionId != null &&
         _activeAuthSessionId != null &&
         requestedAuthSessionId != _activeAuthSessionId;
   }
+
+  bool _isStaleAuthRevisionMessage(dynamic data) {
+    final revision = _authRevisionOf(data);
+    return revision != null && revision != _activeAuthRevision;
+  }
+
+  bool _isExternalSsoFailure(Object error) =>
+      error is SocketException ||
+      error is TimeoutException ||
+      (error is SsoExchangeException && error.externalFailure);
 
   bool _shouldRevokeNativeSso(dynamic data) =>
       data is Map && data['revokeNativeSso'] == true;
@@ -386,6 +1110,13 @@ class FlutterWebViewBridgeJavaScriptChannel {
       return;
     }
 
+    if (_ssoReloadCount >= 1) {
+      _terminateAuthAttemptWithError(
+        resultCode: 'code_failure:ui_commit_timeout',
+        code: 'UI_COMMIT_TIMEOUT',
+      );
+      return;
+    }
     _ssoReloadCount += 1;
     // B1(web 교환): reload 후 fresh page 에 카카오 raw payload 재전송 (web 교환 재개).
     // B2(네이티브 교환): reload 후 fresh page 가 REFRESH_TOKEN_READ → 세션 replay 로 로그인 복원
@@ -407,7 +1138,7 @@ class FlutterWebViewBridgeJavaScriptChannel {
       }
     } catch (e) {
       // ignore: avoid_print
-      print('[Watchdog] reload FAIL: $e');
+      print('[Watchdog] reload FAIL: ${e.runtimeType}');
     }
   }
 
@@ -438,7 +1169,7 @@ class FlutterWebViewBridgeJavaScriptChannel {
       await webViewController.loadRequest(homeUri);
     } catch (e) {
       // ignore: avoid_print
-      print('[Watchdog] load home FAIL: $e');
+      print('[Watchdog] load home FAIL: ${e.runtimeType}');
     }
   }
 
@@ -456,12 +1187,20 @@ class FlutterWebViewBridgeJavaScriptChannel {
       await runJavaScriptPostMessage(jsonEncode(data));
     } catch (e) {
       // ignore: avoid_print
-      print('[Watchdog] resend FAIL: $e');
+      print('[Watchdog] resend FAIL: ${e.runtimeType}');
     }
   }
   // ───────────────────────────────────────────────────────────────────────────
 
   Future<void> onMessageReceived(JavaScriptMessage message) async {
+    final operation = _messageSerial.then(
+      (_) => _handleMessageReceived(message),
+    );
+    _messageSerial = operation.catchError((_) {});
+    return operation;
+  }
+
+  Future<void> _handleMessageReceived(JavaScriptMessage message) async {
     final json = jsonDecode(message.message);
     final type = json['type'] as String?;
     final data = json['data'];
@@ -470,10 +1209,15 @@ class FlutterWebViewBridgeJavaScriptChannel {
       if (webViewBridgeFeatureType != null) {
         late Map<String, Object?> sendData;
         int? authEpoch;
+        _ProcessAutoAuthWork? processAutoAuthWork;
 
         try {
           if (_isSsoLogin(webViewBridgeFeatureType)) {
-            authEpoch = _beginAuthTransaction(webViewBridgeFeatureType, data);
+            authEpoch = await _beginAuthTransaction(
+              webViewBridgeFeatureType,
+              data,
+            );
+            if (!context.mounted) return;
           }
           switch (webViewBridgeFeatureType) {
             case WebViewBridgeFeatureType.appStateChange:
@@ -484,6 +1228,10 @@ class FlutterWebViewBridgeJavaScriptChannel {
               break;
             case WebViewBridgeFeatureType.deviceInfo:
               sendData = await DeviceInfoEvent().process(context);
+              final responseData = sendData['data'];
+              if (responseData is Map) {
+                responseData['bridgeRevision'] = bridgeRevision ?? 'unknown';
+              }
               break;
             case WebViewBridgeFeatureType.cameraAccess:
               sendData = await CameraAccessEvent().process(context);
@@ -519,9 +1267,8 @@ class FlutterWebViewBridgeJavaScriptChannel {
               sendData = await ExitAppEvent().process(context);
               break;
             case WebViewBridgeFeatureType.googleSignInLogin:
-              sendData = await SignInGoogle.shared.process(
-                context,
-                action: 'login',
+              sendData = await _awaitAuthOperation(
+                SignInGoogle.shared.process(context, action: 'login'),
               );
               if (!_isCurrentAuthTransaction(authEpoch!, data)) {
                 _logStaleAuthMessage(webViewBridgeFeatureType.value, data);
@@ -529,6 +1276,11 @@ class FlutterWebViewBridgeJavaScriptChannel {
               }
               break;
             case WebViewBridgeFeatureType.googleSignInLogout:
+              _processAuthCoordinator.cancelActiveForExplicitLogout();
+              _activeAuthRevision = await const AuthRevisionStore().next(
+                serviceCountry: serviceCountry,
+              );
+              if (!context.mounted) return;
               _invalidateAuthTransaction('googleSignInLogout');
               sendData = await SignInGoogle.shared.process(
                 context,
@@ -536,9 +1288,8 @@ class FlutterWebViewBridgeJavaScriptChannel {
               );
               break;
             case WebViewBridgeFeatureType.appleSignInLogin:
-              sendData = await SignInApple.shared.process(
-                context,
-                action: 'login',
+              sendData = await _awaitAuthOperation(
+                SignInApple.shared.process(context, action: 'login'),
               );
               if (!_isCurrentAuthTransaction(authEpoch!, data)) {
                 _logStaleAuthMessage(webViewBridgeFeatureType.value, data);
@@ -546,6 +1297,11 @@ class FlutterWebViewBridgeJavaScriptChannel {
               }
               break;
             case WebViewBridgeFeatureType.appleSignInLogout:
+              _processAuthCoordinator.cancelActiveForExplicitLogout();
+              _activeAuthRevision = await const AuthRevisionStore().next(
+                serviceCountry: serviceCountry,
+              );
+              if (!context.mounted) return;
               _invalidateAuthTransaction('appleSignInLogout');
               sendData = await SignInApple.shared.process(
                 context,
@@ -553,9 +1309,8 @@ class FlutterWebViewBridgeJavaScriptChannel {
               );
               break;
             case WebViewBridgeFeatureType.kakaoSignInLogin:
-              sendData = await SignInKakao.shared.process(
-                context,
-                action: 'login',
+              sendData = await _awaitAuthOperation(
+                SignInKakao.shared.process(context, action: 'login'),
               );
               if (!_isCurrentAuthTransaction(authEpoch!, data)) {
                 _logStaleAuthMessage(webViewBridgeFeatureType.value, data);
@@ -563,6 +1318,11 @@ class FlutterWebViewBridgeJavaScriptChannel {
               }
               break;
             case WebViewBridgeFeatureType.kakaoSignInLogout:
+              _processAuthCoordinator.cancelActiveForExplicitLogout();
+              _activeAuthRevision = await const AuthRevisionStore().next(
+                serviceCountry: serviceCountry,
+              );
+              if (!context.mounted) return;
               _invalidateAuthTransaction('kakaoSignInLogout');
               sendData = await SignInKakao.shared.process(
                 context,
@@ -570,14 +1330,49 @@ class FlutterWebViewBridgeJavaScriptChannel {
               );
               break;
             case WebViewBridgeFeatureType.refreshTokenRead:
+              if (_protocolVersionOf(data) >= 2) {
+                await _recoverInterruptedAuthAttemptIfNeeded();
+              }
+              final readSnapshot = AuthRevisionReadSnapshot(
+                epoch: _authEpoch,
+                serviceCountry: serviceCountry,
+              );
+              final preserveInteractiveAttempt =
+                  _ownsActiveInteractiveLease && _awaitingAuthTerminal;
+              final storedRevision = await const AuthRevisionStore().current(
+                serviceCountry: readSnapshot.serviceCountry,
+              );
+              if (!context.mounted ||
+                  !readSnapshot.matches(
+                    epoch: _authEpoch,
+                    serviceCountry: serviceCountry,
+                  )) {
+                return;
+              }
+              _activeAuthRevision = resolveRefreshAuthRevision(
+                activeRevision: _activeAuthRevision,
+                storedRevision: storedRevision,
+                preserveInteractiveAttempt: preserveInteractiveAttempt,
+              );
+              if (!preserveInteractiveAttempt &&
+                  _protocolVersionOf(data) >= 2) {
+                _activeProtocolVersion = _protocolVersionOf(data);
+                _activeRequestId = _requestIdOf(data);
+                _activeAuthSessionId =
+                    _authSessionIdOf(data) ?? _activeAuthSessionId;
+                _activeDocumentId = _stringFieldOf(data, 'documentId');
+              }
               sendData = await RefreshTokenEvent().process(
                 context,
                 action: 'read',
+                data: data,
                 serviceCountry: serviceCountry,
+                authRevision: _activeAuthRevision,
               );
               break;
             case WebViewBridgeFeatureType.refreshTokenWrite:
-              if (_isStaleAuthSessionMessage(data)) {
+              if (_isStaleAuthSessionMessage(data) ||
+                  _isStaleAuthRevisionMessage(data)) {
                 _logStaleAuthMessage('refreshTokenWrite', data);
                 return;
               }
@@ -586,7 +1381,10 @@ class FlutterWebViewBridgeJavaScriptChannel {
               // 반대로 홈 문서 confirm 은 AUTH_TOKENS_READY persist 가 active home 에
               // 도달했다는 신호이므로 즉시 watchdog 을 종료한다. 이를 유지하면 timeout 이
               // 추가 home load 를 만들어 Safari Develop inspectable document 가 매회 늘어난다.
-              if (_ssoWatchdogB2 && (_ssoWatchdog?.isActive ?? false)) {
+              if (_activeProtocolVersion >= 2) {
+                // v2에서는 token persist가 아니라 visible home의 AUTH_UI_COMMITTED만 terminal success다.
+                _emitAuthTrace('auth.state.persisted', data: data);
+              } else if (_ssoWatchdogB2 && (_ssoWatchdog?.isActive ?? false)) {
                 if (_isHomeDocumentConfirm(data)) {
                   cancelSsoWatchdog('refreshTokenWrite:home');
                   // ignore: avoid_print
@@ -609,6 +1407,7 @@ class FlutterWebViewBridgeJavaScriptChannel {
                 action: 'write',
                 data: data,
                 serviceCountry: serviceCountry,
+                authRevision: _activeAuthRevision,
               );
               break;
             case WebViewBridgeFeatureType.refreshTokenDelete:
@@ -616,17 +1415,27 @@ class FlutterWebViewBridgeJavaScriptChannel {
                 _logStaleAuthMessage('refreshTokenDelete', data);
                 return;
               }
+              // account logout은 다른 WebView document에서 도착할 수 있다. 저장소 삭제를
+              // 기다리는 동안 직후 재로그인이 기존 process owner에 의해 중복 처리되지
+              // 않도록 shared owner를 먼저 동기적으로 종료한다.
+              _processAuthCoordinator.cancelActiveForExplicitLogout();
               // web 가 종결 실패/로그아웃으로 token 삭제 — 타이머 살아있는 실제 실패이므로
               // reload 무의미. watchdog 해제 (frozen 케이스는 애초에 아무 메시지도 안 옴).
               // ignore: avoid_print
               print(
                 '[SsoExchange] refresh token delete requested ${_deleteDebugOf(data)}',
               );
+              _activeAuthRevision = await const AuthRevisionStore().next(
+                serviceCountry: serviceCountry,
+              );
+              if (!context.mounted) return;
               _invalidateAuthTransaction('refreshTokenDelete');
               sendData = await RefreshTokenEvent().process(
                 context,
                 action: 'delete',
+                data: data,
                 serviceCountry: serviceCountry,
+                authRevision: _activeAuthRevision,
               );
               await _revokeNativeSsoSessions(data);
               break;
@@ -666,18 +1475,80 @@ class FlutterWebViewBridgeJavaScriptChannel {
             case WebViewBridgeFeatureType.authTokensReady:
               // B2: native → web 단방향. webview 가 request 로 보내는 type 아님. silent skip.
               return;
+            case WebViewBridgeFeatureType.authUiCommitted:
+              await _handleAuthUiCommitted(data);
+              return;
+            case WebViewBridgeFeatureType.authAttemptStarted:
+              // native → web acknowledgement only.
+              return;
           }
         } catch (e) {
+          if (e is _AuthOperationAborted) return;
           // OAuth 실패 (sign_in_*.dart 의 throw AuthError) 는 단일 surface:
           // AUTH_ERROR payload 송신 + native SnackBar skip.
           // (사용자 toast 는 webview 측이 단독 표시 — 중복 회피)
           if (e is AuthError) {
+            final failureData = _failureData(
+              data,
+              failureStage: 'native_sdk',
+              failureCode: e.code,
+            )..['nativeSdkErrorCode'] = e.nativeSdkErrorCode;
+            _emitAuthTerminal(
+              e.code == 'USER_CANCELLED'
+                  ? 'user_cancelled'
+                  : const {'NETWORK_ERROR', 'PROVIDER_ERROR'}.contains(e.code)
+                  ? 'excluded_external_failure'
+                  : 'code_failure:native_auth_error',
+              data: failureData,
+            );
             _invalidateAuthTransaction('authError');
             try {
               await runJavaScriptPostMessage(
                 jsonEncode({
                   'type': WebViewBridgeFeatureType.authError.value,
-                  'data': {'code': e.code, 'message': e.message},
+                  'data': {
+                    'code': e.code,
+                    'message': '',
+                    'protocolVersion': _activeProtocolVersion,
+                    if (_activeRequestId != null) 'requestId': _activeRequestId,
+                    if (_authSessionIdOf(data) != null)
+                      'authSessionId': _authSessionIdOf(data),
+                    if (_stringFieldOf(data, 'documentId') != null)
+                      'documentId': _stringFieldOf(data, 'documentId'),
+                    'authRevision': _activeAuthRevision,
+                    'failureStage': 'native_sdk',
+                    'failureCode': e.code,
+                  },
+                }),
+              );
+            } catch (_) {}
+            return;
+          }
+          // 예상 밖 auth exception도 반드시 canonical terminal로 닫는다. 그렇지 않으면
+          // UI에는 실패가 보여도 KPI에는 attempt 자체가 사라질 수 있다.
+          final unexpectedFailureStage = unexpectedAuthFailureStage(
+            webViewBridgeFeatureType,
+          );
+          if (unexpectedFailureStage != null) {
+            final failureData = _failureData(
+              data,
+              failureStage: unexpectedFailureStage,
+              failureCode: 'NATIVE_INTERNAL_ERROR',
+            );
+            _emitAuthTerminal(
+              'code_failure:native_internal',
+              data: failureData,
+            );
+            _invalidateAuthTransaction('NATIVE_INTERNAL_ERROR');
+            try {
+              await runJavaScriptPostMessage(
+                jsonEncode({
+                  'type': WebViewBridgeFeatureType.authError.value,
+                  'data': {
+                    ...failureData,
+                    'code': 'NATIVE_INTERNAL_ERROR',
+                    'message': '',
+                  },
                 }),
               );
             } catch (_) {}
@@ -688,16 +1559,39 @@ class FlutterWebViewBridgeJavaScriptChannel {
             await runJavaScriptPostMessage(
               jsonEncode({
                 'type': webViewBridgeFeatureType.value,
-                'error': e.toString(),
+                'error': 'NATIVE_INTERNAL_ERROR',
               }),
             );
           } catch (_) {
             // controller stale / channel teardown 등 응답 전송 자체 실패는 무시
           }
           if (context.mounted) {
-            WebViewUtils.showErrorSnackBar(context, e.toString());
+            WebViewUtils.showErrorSnackBar(context, 'NATIVE_INTERNAL_ERROR');
           }
           return;
+        }
+
+        if (webViewBridgeFeatureType ==
+            WebViewBridgeFeatureType.refreshTokenRead) {
+          final isInteractiveReplay =
+              _protocolVersionOf(data) >= 2 &&
+              _canReplayInteractiveRefresh(data);
+          if (isInteractiveReplay) {
+            _emitAuthTrace('auth.refresh.interactive_replay', data: data);
+          }
+          if (!isInteractiveReplay) {
+            processAutoAuthWork = _beginAutoAuthAttemptIfNeeded(data, sendData);
+          }
+          // protocol v2 자동 인증 응답은 process-wide 소유권이 있을 때만 진행한다.
+          // 다른 bridge instance에서 수동 로그인이 진행 중이면 오래된 refresh 결과가
+          // 사용자가 선택한 로그인 결과를 덮어쓰지 않도록 응답 자체를 중단한다.
+          // 단, 현재 bridge가 소유한 동일 interactive 시도의 session replay는 새 home
+          // document로 수렴하는 경로이므로 새 auto lease 없이 그대로 허용한다.
+          if (_protocolVersionOf(data) >= 2 &&
+              processAutoAuthWork == null &&
+              !isInteractiveReplay) {
+            return;
+          }
         }
 
         // ── B2: 카카오 로그인만 네이티브가 토큰 교환 후 AUTH_TOKENS_READY 로 변환 ──
@@ -726,7 +1620,32 @@ class FlutterWebViewBridgeJavaScriptChannel {
             webViewBridgeFeatureType ==
                 WebViewBridgeFeatureType.refreshTokenRead) {
           final replay = _replayRecentSession(data);
-          if (replay != null) sendData = replay;
+          if (replay != null) {
+            sendData = replay;
+          } else if (_protocolVersionOf(data) >= 2) {
+            sendData = await _refreshStoredSessionToTokensReady(sendData, data);
+          }
+        }
+
+        if (processAutoAuthWork != null &&
+            !_processAuthCoordinator.isActive(processAutoAuthWork.lease)) {
+          _completeUntrackedAutoAuthWork(processAutoAuthWork);
+          return;
+        }
+
+        if (webViewBridgeFeatureType ==
+            WebViewBridgeFeatureType.refreshTokenRead) {
+          _bindAutoAuthAttemptToResponse(sendData);
+        }
+
+        // OAuth 계정 선택/동의는 사람의 입력을 기다리는 provider interaction이다.
+        // 이 구간에는 짧은 terminal deadline을 적용하지 않고, SDK가 성공 결과를
+        // 반환해 web으로 전달할 준비가 끝난 뒤부터 UI 수렴 deadline을 시작한다.
+        // 반드시 postMessage 전에 arm해야 즉시 도착하는 UI ACK와의 race가 없다.
+        if (_isSsoLogin(webViewBridgeFeatureType) &&
+            _authAttemptPhase.completeProviderInteraction()) {
+          _emitAuthTrace('auth.provider.completed', data: data);
+          _armAttemptTerminalTimer();
         }
 
         // ── SSO watchdog arm (반드시 송신 *전*) ──
@@ -753,6 +1672,24 @@ class FlutterWebViewBridgeJavaScriptChannel {
             // B2(네이티브 교환 성공): AUTH_TOKENS_READY 송신 예정. web confirm 미수신 시 reload→replay.
             _armSsoWatchdog(isB2: true);
           }
+        } else if (webViewBridgeFeatureType ==
+                WebViewBridgeFeatureType.refreshTokenRead &&
+            _activeProtocolVersion >= 2 &&
+            sendData['type'] ==
+                WebViewBridgeFeatureType.authTokensReady.value) {
+          if (await _hasCompletedAuthTerminal(data)) {
+            _settleAuthTerminalTracking();
+            cancelSsoWatchdog('refreshTokenRead:terminalAlreadyCompleted');
+            _emitAuthTrace(
+              'auth.terminal.rearm_skipped',
+              resultCode: 'terminal_already_emitted',
+              data: data,
+            );
+          } else {
+            _authAttemptPhase.restoreTerminalConvergence();
+            _armAttemptTerminalTimer();
+            _armSsoWatchdog(isB2: true);
+          }
         }
 
         // Send Data to WebView
@@ -761,13 +1698,27 @@ class FlutterWebViewBridgeJavaScriptChannel {
           '[Bridge] postMessage type=${webViewBridgeFeatureType.value} len=${encoded.length}',
         );
         try {
-          await runJavaScriptPostMessage(encoded);
+          final delivered = await _runJavaScriptPostMessageWithReceipt(encoded);
+          final deliveryTraceData = delivered
+              ? data
+              : _failureData(
+                  data,
+                  failureStage: 'web_delivery',
+                  failureCode: 'BRIDGE_HANDLER_UNAVAILABLE',
+                );
+          _emitAuthTrace(
+            'bridge.delivery.${delivered ? "received" : "missed"}',
+            resultCode: delivered ? 'received' : 'handler_unavailable',
+            data: deliveryTraceData,
+          );
           debugPrint(
-            '[Bridge] postMessage OK type=${webViewBridgeFeatureType.value}',
+            '[Bridge] postMessage ${delivered ? "RECEIVED" : "MISSED"} '
+            'type=${webViewBridgeFeatureType.value}',
           );
         } catch (e) {
           debugPrint(
-            '[Bridge] postMessage FAIL type=${webViewBridgeFeatureType.value}: $e',
+            '[Bridge] postMessage FAIL '
+            'type=${webViewBridgeFeatureType.value}: ${e.runtimeType}',
           );
         }
 
@@ -781,6 +1732,7 @@ class FlutterWebViewBridgeJavaScriptChannel {
           _resendKakaoAfterReload = false;
           await _resendKakaoLogin();
         }
+        _completeUntrackedAutoAuthWork(processAutoAuthWork);
       }
     }
   }
@@ -832,7 +1784,162 @@ class FlutterWebViewBridgeJavaScriptChannel {
         // SDK 세션 정리 실패가 사줘 refresh token 삭제를 되돌리면 안 된다.
         // 다음 로그인 시도는 새 authSessionId 로 시작하고, 실패 원인은 로그로 남긴다.
         // ignore: avoid_print
-        print('[SsoExchange] native SSO logout FAIL provider=$provider: $e');
+        print(
+          '[SsoExchange] native SSO logout FAIL '
+          'provider=$provider: ${e.runtimeType}',
+        );
+      }
+    }
+  }
+
+  Future<void> _handleAuthUiCommitted(dynamic data) async {
+    if (data is! Map || data['protocolVersion'] != 2) return;
+
+    final workSnapshot = _captureAuthTerminalWork(data);
+    final isKnownTerminal = _processAuthCoordinator.isTerminalSettled(
+      attemptId: workSnapshot.attemptId,
+      revision: workSnapshot.revision,
+    );
+    final terminalKey = _terminalKeyOf(data);
+    if (isKnownTerminal || _terminalAuthSessionIds.contains(terminalKey)) {
+      _rememberTerminalKey(terminalKey);
+      _emitAuthTrace(
+        'auth.ui.duplicate_ignored',
+        resultCode: 'idempotent_duplicate',
+        data: data,
+      );
+      return;
+    }
+    if (workSnapshot.leaseGeneration == null) {
+      _emitAuthTrace(
+        'auth.ui.rejected',
+        resultCode: 'no_active_auth_owner',
+        data: data,
+      );
+      return;
+    }
+    if (!_isCurrentAuthTerminalWork(workSnapshot)) {
+      _emitAuthTrace(
+        'auth.ui.rejected',
+        resultCode: 'stale_auth_work',
+        data: data,
+      );
+      return;
+    }
+
+    // UI ACK가 native URL을 확인하는 동안 deadline timer가 같은 attempt를 먼저
+    // 실패 처리하지 못하게 잠시 멈춘다. 거부되면 기존 모드로 다시 arm한다.
+    final attemptTimerWasActive = _attemptTerminalTimer?.isActive ?? false;
+    final watchdogWasActive = _ssoWatchdog?.isActive ?? false;
+    final watchdogWasB2 = _ssoWatchdogB2;
+    _attemptTerminalTimer?.cancel();
+    _attemptTerminalTimer = null;
+    _ssoWatchdog?.cancel();
+    _ssoWatchdog = null;
+    var accepted = false;
+
+    // `_awaitingAuthTerminal == false`는 성공 terminal의 증거가 아니다. 새 document의
+    // 토큰 read/ACK 순서에 따라 flag가 false인 동안에도 유효한 UI commit이 도착할 수 있다.
+    // 반드시 payload를 먼저 검증하고 실제 terminal key/영속 marker로만 중복 판정한다.
+    try {
+      String? currentUrl;
+      try {
+        currentUrl = await webViewController.currentUrl().timeout(
+          const Duration(seconds: 3),
+        );
+      } catch (error) {
+        _emitAuthTrace(
+          'auth.ui.rejected',
+          resultCode: 'native_url_unavailable',
+          data: data,
+        );
+        return;
+      }
+      if (!_isCurrentAuthTerminalWork(workSnapshot)) {
+        _emitAuthTrace(
+          'auth.ui.rejected',
+          resultCode: 'attempt_changed_during_url_check',
+          data: data,
+        );
+        return;
+      }
+      final decision = validateAuthUiCommit(
+        data: data,
+        // process generation으로 동일 attempt임을 이미 검증했다. observer home
+        // bridge의 local active attempt는 비어 있거나 이전 document 값일 수 있다.
+        activeAuthSessionId: workSnapshot.attemptId,
+        activeAuthRevision: _activeAuthRevision,
+        nativeIsHome: _isHomePath(currentUrl),
+        webIsHome: _isHomePath(_stringFieldOf(data, 'pathname')),
+      );
+      if (!decision.isAccepted) {
+        _emitAuthTrace(
+          'auth.ui.rejected',
+          resultCode: decision.rejection!.name,
+          data: data,
+        );
+        return;
+      }
+      accepted = true;
+
+      // 여기부터는 사용자가 보는 UI 성공이 검증됐다. SharedPreferences 조회/쓰기 중
+      // watchdog이 끼어들어 같은 시도를 timeout으로 먼저 종결하지 못하게 즉시 정지한다.
+      _settleAuthTerminalTracking();
+      cancelSsoWatchdog('authUiCommitted:validated');
+
+      final hasCompletedTerminal = await _hasCompletedAuthTerminal(data);
+      if (hasCompletedTerminal) {
+        _emitAuthTrace(
+          'auth.ui.duplicate_ignored',
+          resultCode: 'idempotent_duplicate',
+          data: data,
+        );
+        return;
+      }
+      if (!_isCurrentAuthTerminalWork(workSnapshot)) {
+        _emitAuthTrace(
+          'auth.ui.rejected',
+          resultCode: 'attempt_changed_during_terminal_check',
+          data: data,
+        );
+        return;
+      }
+
+      try {
+        await const AuthTerminalStore().markSuccess(
+          authSessionId: _effectiveAuthSessionIdOf(data),
+          authRevision: _authRevisionOf(data) ?? _activeAuthRevision,
+          serviceCountry: serviceCountry,
+        );
+      } catch (error) {
+        // 계측 idempotency 저장 실패 때문에 사용자가 이미 본 로그인 성공을 실패로
+        // 바꾸지 않는다. 현재 process에서는 in-memory key가 계속 중복을 막는다.
+        // ignore: avoid_print
+        print(
+          '[SsoExchange] auth terminal marker write FAIL: ${error.runtimeType}',
+        );
+      }
+      if (!_isCurrentAuthTerminalWork(workSnapshot)) {
+        _emitAuthTrace(
+          'auth.ui.rejected',
+          resultCode: 'attempt_changed_during_marker_write',
+          data: data,
+        );
+        return;
+      }
+      final successData = <String, Object?>{
+        for (final entry in data.entries)
+          if (entry.key is String) entry.key as String: entry.value,
+        'success': true,
+        'uiAuthCommitted': true,
+      };
+      _emitAuthTerminal('ui_authenticated', data: successData);
+    } finally {
+      if (!accepted &&
+          _isCurrentAuthTerminalWork(workSnapshot) &&
+          _awaitingAuthTerminal) {
+        if (attemptTimerWasActive) _armAttemptTerminalTimer();
+        if (watchdogWasActive) _armSsoWatchdog(isB2: watchdogWasB2);
       }
     }
   }
@@ -884,6 +1991,118 @@ class FlutterWebViewBridgeJavaScriptChannel {
     };
   }
 
+  Future<Map<String, Object?>> _refreshStoredSessionToTokensReady(
+    Map<String, Object?> readResponse,
+    dynamic requestData,
+  ) async {
+    final readData = readResponse['data'];
+    final refreshToken = readData is Map
+        ? readData['refreshToken'] as String?
+        : null;
+    if (refreshToken == null || refreshToken.isEmpty) return readResponse;
+
+    try {
+      final sso = SsoExchange(
+        apiBaseUrl: apiBaseUrl!,
+        domainType: serviceCountry == 'GLOBAL'
+            ? 'sazo-global-shop'
+            : 'sazo-korea-shop',
+      );
+      final deviceHeaders = await _deviceHeaders();
+      final result = await sso.refreshToAccess(
+        refreshToken: refreshToken,
+        deviceHeaders: deviceHeaders,
+      );
+      if (!context.mounted) throw StateError('CONTEXT_DISPOSED');
+      final persisted = await RefreshTokenEvent().process(
+        context,
+        action: 'write',
+        data: result.refreshToken,
+        serviceCountry: serviceCountry,
+        authRevision: _activeAuthRevision,
+      );
+      if (persisted['error'] != null) {
+        throw StateError('REFRESH_TOKEN_PERSIST_FAILED');
+      }
+      final me = await sso.fetchMe(
+        accessToken: result.accessToken,
+        deviceHeaders: deviceHeaders,
+      );
+      _emitMeFetchResult(me, requestData);
+      final payload = <String, Object?>{
+        'type': WebViewBridgeFeatureType.authTokensReady.value,
+        'data': {
+          'accessToken': result.accessToken,
+          'refreshToken': result.refreshToken,
+          'protocolVersion': 2,
+          if (_requestIdOf(requestData) != null)
+            'requestId': _requestIdOf(requestData),
+          if (_authSessionIdOf(requestData) != null)
+            'authSessionId': _authSessionIdOf(requestData),
+          if (_stringFieldOf(requestData, 'documentId') != null)
+            'documentId': _stringFieldOf(requestData, 'documentId'),
+          if (requestData is Map && requestData['pageGeneration'] is int)
+            'pageGeneration': requestData['pageGeneration'] as int,
+          'authRevision': _activeAuthRevision,
+          if (me != null) 'me': me,
+        },
+      };
+      _cachedSessionPayload = payload;
+      _cachedSessionAt = DateTime.now();
+      _emitAuthTrace('auth.refresh.exchanged', data: requestData);
+      return payload;
+    } catch (error) {
+      final statusCode = error is SsoExchangeException
+          ? error.statusCode
+          : null;
+      if (statusCode != null &&
+          statusCode >= 400 &&
+          statusCode < 500 &&
+          statusCode != 408 &&
+          statusCode != 429 &&
+          context.mounted) {
+        await RefreshTokenEvent().process(
+          context,
+          action: 'delete',
+          serviceCountry: serviceCountry,
+          authRevision: _activeAuthRevision,
+        );
+      }
+      final failureStage = _failureStageOf(error, 'refresh_exchange');
+      final failureCode = _failureCodeOf(error, 'NATIVE_INTERNAL_ERROR');
+      final failureData = _failureData(
+        requestData,
+        failureStage: failureStage,
+        failureCode: failureCode,
+        httpStatus: statusCode,
+      );
+      _emitAuthTerminal(
+        _isExternalSsoFailure(error)
+            ? 'excluded_external_failure'
+            : 'code_failure:native_refresh_exchange',
+        data: failureData,
+      );
+      return {
+        'type': WebViewBridgeFeatureType.authError.value,
+        'data': {
+          'code': 'REFRESH_EXCHANGE_FAILED',
+          'message': '',
+          'protocolVersion': 2,
+          if (_requestIdOf(requestData) != null)
+            'requestId': _requestIdOf(requestData),
+          if (_authSessionIdOf(requestData) != null)
+            'authSessionId': _authSessionIdOf(requestData),
+          if (_stringFieldOf(requestData, 'documentId') != null)
+            'documentId': _stringFieldOf(requestData, 'documentId'),
+          'authRevision': _activeAuthRevision,
+          'failureStage': failureStage,
+          'failureCode': failureCode,
+          if (statusCode != null) 'httpStatus': statusCode,
+        },
+      };
+    }
+  }
+
   /// SSO SignIn 결과(idToken 포함 sendData)를 네이티브 교환 후 AUTH_TOKENS_READY payload 로
   /// 변환. 실패 시 AUTH_ERROR payload. web 은 결과로 토큰 persist 만 (HTTP 교환 0).
   Future<Map<String, Object?>?> _ssoExchangeToTokensReady(
@@ -927,19 +2146,25 @@ class FlutterWebViewBridgeJavaScriptChannel {
       }
       // 자동로그인용 refresh 네이티브 저장. (RefreshTokenEvent 는 context 를 SharedPreferences
       // 용으로만 받고 UI 미사용 → async gap 안전)
-      await RefreshTokenEvent().process(
+      final persistResult = await RefreshTokenEvent().process(
         // ignore: use_build_context_synchronously
         context,
         action: 'write',
         data: result.refreshToken,
         serviceCountry: serviceCountry,
+        authRevision: _activeAuthRevision,
       );
+      if (persistResult['error'] != null) {
+        throw StateError('REFRESH_TOKEN_PERSIST_FAILED');
+      }
+      _emitAuthTrace('auth.refresh.persisted', data: requestData);
       // me 도 네이티브 fetch — web me fetch 가 카카오 throttle 로 hang 하는 것 우회.
       // 실패는 non-fatal(me 생략 → web 이 기존 fetch 로 fallback).
       final me = await sso.fetchMe(
         accessToken: result.accessToken,
         deviceHeaders: deviceHeaders,
       );
+      _emitMeFetchResult(me, requestData);
       if (!_isCurrentAuthTransaction(authEpoch, requestData)) {
         _logStaleAuthMessage('ssoExchange:afterMe', requestData);
         return null;
@@ -958,6 +2183,13 @@ class FlutterWebViewBridgeJavaScriptChannel {
           'profile': profile,
           if (authSessionId != null) 'authSessionId': authSessionId,
           if (requestProvider != null) 'provider': requestProvider,
+          'protocolVersion': _activeProtocolVersion,
+          if (_activeRequestId != null) 'requestId': _activeRequestId,
+          if (_stringFieldOf(requestData, 'documentId') != null)
+            'documentId': _stringFieldOf(requestData, 'documentId'),
+          if (requestData is Map && requestData['pageGeneration'] is int)
+            'pageGeneration': requestData['pageGeneration'] as int,
+          'authRevision': _activeAuthRevision,
           if (me != null) 'me': me,
         },
       };
@@ -972,10 +2204,37 @@ class FlutterWebViewBridgeJavaScriptChannel {
         return null;
       }
       // ignore: avoid_print
-      print('[SsoExchange] FAIL ${type.value}: $e');
+      print('[SsoExchange] FAIL ${type.value}: ${e.runtimeType}');
+      final statusCode = e is SsoExchangeException ? e.statusCode : null;
+      final failureStage = _failureStageOf(e, 'unknown');
+      final failureCode = _failureCodeOf(e, 'NATIVE_INTERNAL_ERROR');
+      final failureData = _failureData(
+        requestData,
+        failureStage: failureStage,
+        failureCode: failureCode,
+        httpStatus: statusCode,
+      );
+      _emitAuthTerminal(
+        _isExternalSsoFailure(e)
+            ? 'excluded_external_failure'
+            : 'code_failure:sso_exchange',
+        data: failureData,
+      );
       return {
         'type': WebViewBridgeFeatureType.authError.value,
-        'data': {'code': 'SSO_EXCHANGE_FAILED', 'message': e.toString()},
+        'data': {
+          'code': 'SSO_EXCHANGE_FAILED',
+          'message': '',
+          'protocolVersion': _activeProtocolVersion,
+          if (_activeRequestId != null) 'requestId': _activeRequestId,
+          if (authSessionId != null) 'authSessionId': authSessionId,
+          if (_stringFieldOf(requestData, 'documentId') != null)
+            'documentId': _stringFieldOf(requestData, 'documentId'),
+          'authRevision': _activeAuthRevision,
+          'failureStage': failureStage,
+          'failureCode': failureCode,
+          if (statusCode != null) 'httpStatus': statusCode,
+        },
       };
     }
   }
@@ -1025,6 +2284,25 @@ class FlutterWebViewBridgeJavaScriptChannel {
       '[SsoExchange] session replay → AUTH_TOKENS_READY '
       '(authSessionId=${cachedAuthSessionId ?? "null"})',
     );
+    if (requestData is Map && payload['data'] is Map) {
+      final replayData = Map<String, Object?>.from(payload['data'] as Map);
+      for (final key in const [
+        'protocolVersion',
+        'requestId',
+        'authSessionId',
+        'documentId',
+        'pageGeneration',
+      ]) {
+        if (requestData[key] != null) replayData[key] = requestData[key];
+      }
+      replayData['authRevision'] = _activeAuthRevision;
+      _activeRequestId = _requestIdOf(requestData);
+      _activeDocumentId = _stringFieldOf(requestData, 'documentId');
+      return {
+        'type': WebViewBridgeFeatureType.authTokensReady.value,
+        'data': replayData,
+      };
+    }
     return payload;
   }
   // ───────────────────────────────────────────────────────────────────────────
@@ -1043,14 +2321,18 @@ class FlutterWebViewBridgeJavaScriptChannel {
   }
 
   Future<void> runJavaScriptPostMessage(String jsonData) async {
-    if (!_canTouchWebView) return;
+    await _runJavaScriptPostMessageWithReceipt(jsonData);
+  }
+
+  Future<bool> _runJavaScriptPostMessageWithReceipt(String jsonData) async {
+    if (!_canTouchWebView) return false;
 
     if (!_isAppResumed) {
       _enqueuePendingPostMessage(jsonData);
-      return;
+      return false;
     }
 
-    await _sendPostMessageNow(jsonData);
+    return _sendPostMessageNow(jsonData);
   }
 
   Future<void> runJavaScriptReturningResultPostMessage(String jsonData) {
@@ -1086,39 +2368,45 @@ class FlutterWebViewBridgeJavaScriptChannel {
     }
   }
 
-  Future<void> _sendPostMessageNow(String jsonData) {
+  Future<bool> _sendPostMessageNow(String jsonData) {
     return _runBridgeCallback(
       callbackName: 'callbackPostMessage',
       jsonData: jsonData,
     );
   }
 
-  Future<void> _runBridgeCallback({
+  Future<bool> _runBridgeCallback({
     required String callbackName,
     required String jsonData,
   }) async {
-    if (!_canTouchWebView) return;
+    if (!_canTouchWebView) return false;
 
     final payloadLiteral = jsonEncode(jsonData);
     try {
-      await webViewController.runJavaScript('''
+      final result = await webViewController.runJavaScriptReturningResult('''
         (function() {
           try {
             var payload = $payloadLiteral;
             if (typeof window.$callbackName === 'function') {
               window.$callbackName(payload);
-              return;
+              return true;
             }
             if (typeof document.$callbackName === 'function') {
               document.$callbackName(payload);
+              return true;
             }
-          } catch (_) {}
+            return false;
+          } catch (_) {
+            return false;
+          }
         })();
       ''');
+      return result == true || result == 1 || result == 'true';
     } catch (e) {
       if (!_isDisposed) {
-        debugPrint('[Bridge] $callbackName JS skipped: $e');
+        debugPrint('[Bridge] $callbackName JS skipped: ${e.runtimeType}');
       }
+      return false;
     }
   }
 }

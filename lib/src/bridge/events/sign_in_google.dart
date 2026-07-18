@@ -48,6 +48,7 @@ class SignInGoogle {
         throw AuthError(
           AuthErrorCode.sdkInitFailed,
           'Google sign-in not supported on this platform',
+          nativeSdkErrorCode: 'GOOGLE_SDK_INIT_FAILED',
         );
       }
       try {
@@ -70,7 +71,8 @@ class SignInGoogle {
         final message = e is GoogleSignInException
             ? _errorMessageFromSignInException(e)
             : 'Unknown error: $e';
-        throw AuthError(mapGoogleError(e), message);
+        final code = mapGoogleError(e);
+        throw AuthError(code, message, nativeSdkErrorCode: 'GOOGLE_$code');
       }
     }
 

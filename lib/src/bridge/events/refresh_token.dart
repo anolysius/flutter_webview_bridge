@@ -33,11 +33,26 @@ class RefreshTokenEvent {
     required String action,
     dynamic data,
     String? serviceCountry,
+    int? authRevision,
   }) async {
     Map<String, Object?> sendData = {};
 
     final SharedPreferences prefs = await SharedPreferences.getInstance();
     final String storageKey = refreshTokenKeyFor(serviceCountry);
+    final isV2 = data is Map && data['protocolVersion'] == 2;
+    Map<String, Object?> v2Response({required String status}) => {
+      'status': status,
+      'protocolVersion': 2,
+      if (data is Map && data['requestId'] is String)
+        'requestId': data['requestId'] as String,
+      if (data is Map && data['authSessionId'] is String)
+        'authSessionId': data['authSessionId'] as String,
+      if (data is Map && data['documentId'] is String)
+        'documentId': data['documentId'] as String,
+      if (data is Map && data['pageGeneration'] is int)
+        'pageGeneration': data['pageGeneration'] as int,
+      if (authRevision != null) 'authRevision': authRevision,
+    };
 
     if (action == 'read') {
       sendData['type'] = WebViewBridgeFeatureType.refreshTokenRead.value;
@@ -45,7 +60,16 @@ class RefreshTokenEvent {
       // Get the stored refresh token
       final String? refreshToken = prefs.getString(storageKey);
       if (refreshToken != null) {
-        sendData['data'] = refreshToken;
+        if (isV2) {
+          sendData['data'] = {
+            ...v2Response(status: 'found'),
+            'refreshToken': refreshToken,
+          };
+        } else {
+          sendData['data'] = refreshToken;
+        }
+      } else if (isV2) {
+        sendData['data'] = v2Response(status: 'absent');
       } else {
         sendData['error'] = 'No refresh token found';
       }
@@ -61,8 +85,8 @@ class RefreshTokenEvent {
           : null;
       if (refreshToken != null) {
         final r = await prefs.setString(storageKey, refreshToken);
-        if (r == true) {
-          sendData['data'] = refreshToken;
+        if (r == true && prefs.getString(storageKey) == refreshToken) {
+          sendData['data'] = isV2 ? v2Response(status: 'stored') : refreshToken;
         } else {
           sendData['error'] = 'Failed to store the refresh token';
         }
@@ -76,7 +100,7 @@ class RefreshTokenEvent {
       // Delete the stored refresh token
       final r = await prefs.remove(storageKey);
       if (r == true) {
-        sendData['data'] = '';
+        sendData['data'] = isV2 ? v2Response(status: 'deleted') : '';
       } else {
         sendData['error'] = 'Failed to delete the stored refresh token';
       }

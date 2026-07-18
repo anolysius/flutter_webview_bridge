@@ -44,7 +44,9 @@ class SignInKakao {
             idToken = token.idToken;
             debugPrint('[SignInKakao] loginWithKakaoTalk OK');
           } catch (error) {
-            debugPrint('[SignInKakao] loginWithKakaoTalk FAIL: $error');
+            debugPrint(
+              '[SignInKakao] loginWithKakaoTalk FAIL: ${error.runtimeType}',
+            );
             // 사용자가 카카오톡 설치 후 디바이스 권한 요청 화면에서 로그인을 취소한 경우,
             // 의도적인 로그인 취소로 보고 카카오계정으로 로그인 시도 없이 로그인 취소로 처리 (예: 뒤로 가기)
             if (error is PlatformException && error.code == 'CANCELED') {
@@ -78,37 +80,42 @@ class SignInKakao {
           user = await UserApi.instance.me();
           debugPrint('[SignInKakao] me() OK first attempt');
         } catch (error) {
-          debugPrint('[SignInKakao] me() FAIL first attempt: $error — retry');
+          debugPrint(
+            '[SignInKakao] me() FAIL first attempt: '
+            '${error.runtimeType} — retry',
+          );
           // 1회 retry — SDK token 적용 추가 대기 후
           await Future.delayed(const Duration(milliseconds: 500));
           try {
             user = await UserApi.instance.me();
             debugPrint('[SignInKakao] me() OK retry');
           } catch (error2) {
-            debugPrint('[SignInKakao] me() FAIL retry: $error2');
-            rethrow;
+            debugPrint('[SignInKakao] me() FAIL retry: ${error2.runtimeType}');
+            // idToken 확보가 로그인 본체다. me()는 profile enrichment일 뿐이므로
+            // 두 번 실패해도 토큰 교환을 계속하고 web/native me fallback에 맡긴다.
+            user = null;
           }
         }
 
         // 사용자의 추가 동의가 필요한 사용자 정보 동의항목 확인
         List<String> scopes = [];
 
-        if (user.kakaoAccount?.emailNeedsAgreement == true) {
+        if (user?.kakaoAccount?.emailNeedsAgreement == true) {
           scopes.add('account_email');
         }
-        if (user.kakaoAccount?.birthdayNeedsAgreement == true) {
+        if (user?.kakaoAccount?.birthdayNeedsAgreement == true) {
           scopes.add("birthday");
         }
-        if (user.kakaoAccount?.birthyearNeedsAgreement == true) {
+        if (user?.kakaoAccount?.birthyearNeedsAgreement == true) {
           scopes.add("birthyear");
         }
-        if (user.kakaoAccount?.phoneNumberNeedsAgreement == true) {
+        if (user?.kakaoAccount?.phoneNumberNeedsAgreement == true) {
           scopes.add("phone_number");
         }
-        if (user.kakaoAccount?.profileNeedsAgreement == true) {
+        if (user?.kakaoAccount?.profileNeedsAgreement == true) {
           scopes.add("profile");
         }
-        if (user.kakaoAccount?.ageRangeNeedsAgreement == true) {
+        if (user?.kakaoAccount?.ageRangeNeedsAgreement == true) {
           scopes.add("age_range");
         }
 
@@ -130,20 +137,28 @@ class SignInKakao {
           }
         }
 
+        if (idToken == null || idToken.isEmpty) {
+          throw StateError('KAKAO_ID_TOKEN_MISSING');
+        }
         sendData['data'] = {
-          'id': user.id,
-          'displayName': user.kakaoAccount?.profile?.nickname,
-          'email': user.kakaoAccount?.email,
-          'photoUrl': user.kakaoAccount?.profile?.profileImageUrl,
+          'id': user?.id,
+          'displayName': user?.kakaoAccount?.profile?.nickname,
+          'email': user?.kakaoAccount?.email,
+          'photoUrl': user?.kakaoAccount?.profile?.profileImageUrl,
           'idToken': idToken,
         };
-        debugPrint(
-          '[SignInKakao] SUCCESS sendData ready (idToken=${idToken == null ? "null" : "${idToken.substring(0, idToken.length < 20 ? idToken.length : 20)}..."})',
-        );
+        debugPrint('[SignInKakao] SUCCESS sendData ready');
       } catch (e) {
         // bridge.dart catch 의 `e is AuthError` 분기에서 AUTH_ERROR payload 발화.
-        debugPrint('[SignInKakao] OUTER CATCH — throw AuthError: $e');
-        throw AuthError(mapKakaoError(e), e.toString());
+        debugPrint(
+          '[SignInKakao] OUTER CATCH — throw AuthError: ${e.runtimeType}',
+        );
+        final code = mapKakaoError(e);
+        throw AuthError(
+          code,
+          e.runtimeType.toString(),
+          nativeSdkErrorCode: 'KAKAO_$code',
+        );
       }
     }
 
