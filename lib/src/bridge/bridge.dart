@@ -35,6 +35,7 @@ import 'auth/auth_terminal_store.dart';
 import 'auth/auth_ui_commit.dart';
 import 'auth/auto_auth_attempt.dart';
 import 'auth/interactive_refresh_convergence.dart';
+import 'auth/pending_auth_attempt_store.dart';
 import 'auth/process_auth_attempt_coordinator.dart';
 import 'auth/unexpected_auth_failure.dart';
 
@@ -290,6 +291,7 @@ class FlutterWebViewBridgeJavaScriptChannel {
   String? _activeRequestId;
   String? _activeDocumentId;
   final Set<String> _terminalAuthSessionIds = <String>{};
+  final Set<String> _interruptedAttemptRecoveryChecked = <String>{};
   final AutoAuthAttemptController _autoAuthAttempt =
       AutoAuthAttemptController();
   final ProcessAuthAttemptCoordinator _processAuthCoordinator =
@@ -511,6 +513,15 @@ class FlutterWebViewBridgeJavaScriptChannel {
           };
     final key = _terminalKeyOf(terminalData);
     final revision = _authRevisionOf(terminalData) ?? _activeAuthRevision;
+    if (attemptId != null) {
+      unawaited(
+        const PendingAuthAttemptStore().clearIfMatches(
+          attemptId: attemptId,
+          authRevision: revision,
+          serviceCountry: serviceCountry,
+        ),
+      );
+    }
     final isFirstProcessTerminal = _processAuthCoordinator.settleTerminal(
       attemptId: attemptId,
       revision: revision,
@@ -800,6 +811,60 @@ class FlutterWebViewBridgeJavaScriptChannel {
     return _ProcessAutoAuthWork(lease: lease, tracksTerminal: tracksTerminal);
   }
 
+  Future<void> _recoverInterruptedAuthAttemptIfNeeded() async {
+    final country = serviceCountry ?? 'KR';
+    if (_interruptedAttemptRecoveryChecked.contains(country)) return;
+
+    PendingAuthAttempt? interrupted;
+    try {
+      interrupted = await const PendingAuthAttemptStore().takeInterrupted(
+        currentProcessInstanceId: authProcessInstanceId,
+        serviceCountry: serviceCountry,
+      );
+      _interruptedAttemptRecoveryChecked.add(country);
+    } catch (_) {
+      _emitAuthTrace(
+        'auth.interrupted.recovery_failed',
+        resultCode: 'pending_attempt_read_failed',
+        data: _failureData(
+          const <String, Object?>{},
+          failureStage: 'attempt_recovery',
+          failureCode: 'PENDING_ATTEMPT_READ_FAILED',
+        ),
+      );
+      return;
+    }
+    if (interrupted == null) return;
+
+    try {
+      final alreadySucceeded = await const AuthTerminalStore().matchesSuccess(
+        authSessionId: interrupted.attemptId,
+        authRevision: interrupted.authRevision,
+        serviceCountry: serviceCountry,
+      );
+      if (alreadySucceeded) return;
+    } catch (_) {
+      // 성공 marker 조회 실패만으로 회수를 누락하면 missing terminal이 다시 생긴다.
+      // pending attempt 자체가 이전 process 소유라는 영속 증거를 우선한다.
+    }
+
+    // 이전 process는 계정 선택/동의 화면에서 강제 종료되어 callback을 실행할 수 없었다.
+    // 다음 process의 첫 v2 refresh read가 사용자 중단 terminal을 한 번만 보충한다.
+    _emitAuthTrace(
+      'auth.terminal',
+      resultCode: 'process_interrupted',
+      data: <String, Object?>{
+        'protocolVersion': interrupted.protocolVersion,
+        'authSessionId': interrupted.attemptId,
+        'authRevision': interrupted.authRevision,
+        'provider': interrupted.provider,
+        if (interrupted.requestId != null) 'requestId': interrupted.requestId,
+        if (interrupted.documentId != null)
+          'documentId': interrupted.documentId,
+      },
+    );
+  }
+
   void _completeUntrackedAutoAuthWork(_ProcessAutoAuthWork? work) {
     if (work == null || work.tracksTerminal) return;
     if (identical(_processAuthLease, work.lease)) {
@@ -874,6 +939,33 @@ class FlutterWebViewBridgeJavaScriptChannel {
     _authAttemptPhase.beginProviderInteraction(
       tracksTerminal: _activeProtocolVersion >= 2,
     );
+    if (_activeProtocolVersion >= 2) {
+      try {
+        await const PendingAuthAttemptStore().markStarted(
+          attempt: PendingAuthAttempt(
+            attemptId: processLease.attemptId,
+            authRevision: _activeAuthRevision,
+            provider: provider,
+            protocolVersion: _activeProtocolVersion,
+            startedAt: DateTime.now().toUtc(),
+            processInstanceId: authProcessInstanceId,
+            requestId: _activeRequestId,
+            documentId: _activeDocumentId,
+          ),
+          serviceCountry: serviceCountry,
+        );
+      } catch (_) {
+        _emitAuthTrace(
+          'auth.attempt.persistence_failed',
+          resultCode: 'pending_attempt_write_failed',
+          data: _failureData(
+            data,
+            failureStage: 'attempt_persistence',
+            failureCode: 'PENDING_ATTEMPT_PERSIST_FAILED',
+          ),
+        );
+      }
+    }
     _emitAuthTrace('auth.attempt.started', data: data);
     await runJavaScriptPostMessage(
       jsonEncode({
@@ -1238,6 +1330,9 @@ class FlutterWebViewBridgeJavaScriptChannel {
               );
               break;
             case WebViewBridgeFeatureType.refreshTokenRead:
+              if (_protocolVersionOf(data) >= 2) {
+                await _recoverInterruptedAuthAttemptIfNeeded();
+              }
               final readSnapshot = AuthRevisionReadSnapshot(
                 epoch: _authEpoch,
                 serviceCountry: serviceCountry,
