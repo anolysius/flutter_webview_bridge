@@ -31,12 +31,14 @@ class SsoExchangeException implements Exception {
   final String failureCode;
   final bool externalFailure;
   final int? statusCode;
+  final String? semanticReason;
   const SsoExchangeException(
     this.message, {
     required this.failureStage,
     required this.failureCode,
     this.externalFailure = false,
     this.statusCode,
+    this.semanticReason,
   });
 
   @override
@@ -171,6 +173,7 @@ class SsoExchange {
         failureCode: 'SSO_REFRESH_HTTP',
         externalFailure: _isExternalStatus(rfRes.statusCode),
         statusCode: rfRes.statusCode,
+        semanticReason: _refreshSemanticReason(rfRes.body),
       );
     }
     final Map<String, dynamic> rfBody;
@@ -239,6 +242,20 @@ class SsoExchange {
     final decoded = jsonDecode(body);
     if (decoded is Map<String, dynamic>) return decoded;
     return <String, dynamic>{};
+  }
+
+  String? _refreshSemanticReason(String body) {
+    try {
+      final decoded = jsonDecode(body);
+      final code = decoded is Map ? decoded['code'] : null;
+      return switch (code) {
+        'A400-10' => 'refresh_token_expired',
+        'A400-11' => 'refresh_token_invalid',
+        _ => null,
+      };
+    } catch (_) {
+      return null;
+    }
   }
 
   bool _isExternalStatus(int statusCode) =>

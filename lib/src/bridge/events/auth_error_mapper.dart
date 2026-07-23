@@ -64,9 +64,60 @@ String mapKakaoError(Object e) {
   if (e is KakaoApiException || e is KakaoAppsException) {
     return AuthErrorCode.providerError;
   }
+  if (e is StateError && e.message == 'KAKAO_ID_TOKEN_MISSING') {
+    return AuthErrorCode.invalidResponse;
+  }
   if (_isNetworkError(e)) return AuthErrorCode.networkError;
   return AuthErrorCode.unknown;
 }
+
+String mapKakaoSafeCause(Object e) {
+  if (e is PlatformException && e.code == 'CANCELED') return 'user_cancelled';
+  if (e is KakaoClientException) {
+    return switch (e.reason) {
+      ClientErrorCause.cancelled => 'user_cancelled',
+      ClientErrorCause.notSupported => 'unsupported',
+      ClientErrorCause.tokenNotFound => 'token_not_found',
+      ClientErrorCause.badParameter => 'bad_parameter',
+      ClientErrorCause.illegalState => 'illegal_state',
+      ClientErrorCause.unknown => 'unknown',
+    };
+  }
+  if (e is KakaoAuthException) {
+    return switch (e.error) {
+      AuthErrorCause.accessDenied => 'user_cancelled',
+      AuthErrorCause.invalidClient => 'invalid_client',
+      AuthErrorCause.misconfigured => 'misconfigured',
+      AuthErrorCause.serverError => 'provider_error',
+      _ => 'provider_error',
+    };
+  }
+  if (e is KakaoApiException || e is KakaoAppsException) {
+    return 'provider_error';
+  }
+  if (e is StateError && e.message == 'KAKAO_ID_TOKEN_MISSING') {
+    return 'id_token_missing';
+  }
+  if (_isNetworkError(e)) return 'network';
+  return 'unknown';
+}
+
+/// Only reasons emitted by [mapKakaoSafeCause] are accepted. The public
+/// [AuthError] contract remains backward-compatible; v3 tracing derives the
+/// diagnostic field from its already allowlisted provider code.
+String? safeNativeSdkCauseFromCode(String code) => const {
+  'KAKAO_USER_CANCELLED': 'user_cancelled',
+  'KAKAO_UNSUPPORTED': 'unsupported',
+  'KAKAO_TOKEN_NOT_FOUND': 'token_not_found',
+  'KAKAO_BAD_PARAMETER': 'bad_parameter',
+  'KAKAO_ILLEGAL_STATE': 'illegal_state',
+  'KAKAO_INVALID_CLIENT': 'invalid_client',
+  'KAKAO_MISCONFIGURED': 'misconfigured',
+  'KAKAO_PROVIDER_ERROR': 'provider_error',
+  'KAKAO_ID_TOKEN_MISSING': 'id_token_missing',
+  'KAKAO_NETWORK': 'network',
+  'KAKAO_UNKNOWN': 'unknown',
+}[code];
 
 /// Google Sign-In raw exception → AUTH_ERROR code.
 String mapGoogleError(Object e) {

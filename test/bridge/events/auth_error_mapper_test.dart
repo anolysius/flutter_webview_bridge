@@ -50,6 +50,22 @@ void main() {
       expect(mapKakaoError(e), AuthErrorCode.providerError);
     });
 
+    test('모든 Kakao auth enum은 allowlisted safe cause로만 축약된다', () {
+      const allowed = {
+        'user_cancelled',
+        'invalid_client',
+        'misconfigured',
+        'provider_error',
+      };
+      for (final cause in AuthErrorCause.values) {
+        final mapped = mapKakaoSafeCause(
+          KakaoAuthException(cause, 'private provider text'),
+        );
+        expect(allowed, contains(mapped), reason: cause.name);
+        expect(mapped, isNot(contains('private')));
+      }
+    });
+
     test('SocketException → NETWORK_ERROR', () {
       expect(
         mapKakaoError(const SocketException('no route')),
@@ -59,6 +75,44 @@ void main() {
 
     test('generic Exception → UNKNOWN', () {
       expect(mapKakaoError(Exception('???')), AuthErrorCode.unknown);
+    });
+
+    test('명시적 id token 누락은 INVALID_RESPONSE + safe cause로 보존한다', () {
+      final error = StateError('KAKAO_ID_TOKEN_MISSING');
+      expect(mapKakaoError(error), AuthErrorCode.invalidResponse);
+      expect(mapKakaoSafeCause(error), 'id_token_missing');
+    });
+
+    test('Kakao client reason을 raw message 없이 allowlisted cause로 구분한다', () {
+      const expected = {
+        ClientErrorCause.cancelled: 'user_cancelled',
+        ClientErrorCause.notSupported: 'unsupported',
+        ClientErrorCause.tokenNotFound: 'token_not_found',
+        ClientErrorCause.badParameter: 'bad_parameter',
+        ClientErrorCause.illegalState: 'illegal_state',
+        ClientErrorCause.unknown: 'unknown',
+      };
+      expect(expected.keys.toSet(), ClientErrorCause.values.toSet());
+      for (final entry in expected.entries) {
+        expect(
+          mapKakaoSafeCause(
+            KakaoClientException(entry.key, 'private provider text'),
+          ),
+          entry.value,
+        );
+      }
+    });
+
+    test('allowlisted native code만 safe cause로 복원한다', () {
+      expect(
+        safeNativeSdkCauseFromCode('KAKAO_ID_TOKEN_MISSING'),
+        'id_token_missing',
+      );
+      expect(
+        safeNativeSdkCauseFromCode('KAKAO_PRIVATE_PROVIDER_TEXT'),
+        isNull,
+      );
+      expect(safeNativeSdkCauseFromCode('GOOGLE_UNKNOWN'), isNull);
     });
   });
 

@@ -1,5 +1,11 @@
 const autoAuthProvider = 'AUTO_REFRESH';
 
+bool shouldDeliverAutoAuthResponse({
+  required bool isLeaseActive,
+  required bool isTerminalSettled,
+  required Object? responseType,
+}) => isLeaseActive || (isTerminalSettled && responseType == 'AUTH_ERROR');
+
 /// coordinator가 허용한 첫 v2 refresh-token read를 독립 자동 로그인 시도로 승격한다.
 ///
 /// process-wide 1회 게이트와 interactive 우선권은
@@ -23,8 +29,12 @@ class AutoAuthAttemptController {
     required bool interactiveAttemptActive,
     required int fallbackNonce,
   }) {
-    final isV2 = requestData is Map && requestData['protocolVersion'] == 2;
-    if (!isV2) return null;
+    final protocolVersion = requestData is Map
+        ? requestData['protocolVersion']
+        : null;
+    final isTrackedProtocol =
+        protocolVersion is int && protocolVersion >= 2 && protocolVersion <= 3;
+    if (!isTrackedProtocol) return null;
 
     if (_initialV2RefreshObserved) return null;
     _initialV2RefreshObserved = true;

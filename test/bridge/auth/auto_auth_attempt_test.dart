@@ -2,6 +2,25 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:flutter_webview_bridge/src/bridge/auth/auto_auth_attempt.dart';
 
 void main() {
+  test('같은 auto attempt의 settled AUTH_ERROR는 web 실패 UI까지 전달한다', () {
+    expect(
+      shouldDeliverAutoAuthResponse(
+        isLeaseActive: false,
+        isTerminalSettled: true,
+        responseType: 'AUTH_ERROR',
+      ),
+      isTrue,
+    );
+    expect(
+      shouldDeliverAutoAuthResponse(
+        isLeaseActive: false,
+        isTerminalSettled: false,
+        responseType: 'AUTH_ERROR',
+      ),
+      isFalse,
+    );
+  });
+
   Map<String, Object?> request({
     int protocolVersion = 2,
     String? requestId = 'request-1',

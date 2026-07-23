@@ -23,7 +23,8 @@ AuthUiCommitDecision validateAuthUiCommit({
   required bool nativeIsHome,
   required bool webIsHome,
 }) {
-  if (data is! Map || data['protocolVersion'] != 2) {
+  final protocolVersion = data is Map ? data['protocolVersion'] : null;
+  if (protocolVersion is! int || protocolVersion < 2 || protocolVersion > 3) {
     return const AuthUiCommitDecision.rejected(
       AuthUiCommitRejection.invalidPayload,
     );

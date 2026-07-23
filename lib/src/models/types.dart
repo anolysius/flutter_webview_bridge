@@ -28,6 +28,9 @@ enum WebViewBridgeFeatureType {
   authError,
   authTokensReady,
   authUiCommitted,
+  authOnboardingReady,
+  authReauthCommitted,
+  authReauthRequired,
   authAttemptStarted,
   serviceCountryQuery,
   serviceCountryChange,
@@ -94,6 +97,12 @@ extension WebViewBridgeFeatureTypeValue on WebViewBridgeFeatureType {
         return 'AUTH_TOKENS_READY';
       case WebViewBridgeFeatureType.authUiCommitted:
         return 'AUTH_UI_COMMITTED';
+      case WebViewBridgeFeatureType.authOnboardingReady:
+        return 'AUTH_ONBOARDING_READY';
+      case WebViewBridgeFeatureType.authReauthCommitted:
+        return 'AUTH_REAUTH_COMMITTED';
+      case WebViewBridgeFeatureType.authReauthRequired:
+        return 'AUTH_REAUTH_REQUIRED';
       case WebViewBridgeFeatureType.authAttemptStarted:
         return 'AUTH_ATTEMPT_STARTED';
       case WebViewBridgeFeatureType.serviceCountryQuery:
@@ -165,6 +174,12 @@ extension WebViewBridgeFeatureTypeString on String {
         return WebViewBridgeFeatureType.authTokensReady;
       case 'AUTH_UI_COMMITTED':
         return WebViewBridgeFeatureType.authUiCommitted;
+      case 'AUTH_ONBOARDING_READY':
+        return WebViewBridgeFeatureType.authOnboardingReady;
+      case 'AUTH_REAUTH_COMMITTED':
+        return WebViewBridgeFeatureType.authReauthCommitted;
+      case 'AUTH_REAUTH_REQUIRED':
+        return WebViewBridgeFeatureType.authReauthRequired;
       case 'SERVICE_COUNTRY_QUERY':
         return WebViewBridgeFeatureType.serviceCountryQuery;
       case 'SERVICE_COUNTRY_CHANGE':
