@@ -44,9 +44,26 @@ import 'auth/pending_auth_attempt_store.dart';
 import 'auth/pending_reauth_replay.dart';
 import 'auth/process_auth_attempt_coordinator.dart';
 import 'auth/refresh_token_protocol_adapter.dart';
+import 'auth/service_auth_context.dart';
 import 'auth/unexpected_auth_failure.dart';
 
 typedef AuthTraceCallback = void Function(Map<String, Object?> event);
+typedef AuthContextStatusCallback =
+    FutureOr<void> Function(Map<String, Object?> status);
+typedef AuthContextRestartCallback =
+    FutureOr<void> Function(Map<String, Object?> request);
+typedef WebAuthContextCapabilityCallback =
+    void Function({
+      required bool supported,
+      required String? documentId,
+      required int navigationGeneration,
+    });
+typedef AuthProviderOperation =
+    Future<Map<String, Object?>> Function(
+      WebViewBridgeFeatureType type,
+      BuildContext context,
+      dynamic data,
+    );
 
 class _ProcessAutoAuthWork {
   const _ProcessAutoAuthWork({
@@ -77,7 +94,8 @@ class FlutterWebViewBridgeJavaScriptChannel {
   /// B2: 네이티브 SSO 토큰 교환 API base (flavor 별, 예 https://qa.api.sazo.kr).
   /// 주입 시 SSO 로그인 교환을 네이티브가 수행(AUTH_TOKENS_READY) — WKWebView throttling 우회.
   /// 미주입(null) 시 기존 경로(SIGN_IN_LOGIN → web 교환 + watchdog) fallback.
-  final String? apiBaseUrl;
+  String? _apiBaseUrl;
+  String? get apiBaseUrl => _apiBaseUrl;
   final String? bridgeRevision;
 
   /// 서비스 국가 코드 (APP-300 R5 — 'KR' / 'GLOBAL'). 미주입(null)=KR/레거시 동작.
@@ -87,10 +105,18 @@ class FlutterWebViewBridgeJavaScriptChannel {
   /// 재시작 없이 refresh-key/domainType 가 새 국가를 반영한다.
   String? _serviceCountry;
   String? get serviceCountry => _serviceCountry;
+  late ServiceAuthContext _serviceAuthContext;
+  bool _serviceContextTransitionInProgress = false;
 
   /// 웹의 SERVICE_COUNTRY_CHANGE 수신 시 앱이 override+reload 하도록 위임하는 콜백.
   final void Function(String requestedCountry)? onServiceCountryChange;
   final AuthTraceCallback? onAuthTrace;
+  final AuthContextStatusCallback? onAuthContextStatus;
+  final AuthContextRestartCallback? onAuthContextRestart;
+  final WebAuthContextCapabilityCallback? onWebAuthContextCapability;
+  int _webDocumentNavigationGeneration;
+  @visibleForTesting
+  final AuthProviderOperation? testAuthProviderOperation;
   bool _isDisposed = false;
   bool _pendingSsoRecovery = false;
   AppLifecycleState _appLifecycleState = AppLifecycleState.resumed;
@@ -98,6 +124,11 @@ class FlutterWebViewBridgeJavaScriptChannel {
   bool _isFlushingPendingPostMessages = false;
   Future<void> _messageSerial = Future<void>.value();
   static const int _maxPendingPostMessages = 20;
+  final AuthContextOperationRegistry _authContextStatusOperations =
+      AuthContextOperationRegistry();
+  final AuthContextRecoveryCoordinator _authContextRecoveryCoordinator =
+      AuthContextRecoveryCoordinator();
+  final AuthDocumentBoundary _authDocumentBoundary = AuthDocumentBoundary();
 
   FlutterWebViewBridgeJavaScriptChannel({
     required this.context,
@@ -105,12 +136,28 @@ class FlutterWebViewBridgeJavaScriptChannel {
     this.channelName = 'IN_APP_WEBVIEW_BRIDGE_CHANNEL',
     required this.googleServerClientId,
     required this.kakaoNativeAppKey,
-    this.apiBaseUrl,
+    String? apiBaseUrl,
     this.bridgeRevision,
     String? serviceCountry,
     this.onServiceCountryChange,
     this.onAuthTrace,
-  }) : _serviceCountry = serviceCountry {
+    this.onAuthContextStatus,
+    this.onAuthContextRestart,
+    this.onWebAuthContextCapability,
+    int webDocumentNavigationGeneration = 0,
+    this.testAuthProviderOperation,
+  }) : _webDocumentNavigationGeneration = webDocumentNavigationGeneration,
+       _apiBaseUrl = apiBaseUrl,
+       _serviceCountry = normalizeServiceCountry(serviceCountry) {
+    validateServiceAuthContextPair(
+      serviceCountry: serviceCountry,
+      apiBaseUrl: apiBaseUrl,
+    );
+    _serviceAuthContext = ServiceAuthContext(
+      serviceCountry: normalizeServiceCountry(serviceCountry),
+      apiBaseUrl: apiBaseUrl,
+      generation: 0,
+    );
     if (googleServerClientId != null) {
       SignInGoogle.shared.initialize(
         googleServerClientId: googleServerClientId,
@@ -150,12 +197,60 @@ class FlutterWebViewBridgeJavaScriptChannel {
     }
   }
 
-  /// staff 서비스 국가 전환 시 세션 내 serviceCountry 갱신 (재시작 불요).
-  /// 이후 RefreshToken 키 분기(refreshTokenRead/Write/Delete) 와 SSO domainType 가
-  /// 즉시 새 국가를 반영한다. 채널 재생성 없이 동작.
-  void updateServiceCountry(String? code) {
+  /// 국가 전환의 첫 await 전에 호출한다. 이후 시작되는 인증 mutation을 target context가
+  /// 설치될 때까지 차단하고, 이미 실행 중인 모든 인증 snapshot을 stale로 만든다.
+  void beginServiceContextTransition(String reason) {
+    if (_isDisposed || _serviceContextTransitionInProgress) return;
+    _serviceContextTransitionInProgress = true;
+    _serviceAuthContext = _serviceAuthContext.next(
+      serviceCountry: _serviceAuthContext.serviceCountry,
+      apiBaseUrl: _serviceAuthContext.apiBaseUrl,
+    );
+    resetAuthStateForServiceCountrySwitch(reason);
+    _emitAuthTrace('auth.context.transition_started', resultCode: reason);
+  }
+
+  /// serviceCountry, API origin, domainType을 동일 generation으로 원자 갱신한다.
+  void updateServiceContext({
+    required String? serviceCountry,
+    required String? apiBaseUrl,
+  }) {
     if (_isDisposed) return;
-    _serviceCountry = code;
+    final nextCountry = normalizeServiceCountry(serviceCountry);
+    final isSameContext =
+        nextCountry == _serviceAuthContext.serviceCountry &&
+        apiBaseUrl == _serviceAuthContext.apiBaseUrl;
+    if (!_serviceContextTransitionInProgress && isSameContext) return;
+    if (!_serviceContextTransitionInProgress) {
+      resetAuthStateForServiceCountrySwitch('service-context-direct-update');
+    }
+    final nextContext = _serviceAuthContext.next(
+      serviceCountry: nextCountry,
+      apiBaseUrl: apiBaseUrl,
+    );
+    _serviceCountry = nextContext.serviceCountry;
+    _apiBaseUrl = nextContext.apiBaseUrl;
+    _serviceAuthContext = nextContext;
+    _serviceContextTransitionInProgress = false;
+    _emitAuthTrace(
+      'auth.context.transition_completed',
+      data: {
+        'serviceCountry': nextCountry,
+        'domainType': _serviceAuthContext.domainType,
+      },
+    );
+  }
+
+  /// legacy caller 호환. 새 앱은 반드시 [beginServiceContextTransition] 뒤
+  /// [updateServiceContext]로 country와 API origin을 함께 갱신한다.
+  void updateServiceCountry(String? code) {
+    updateServiceContext(
+      serviceCountry: code,
+      apiBaseUrl: apiBaseUrlForServiceCountry(
+        apiBaseUrl: _apiBaseUrl,
+        serviceCountry: code,
+      ),
+    );
   }
 
   /// 명시적 로그아웃(staff 서비스 국가 전환 등) 시 in-memory SSO transient 상태를 정리한다.
@@ -169,6 +264,7 @@ class FlutterWebViewBridgeJavaScriptChannel {
   /// 서비스 국가 전환은 token/replay뿐 아니라 process-wide 인증 소유권까지 끊는 경계다.
   /// 남은 interactive lease가 새 origin의 REFRESH_TOKEN_READ를 막지 않게 reload 전에 호출한다.
   void resetAuthStateForServiceCountrySwitch(String reason) {
+    _authDocumentBoundary.invalidate(_activeDocumentId);
     _processAuthCoordinator.resetForAuthBoundary();
     _autoAuthAttempt.resetForAuthBoundary();
     _invalidateAuthTransaction(reason);
@@ -180,6 +276,29 @@ class FlutterWebViewBridgeJavaScriptChannel {
     _activeDocumentId = null;
     _emitAuthTrace('auth.boundary.reset', resultCode: reason);
   }
+
+  AuthWorkContextSnapshot _captureAuthWorkContext() => AuthWorkContextSnapshot(
+    authEpoch: _authEpoch,
+    authRevision: _activeAuthRevision,
+    service: _serviceAuthContext,
+  );
+
+  bool _isCurrentAuthWorkContext(AuthWorkContextSnapshot snapshot) =>
+      snapshot.matches(
+        authEpoch: _authEpoch,
+        authRevision: _activeAuthRevision,
+        service: _serviceAuthContext,
+        transitionInProgress: _serviceContextTransitionInProgress,
+      );
+
+  AuthContextWorkFence _authContextWorkFence(
+    AuthWorkContextSnapshot snapshot,
+    dynamic data,
+  ) => AuthContextWorkFence(
+    snapshot: snapshot,
+    isCurrent: _isCurrentAuthWorkContext,
+    onStale: (stage) => _discardStaleAuthWorkContext(stage, data),
+  );
 
   void updateAppLifecycleState(AppLifecycleState state) {
     if (_isDisposed) return;
@@ -196,6 +315,11 @@ class FlutterWebViewBridgeJavaScriptChannel {
       _attemptTerminalTimer?.cancel();
       _attemptTerminalTimer = null;
     }
+  }
+
+  void updateWebDocumentNavigationGeneration(int generation) {
+    if (_isDisposed || generation < _webDocumentNavigationGeneration) return;
+    _webDocumentNavigationGeneration = generation;
   }
 
   void dispose() {
@@ -448,6 +572,7 @@ class FlutterWebViewBridgeJavaScriptChannel {
         'documentId': correlation!.documentId,
       if (data is Map && data['pathname'] is String)
         'pathname': data['pathname'] as String,
+      if (data is Map && data['host'] is String) 'host': data['host'] as String,
       if (data is Map && data['visibilityState'] is String)
         'visibilityState': data['visibilityState'] as String,
       'provider':
@@ -455,6 +580,12 @@ class FlutterWebViewBridgeJavaScriptChannel {
           correlation?.provider ??
           _activeAuthProvider,
       'serviceCountry': serviceCountry,
+      if (data is Map && data['expectedServiceCountry'] is String)
+        'expectedServiceCountry': data['expectedServiceCountry'] as String,
+      if (data is Map && data['actualServiceCountry'] is String)
+        'actualServiceCountry': data['actualServiceCountry'] as String,
+      if (data is Map && data['domainType'] is String)
+        'domainType': data['domainType'] as String,
       'event': event,
       if (resultCode != null) 'resultCode': resultCode,
       if (data is Map && data['failureStage'] is String)
@@ -1348,6 +1479,9 @@ class FlutterWebViewBridgeJavaScriptChannel {
 
   void _invalidateAuthTransaction(String reason) {
     _authEpoch += 1;
+    // background 중 old document로 보내려다 보류된 응답도 같은 auth boundary에
+    // 속한다. 국가 전환/명시적 로그아웃 뒤 resume에서 재전달되지 않게 함께 폐기한다.
+    _pendingPostMessages.clear();
     _completeProcessAuthLease();
     _activeAuthSessionId = null;
     _activeAuthProvider = null;
@@ -1400,6 +1534,9 @@ class FlutterWebViewBridgeJavaScriptChannel {
     return revision != null && revision != _activeAuthRevision;
   }
 
+  bool _isInvalidatedAuthDocumentMessage(dynamic data) =>
+      _authDocumentBoundary.rejects(_stringFieldOf(data, 'documentId'));
+
   bool _isExternalSsoFailure(Object error) =>
       error is SocketException ||
       error is TimeoutException ||
@@ -1423,6 +1560,15 @@ class FlutterWebViewBridgeJavaScriptChannel {
       '[SsoExchange] stale auth message skipped ($reason) '
       'request=${_authSessionIdOf(data) ?? "null"} '
       'active=${_activeAuthSessionId ?? "null"} epoch=$_authEpoch',
+    );
+  }
+
+  void _discardStaleAuthWorkContext(String reason, dynamic data) {
+    _logStaleAuthMessage(reason, data);
+    _emitAuthTrace(
+      'auth.context.stale_discarded',
+      resultCode: reason,
+      data: data,
     );
   }
 
@@ -1579,27 +1725,201 @@ class FlutterWebViewBridgeJavaScriptChannel {
   // ───────────────────────────────────────────────────────────────────────────
 
   Future<void> onMessageReceived(JavaScriptMessage message) async {
+    // JavaScriptChannel callbacks can wait behind a long-running provider
+    // operation. Capture the navigation at receipt time so an old document's
+    // queued control message is never relabelled as the current document.
+    final receivedNavigationGeneration = _webDocumentNavigationGeneration;
     final operation = _messageSerial.then(
-      (_) => _handleMessageReceived(message),
+      (_) => _handleMessageReceived(
+        message,
+        receivedNavigationGeneration: receivedNavigationGeneration,
+      ),
     );
     _messageSerial = operation.catchError((_) {});
     return operation;
   }
 
-  Future<void> _handleMessageReceived(JavaScriptMessage message) async {
+  bool _isAuthMutation(WebViewBridgeFeatureType type) => const {
+    WebViewBridgeFeatureType.googleSignInLogin,
+    WebViewBridgeFeatureType.googleSignInLogout,
+    WebViewBridgeFeatureType.appleSignInLogin,
+    WebViewBridgeFeatureType.appleSignInLogout,
+    WebViewBridgeFeatureType.kakaoSignInLogin,
+    WebViewBridgeFeatureType.kakaoSignInLogout,
+    WebViewBridgeFeatureType.refreshTokenRead,
+    WebViewBridgeFeatureType.refreshTokenWrite,
+    WebViewBridgeFeatureType.refreshTokenDelete,
+    WebViewBridgeFeatureType.authContextStatus,
+    WebViewBridgeFeatureType.authContextMismatchClearAndRestart,
+  }.contains(type);
+
+  Map<String, Object?> _authContextAck(
+    Map<String, Object?> data, {
+    required String status,
+  }) => {
+    'type': WebViewBridgeFeatureType.authContextStatusAck.value,
+    'data': {
+      'status': status,
+      if (data['idempotencyKey'] is String)
+        'idempotencyKey': data['idempotencyKey'],
+      if (data['documentId'] is String) 'documentId': data['documentId'],
+      if (data['requestId'] is String) 'requestId': data['requestId'],
+      if (data['authRevision'] is int) 'authRevision': data['authRevision'],
+      'serviceCountry': _serviceAuthContext.serviceCountry,
+      'domainType': _serviceAuthContext.domainType,
+    },
+  };
+
+  Future<void> _handleMessageReceived(
+    JavaScriptMessage message, {
+    required int receivedNavigationGeneration,
+  }) async {
     final json = jsonDecode(message.message);
     final type = json['type'] as String?;
     final data = json['data'];
     if (type != null) {
       final webViewBridgeFeatureType = type.webViewBridgeFeatureType;
       if (webViewBridgeFeatureType != null) {
+        final isNavigationScopedControlMessage =
+            webViewBridgeFeatureType == WebViewBridgeFeatureType.deviceInfo ||
+            webViewBridgeFeatureType ==
+                WebViewBridgeFeatureType.authContextStatus ||
+            webViewBridgeFeatureType ==
+                WebViewBridgeFeatureType.authContextMismatchClearAndRestart;
+        if (isNavigationScopedControlMessage &&
+            receivedNavigationGeneration != _webDocumentNavigationGeneration) {
+          _emitAuthTrace(
+            'auth.context.stale_navigation_message_discarded',
+            resultCode: webViewBridgeFeatureType.value,
+            data: {
+              if (data is Map) ...Map<String, Object?>.from(data),
+              'receivedNavigationGeneration': receivedNavigationGeneration,
+              'currentNavigationGeneration': _webDocumentNavigationGeneration,
+            },
+          );
+          return;
+        }
+        final explicitRetryAction = _isSsoLogin(webViewBridgeFeatureType)
+            ? _authContextRecoveryCoordinator
+                  .consumeTerminalFailureForExplicitRetry(
+                    currentContextGeneration: _serviceAuthContext.generation,
+                    transitionInProgress: _serviceContextTransitionInProgress,
+                    retryDocumentId: _stringFieldOf(data, 'documentId'),
+                  )
+            : null;
+        if (shouldRejectRetiredAuthMessage(
+          isAuthMutation: _isAuthMutation(webViewBridgeFeatureType),
+          isRetiredDocument: _isInvalidatedAuthDocumentMessage(data),
+          hasOwnedExplicitRetry: explicitRetryAction != null,
+        )) {
+          _emitAuthTrace(
+            'auth.context.retired_document_discarded',
+            resultCode: webViewBridgeFeatureType.value,
+            data: data,
+          );
+          return;
+        }
+        if (_serviceContextTransitionInProgress &&
+            _isAuthMutation(webViewBridgeFeatureType)) {
+          if (explicitRetryAction !=
+              AuthContextExplicitRetryAction.reopenTransition) {
+            _emitAuthTrace(
+              'auth.context.transition_message_discarded',
+              resultCode: webViewBridgeFeatureType.value,
+              data: data,
+            );
+            return;
+          }
+        } else if (explicitRetryAction ==
+            AuthContextExplicitRetryAction.continueWithCurrentContext) {
+          _emitAuthTrace(
+            'auth.context.explicit_retry_terminal_failure_consumed',
+            resultCode: webViewBridgeFeatureType.value,
+            data: data,
+          );
+        }
         late Map<String, Object?> sendData;
         int? authEpoch;
+        AuthWorkContextSnapshot? authDeliveryContext;
         _ProcessAutoAuthWork? processAutoAuthWork;
         Map<String, Object?>? pendingReauthReplay;
 
         try {
+          if (explicitRetryAction ==
+              AuthContextExplicitRetryAction.reopenTransition) {
+            final retryGeneration = _serviceAuthContext.generation;
+            final retryCleanup = await _authContextRecoveryCoordinator
+                .retryCleanupForExplicitRetry(
+                  contextGeneration: retryGeneration,
+                  retryDocumentId: _stringFieldOf(data, 'documentId'),
+                  isCurrentTransition: () =>
+                      _serviceContextTransitionInProgress &&
+                      _serviceAuthContext.generation == retryGeneration,
+                  clearTokens: clearAllRefreshTokens,
+                  clearTransient: () =>
+                      _clearSsoTransientState('auth-context-explicit-retry'),
+                );
+            if (retryCleanup ==
+                AuthContextExplicitRetryCleanupResult.superseded) {
+              _emitAuthTrace(
+                'auth.context.explicit_retry_transition_superseded',
+                resultCode: webViewBridgeFeatureType.value,
+                data: data,
+              );
+              return;
+            }
+            if (retryCleanup == AuthContextExplicitRetryCleanupResult.failed) {
+              final failureData = _failureData(
+                data,
+                failureStage: 'service_context_recovery',
+                failureCode: 'AUTH_CONTEXT_RECOVERY_FAILED',
+              );
+              _emitAuthTrace(
+                'auth.context.explicit_retry_cleanup_failed',
+                resultCode: 'AUTH_CONTEXT_RECOVERY_FAILED',
+                data: failureData,
+              );
+              _emitAuthTerminal(
+                'code_failure:service_context_recovery',
+                data: failureData,
+              );
+              final retryStatus = data is Map
+                  ? Map<String, Object?>.from(data)
+                  : <String, Object?>{};
+              try {
+                await onAuthContextStatus?.call({
+                  ...retryStatus,
+                  'status': 'recoveryFailed',
+                  ...failureData,
+                });
+              } catch (_) {}
+              try {
+                await runJavaScriptPostMessage(
+                  jsonEncode({
+                    'type': WebViewBridgeFeatureType.authError.value,
+                    'data': {
+                      ...failureData,
+                      'code': 'AUTH_CONTEXT_RECOVERY_FAILED',
+                      'message': '',
+                    },
+                  }),
+                );
+              } catch (_) {}
+              return;
+            }
+            updateServiceContext(
+              serviceCountry: _serviceAuthContext.serviceCountry,
+              apiBaseUrl: _serviceAuthContext.apiBaseUrl,
+            );
+            _emitAuthTrace(
+              'auth.context.explicit_retry_transition_reopened',
+              resultCode: webViewBridgeFeatureType.value,
+              data: data,
+            );
+          }
+          if (!context.mounted) return;
           if (_isSsoLogin(webViewBridgeFeatureType)) {
+            _authContextRecoveryCoordinator.beginExplicitAuthAttempt();
             authEpoch = await _beginAuthTransaction(
               webViewBridgeFeatureType,
               data,
@@ -1614,6 +1934,11 @@ class FlutterWebViewBridgeJavaScriptChannel {
               sendData = await PushTokenEvent().process(context);
               break;
             case WebViewBridgeFeatureType.deviceInfo:
+              onWebAuthContextCapability?.call(
+                supported: supportsWebAuthContextProtocol(data),
+                documentId: _stringFieldOf(data, 'documentId'),
+                navigationGeneration: receivedNavigationGeneration,
+              );
               sendData = await DeviceInfoEvent().process(context);
               final responseData = sendData['data'];
               if (responseData is Map) {
@@ -1655,7 +1980,12 @@ class FlutterWebViewBridgeJavaScriptChannel {
               break;
             case WebViewBridgeFeatureType.googleSignInLogin:
               sendData = await _awaitAuthOperation(
-                SignInGoogle.shared.process(context, action: 'login'),
+                testAuthProviderOperation?.call(
+                      webViewBridgeFeatureType,
+                      context,
+                      data,
+                    ) ??
+                    SignInGoogle.shared.process(context, action: 'login'),
               );
               if (!_isCurrentAuthTransaction(authEpoch!, data)) {
                 _logStaleAuthMessage(webViewBridgeFeatureType.value, data);
@@ -1664,19 +1994,42 @@ class FlutterWebViewBridgeJavaScriptChannel {
               break;
             case WebViewBridgeFeatureType.googleSignInLogout:
               _processAuthCoordinator.cancelActiveForExplicitLogout();
-              _activeAuthRevision = await const AuthRevisionStore().next(
-                serviceCountry: serviceCountry,
-              );
-              if (!context.mounted) return;
+              final googleLogoutRevisionSnapshot = _captureAuthWorkContext();
+              final googleLogoutRevision =
+                  await runGuardedServiceAuthOperation<int>(
+                    fence: _authContextWorkFence(
+                      googleLogoutRevisionSnapshot,
+                      data,
+                    ),
+                    staleStage: 'google_logout:after_revision',
+                    operation: (country) =>
+                        const AuthRevisionStore().next(serviceCountry: country),
+                  );
+              if (!context.mounted || googleLogoutRevision == null) return;
+              _activeAuthRevision = googleLogoutRevision;
               _invalidateAuthTransaction('googleSignInLogout');
+              final googleLogoutFence = _authContextWorkFence(
+                _captureAuthWorkContext(),
+                data,
+              );
               sendData = await SignInGoogle.shared.process(
                 context,
                 action: 'logout',
               );
+              if (!googleLogoutFence.checkpoint(
+                'google_logout:after_provider',
+              )) {
+                return;
+              }
               break;
             case WebViewBridgeFeatureType.appleSignInLogin:
               sendData = await _awaitAuthOperation(
-                SignInApple.shared.process(context, action: 'login'),
+                testAuthProviderOperation?.call(
+                      webViewBridgeFeatureType,
+                      context,
+                      data,
+                    ) ??
+                    SignInApple.shared.process(context, action: 'login'),
               );
               if (!_isCurrentAuthTransaction(authEpoch!, data)) {
                 _logStaleAuthMessage(webViewBridgeFeatureType.value, data);
@@ -1685,19 +2038,40 @@ class FlutterWebViewBridgeJavaScriptChannel {
               break;
             case WebViewBridgeFeatureType.appleSignInLogout:
               _processAuthCoordinator.cancelActiveForExplicitLogout();
-              _activeAuthRevision = await const AuthRevisionStore().next(
-                serviceCountry: serviceCountry,
-              );
-              if (!context.mounted) return;
+              final appleLogoutRevisionSnapshot = _captureAuthWorkContext();
+              final appleLogoutRevision =
+                  await runGuardedServiceAuthOperation<int>(
+                    fence: _authContextWorkFence(
+                      appleLogoutRevisionSnapshot,
+                      data,
+                    ),
+                    staleStage: 'apple_logout:after_revision',
+                    operation: (country) =>
+                        const AuthRevisionStore().next(serviceCountry: country),
+                  );
+              if (!context.mounted || appleLogoutRevision == null) return;
+              _activeAuthRevision = appleLogoutRevision;
               _invalidateAuthTransaction('appleSignInLogout');
+              final appleLogoutFence = _authContextWorkFence(
+                _captureAuthWorkContext(),
+                data,
+              );
               sendData = await SignInApple.shared.process(
                 context,
                 action: 'logout',
               );
+              if (!appleLogoutFence.checkpoint('apple_logout:after_provider')) {
+                return;
+              }
               break;
             case WebViewBridgeFeatureType.kakaoSignInLogin:
               sendData = await _awaitAuthOperation(
-                SignInKakao.shared.process(context, action: 'login'),
+                testAuthProviderOperation?.call(
+                      webViewBridgeFeatureType,
+                      context,
+                      data,
+                    ) ??
+                    SignInKakao.shared.process(context, action: 'login'),
               );
               if (!_isCurrentAuthTransaction(authEpoch!, data)) {
                 _logStaleAuthMessage(webViewBridgeFeatureType.value, data);
@@ -1706,15 +2080,31 @@ class FlutterWebViewBridgeJavaScriptChannel {
               break;
             case WebViewBridgeFeatureType.kakaoSignInLogout:
               _processAuthCoordinator.cancelActiveForExplicitLogout();
-              _activeAuthRevision = await const AuthRevisionStore().next(
-                serviceCountry: serviceCountry,
-              );
-              if (!context.mounted) return;
+              final kakaoLogoutRevisionSnapshot = _captureAuthWorkContext();
+              final kakaoLogoutRevision =
+                  await runGuardedServiceAuthOperation<int>(
+                    fence: _authContextWorkFence(
+                      kakaoLogoutRevisionSnapshot,
+                      data,
+                    ),
+                    staleStage: 'kakao_logout:after_revision',
+                    operation: (country) =>
+                        const AuthRevisionStore().next(serviceCountry: country),
+                  );
+              if (!context.mounted || kakaoLogoutRevision == null) return;
+              _activeAuthRevision = kakaoLogoutRevision;
               _invalidateAuthTransaction('kakaoSignInLogout');
+              final kakaoLogoutFence = _authContextWorkFence(
+                _captureAuthWorkContext(),
+                data,
+              );
               sendData = await SignInKakao.shared.process(
                 context,
                 action: 'logout',
               );
+              if (!kakaoLogoutFence.checkpoint('kakao_logout:after_provider')) {
+                return;
+              }
               break;
             case WebViewBridgeFeatureType.refreshTokenRead:
               if (authProtocolVersionOf(data) >= 2) {
@@ -1749,6 +2139,7 @@ class FlutterWebViewBridgeJavaScriptChannel {
                     _authSessionIdOf(data) ?? _activeAuthSessionId;
                 _activeDocumentId = _stringFieldOf(data, 'documentId');
               }
+              authDeliveryContext = _captureAuthWorkContext();
               sendData = await RefreshTokenEvent().process(
                 context,
                 action: 'read',
@@ -1757,10 +2148,15 @@ class FlutterWebViewBridgeJavaScriptChannel {
                 authRevision: _activeAuthRevision,
               );
               sendData = restoreRefreshTokenResponseProtocol(sendData, data);
+              if (!_isCurrentAuthWorkContext(authDeliveryContext)) {
+                _discardStaleAuthWorkContext('refresh:after_token_read', data);
+                return;
+              }
               break;
             case WebViewBridgeFeatureType.refreshTokenWrite:
               if (_isStaleAuthSessionMessage(data) ||
-                  _isStaleAuthRevisionMessage(data)) {
+                  _isStaleAuthRevisionMessage(data) ||
+                  _isInvalidatedAuthDocumentMessage(data)) {
                 _logStaleAuthMessage('refreshTokenWrite', data);
                 return;
               }
@@ -1800,7 +2196,8 @@ class FlutterWebViewBridgeJavaScriptChannel {
               sendData = restoreRefreshTokenResponseProtocol(sendData, data);
               break;
             case WebViewBridgeFeatureType.refreshTokenDelete:
-              if (_isStaleAuthSessionMessage(data)) {
+              if (_isStaleAuthSessionMessage(data) ||
+                  _isInvalidatedAuthDocumentMessage(data)) {
                 _logStaleAuthMessage('refreshTokenDelete', data);
                 return;
               }
@@ -1814,20 +2211,142 @@ class FlutterWebViewBridgeJavaScriptChannel {
               print(
                 '[SsoExchange] refresh token delete requested ${_deleteDebugOf(data)}',
               );
-              _activeAuthRevision = await const AuthRevisionStore().next(
-                serviceCountry: serviceCountry,
+              final deleteRevisionSnapshot = _captureAuthWorkContext();
+              final deleteRevision = await runGuardedServiceAuthOperation<int>(
+                fence: _authContextWorkFence(deleteRevisionSnapshot, data),
+                staleStage: 'refresh_delete:after_revision',
+                operation: (country) =>
+                    const AuthRevisionStore().next(serviceCountry: country),
               );
-              if (!context.mounted) return;
+              if (!context.mounted || deleteRevision == null) return;
+              _activeAuthRevision = deleteRevision;
               _invalidateAuthTransaction('refreshTokenDelete');
-              sendData = await RefreshTokenEvent().process(
-                context,
-                action: 'delete',
-                data: adaptRefreshTokenRequestForStorage(data),
-                serviceCountry: serviceCountry,
-                authRevision: _activeAuthRevision,
+              final deleteFence = _authContextWorkFence(
+                _captureAuthWorkContext(),
+                data,
               );
+              final deleteResponse =
+                  await runGuardedServiceAuthOperation<Map<String, Object?>>(
+                    fence: deleteFence,
+                    staleStage: 'refresh_delete:after_token_delete',
+                    operation: (country) => RefreshTokenEvent().process(
+                      context,
+                      action: 'delete',
+                      data: adaptRefreshTokenRequestForStorage(data),
+                      serviceCountry: country,
+                      authRevision: _activeAuthRevision,
+                    ),
+                  );
+              if (deleteResponse == null) return;
+              sendData = deleteResponse;
               sendData = restoreRefreshTokenResponseProtocol(sendData, data);
               await _revokeNativeSsoSessions(data);
+              if (!deleteFence.checkpoint(
+                'refresh_delete:after_native_revoke',
+              )) {
+                return;
+              }
+              break;
+            case WebViewBridgeFeatureType.authContextStatus:
+              final statusData = data is Map
+                  ? Map<String, Object?>.from(data)
+                  : <String, Object?>{};
+              // Native-owned correlation field: overwrite any untrusted web
+              // value with the generation captured when the message arrived.
+              statusData['navigationGeneration'] = receivedNavigationGeneration;
+              final idempotencyKey = statusData['idempotencyKey'] as String?;
+              final isFirst = _authContextStatusOperations.begin(
+                idempotencyKey,
+              );
+              if (isFirst) {
+                _activeDocumentId =
+                    _stringFieldOf(statusData, 'documentId') ??
+                    _activeDocumentId;
+                await onAuthContextStatus?.call(statusData);
+                _emitAuthTrace(
+                  'auth.context.status',
+                  resultCode: statusData['status'] as String?,
+                  data: statusData,
+                );
+              }
+              sendData = _authContextAck(statusData, status: 'accepted');
+              break;
+            case WebViewBridgeFeatureType.authContextStatusAck:
+              // native → web acknowledgement only.
+              return;
+            case WebViewBridgeFeatureType.authContextMismatchClearAndRestart:
+              final restartData = data is Map
+                  ? Map<String, Object?>.from(data)
+                  : <String, Object?>{};
+              restartData['navigationGeneration'] =
+                  receivedNavigationGeneration;
+              final restartKey = restartData['idempotencyKey'] as String?;
+              _activeDocumentId =
+                  _stringFieldOf(restartData, 'documentId') ??
+                  _activeDocumentId;
+              final currentCountry = _serviceAuthContext.serviceCountry;
+              final currentApiBaseUrl = _serviceAuthContext.apiBaseUrl;
+              int? recoveryTransitionGeneration;
+              final recoveryResult = await _authContextRecoveryCoordinator.run(
+                idempotencyKey: restartKey,
+                retryDocumentId: _stringFieldOf(restartData, 'documentId'),
+                currentContextGeneration: () => _serviceAuthContext.generation,
+                // 별도 mismatch/restarting status가 유실돼도 cleanup 요청 자체가
+                // native 지역 판단 gate를 먼저 닫는다.
+                onRestarting: () => onAuthContextStatus?.call({
+                  ...restartData,
+                  'status': 'restarting',
+                }),
+                beginTransition: () {
+                  if (_serviceContextTransitionInProgress) return false;
+                  beginServiceContextTransition('auth-context-mismatch');
+                  recoveryTransitionGeneration = _serviceAuthContext.generation;
+                  return _serviceContextTransitionInProgress;
+                },
+                clearTokens: clearAllRefreshTokens,
+                clearTransient: () =>
+                    _clearSsoTransientState('auth-context-mismatch'),
+                completeTransition: () {
+                  if (!_serviceContextTransitionInProgress ||
+                      _serviceAuthContext.generation !=
+                          recoveryTransitionGeneration) {
+                    return false;
+                  }
+                  updateServiceContext(
+                    serviceCountry: currentCountry,
+                    apiBaseUrl: currentApiBaseUrl,
+                  );
+                  return true;
+                },
+                restart: () async {
+                  await onAuthContextRestart?.call(restartData);
+                  _emitAuthTrace(
+                    'auth.context.restart_requested',
+                    resultCode: 'cleared',
+                    data: restartData,
+                  );
+                },
+                onFailure: () {
+                  _emitAuthTrace(
+                    'auth.context.restart_failed',
+                    resultCode: 'cleanup_failed',
+                    data: restartData,
+                  );
+                  return onAuthContextStatus?.call({
+                    ...restartData,
+                    'status': 'recoveryFailed',
+                    'failureStage': 'service_context_recovery',
+                    'failureCode': 'AUTH_CONTEXT_RECOVERY_FAILED',
+                  });
+                },
+              );
+              sendData = _authContextAck(
+                restartData,
+                status:
+                    recoveryResult == AuthContextRecoveryResult.restartFailed
+                    ? 'restartFailed'
+                    : 'restartAccepted',
+              );
               break;
             case WebViewBridgeFeatureType.serviceCountryQuery:
               // 웹이 현재 서비스 국가 조회 → 주입된 serviceCountry 즉시 응답.
@@ -2038,7 +2557,13 @@ class FlutterWebViewBridgeJavaScriptChannel {
           if (replay != null) {
             sendData = replay;
           } else if (authProtocolVersionOf(data) >= 2) {
-            sendData = await _refreshStoredSessionToTokensReady(sendData, data);
+            final refreshed = await _refreshStoredSessionToTokensReady(
+              sendData,
+              data,
+              authContext: authDeliveryContext!,
+            );
+            if (refreshed == null) return;
+            sendData = refreshed;
           }
         }
 
@@ -2119,6 +2644,12 @@ class FlutterWebViewBridgeJavaScriptChannel {
               _armSsoWatchdog(isB2: true);
             }
           }
+        }
+
+        if (authDeliveryContext != null &&
+            !_isCurrentAuthWorkContext(authDeliveryContext)) {
+          _discardStaleAuthWorkContext('refresh:before_delivery', data);
+          return;
         }
 
         // Send Data to WebView
@@ -2640,36 +3171,48 @@ class FlutterWebViewBridgeJavaScriptChannel {
     };
   }
 
-  Future<Map<String, Object?>> _refreshStoredSessionToTokensReady(
+  Future<Map<String, Object?>?> _refreshStoredSessionToTokensReady(
     Map<String, Object?> readResponse,
-    dynamic requestData,
-  ) async {
+    dynamic requestData, {
+    required AuthWorkContextSnapshot authContext,
+  }) async {
     final readData = readResponse['data'];
     final refreshToken = readData is Map
         ? readData['refreshToken'] as String?
         : null;
     if (refreshToken == null || refreshToken.isEmpty) return readResponse;
+    final snapshotApiBaseUrl = authContext.service.apiBaseUrl;
+    if (snapshotApiBaseUrl == null) return readResponse;
+    final workFence = _authContextWorkFence(authContext, requestData);
 
     try {
       final sso = SsoExchange(
-        apiBaseUrl: apiBaseUrl!,
-        domainType: serviceCountry == 'GLOBAL'
-            ? 'sazo-global-shop'
-            : 'sazo-korea-shop',
+        apiBaseUrl: snapshotApiBaseUrl,
+        domainType: authContext.service.domainType,
       );
       final deviceHeaders = await _deviceHeaders();
+      if (!workFence.checkpoint('refresh:after_device_headers')) return null;
       final result = await sso.refreshToAccess(
         refreshToken: refreshToken,
         deviceHeaders: deviceHeaders,
       );
-      if (!context.mounted) throw StateError('CONTEXT_DISPOSED');
+      if (!context.mounted) return null;
+      if (!workFence.checkpoint('refresh:after_exchange')) return null;
       final persisted = await RefreshTokenEvent().process(
         context,
         action: 'write',
         data: result.refreshToken,
-        serviceCountry: serviceCountry,
-        authRevision: _activeAuthRevision,
+        serviceCountry: authContext.service.serviceCountry,
+        authRevision: authContext.authRevision,
+        canMutate: () => workFence.canMutate,
       );
+      if (persisted['error'] == 'STALE_AUTH_CONTEXT') {
+        workFence.checkpoint('refresh:after_persist');
+        return null;
+      }
+      if (!workFence.checkpoint('refresh:after_persist')) {
+        return null;
+      }
       if (persisted['error'] != null) {
         throw StateError('REFRESH_TOKEN_PERSIST_FAILED');
       }
@@ -2677,6 +3220,7 @@ class FlutterWebViewBridgeJavaScriptChannel {
         accessToken: result.accessToken,
         deviceHeaders: deviceHeaders,
       );
+      if (!workFence.checkpoint('refresh:after_me')) return null;
       _emitMeFetchResult(me, requestData);
       final payload = <String, Object?>{
         'type': WebViewBridgeFeatureType.authTokensReady.value,
@@ -2692,7 +3236,9 @@ class FlutterWebViewBridgeJavaScriptChannel {
             'documentId': _stringFieldOf(requestData, 'documentId'),
           if (requestData is Map && requestData['pageGeneration'] is int)
             'pageGeneration': requestData['pageGeneration'] as int,
-          'authRevision': _activeAuthRevision,
+          'authRevision': authContext.authRevision,
+          'serviceCountry': authContext.service.serviceCountry,
+          'domainType': authContext.service.domainType,
           if (me != null) 'me': me,
         },
       };
@@ -2702,6 +3248,7 @@ class FlutterWebViewBridgeJavaScriptChannel {
       _emitAuthTrace('auth.refresh.exchanged', data: requestData);
       return payload;
     } catch (error) {
+      if (!workFence.checkpoint('refresh:catch')) return null;
       _markProviderCompleted(requestData);
       final statusCode = error is SsoExchangeException
           ? error.statusCode
@@ -2718,9 +3265,10 @@ class FlutterWebViewBridgeJavaScriptChannel {
         await RefreshTokenEvent().process(
           context,
           action: 'delete',
-          serviceCountry: serviceCountry,
-          authRevision: _activeAuthRevision,
+          serviceCountry: authContext.service.serviceCountry,
+          authRevision: authContext.authRevision,
         );
+        if (!workFence.checkpoint('refresh:after_delete')) return null;
       }
       if (semanticReason != null && _activeProtocolVersion >= 3) {
         _activeReauthSemanticReason = semanticReason;
@@ -2795,16 +3343,19 @@ class FlutterWebViewBridgeJavaScriptChannel {
         (requestData is Map ? requestData['persist'] : null) == true;
     final authSessionId = _authSessionIdOf(requestData);
     final requestProvider = _providerOfRequest(requestData);
+    final authContext = _captureAuthWorkContext();
+    final snapshotApiBaseUrl = authContext.service.apiBaseUrl;
+    if (snapshotApiBaseUrl == null) return sendData;
+    final workFence = _authContextWorkFence(authContext, requestData);
     try {
       // domainType: KR(또는 null)=sazo-korea-shop(현행) / GLOBAL=sazo-global-shop
       // (웹 배포 계약 09-env-runtime 확인값). KR 경로 byte-identical.
       final sso = SsoExchange(
-        apiBaseUrl: apiBaseUrl!,
-        domainType: serviceCountry == 'GLOBAL'
-            ? 'sazo-global-shop'
-            : 'sazo-korea-shop',
+        apiBaseUrl: snapshotApiBaseUrl,
+        domainType: authContext.service.domainType,
       );
       final deviceHeaders = await _deviceHeaders();
+      if (!workFence.checkpoint('sso:after_device_headers')) return null;
       final result = await sso.exchange(
         provider: _providerOf(type),
         idToken: idToken,
@@ -2812,8 +3363,11 @@ class FlutterWebViewBridgeJavaScriptChannel {
         persist: persist,
         deviceHeaders: deviceHeaders,
       );
-      if (!_isCurrentAuthTransaction(authEpoch, requestData)) {
-        _logStaleAuthMessage('ssoExchange:afterExchange', requestData);
+      if (!_isCurrentAuthTransaction(authEpoch, requestData) ||
+          !workFence.canMutate) {
+        if (workFence.checkpoint('sso:after_exchange')) {
+          _logStaleAuthMessage('ssoExchange:afterExchange', requestData);
+        }
         return null;
       }
       // 자동로그인용 refresh 네이티브 저장. (RefreshTokenEvent 는 context 를 SharedPreferences
@@ -2823,9 +3377,17 @@ class FlutterWebViewBridgeJavaScriptChannel {
         context,
         action: 'write',
         data: result.refreshToken,
-        serviceCountry: serviceCountry,
-        authRevision: _activeAuthRevision,
+        serviceCountry: authContext.service.serviceCountry,
+        authRevision: authContext.authRevision,
+        canMutate: () => workFence.canMutate,
       );
+      if (persistResult['error'] == 'STALE_AUTH_CONTEXT') {
+        workFence.checkpoint('sso:after_persist');
+        return null;
+      }
+      if (!workFence.checkpoint('sso:after_persist')) {
+        return null;
+      }
       if (persistResult['error'] != null) {
         throw StateError('REFRESH_TOKEN_PERSIST_FAILED');
       }
@@ -2837,8 +3399,11 @@ class FlutterWebViewBridgeJavaScriptChannel {
         deviceHeaders: deviceHeaders,
       );
       _emitMeFetchResult(me, requestData);
-      if (!_isCurrentAuthTransaction(authEpoch, requestData)) {
-        _logStaleAuthMessage('ssoExchange:afterMe', requestData);
+      if (!_isCurrentAuthTransaction(authEpoch, requestData) ||
+          !workFence.canMutate) {
+        if (workFence.checkpoint('sso:after_me')) {
+          _logStaleAuthMessage('ssoExchange:afterMe', requestData);
+        }
         return null;
       }
       // ignore: avoid_print
@@ -2861,7 +3426,9 @@ class FlutterWebViewBridgeJavaScriptChannel {
             'documentId': _stringFieldOf(requestData, 'documentId'),
           if (requestData is Map && requestData['pageGeneration'] is int)
             'pageGeneration': requestData['pageGeneration'] as int,
-          'authRevision': _activeAuthRevision,
+          'authRevision': authContext.authRevision,
+          'serviceCountry': authContext.service.serviceCountry,
+          'domainType': authContext.service.domainType,
           if (me != null) 'me': me,
         },
       };
@@ -2871,8 +3438,11 @@ class FlutterWebViewBridgeJavaScriptChannel {
       _cachedSessionAt = DateTime.now();
       return payload;
     } catch (e) {
-      if (!_isCurrentAuthTransaction(authEpoch, requestData)) {
-        _logStaleAuthMessage('ssoExchange:catch', requestData);
+      if (!_isCurrentAuthTransaction(authEpoch, requestData) ||
+          !workFence.canMutate) {
+        if (workFence.checkpoint('sso:catch')) {
+          _logStaleAuthMessage('ssoExchange:catch', requestData);
+        }
         return null;
       }
       // ignore: avoid_print
@@ -2918,6 +3488,7 @@ class FlutterWebViewBridgeJavaScriptChannel {
   /// 재전송한다. 재교환이 아니라 캐시 replay 이므로 throttle/race 가 없고, 로그인 때 통한 동일
   /// payload 라 콘텐츠도 정상. TTL 게이트로 reboot·일반 자동로그인(캐시 없음)은 baseline 유지.
   Map<String, Object?>? _replayRecentSession(dynamic requestData) {
+    if (_serviceContextTransitionInProgress) return null;
     final at = _cachedSessionAt;
     final payload = _cachedSessionPayload;
     if (payload == null || at == null) return null;
@@ -2928,6 +3499,21 @@ class FlutterWebViewBridgeJavaScriptChannel {
     }
     final requestedAuthSessionId = _authSessionIdOf(requestData);
     final cachedData = payload['data'];
+    final cachedServiceCountry = cachedData is Map
+        ? cachedData['serviceCountry'] as String?
+        : null;
+    if (cachedServiceCountry != null &&
+        normalizeServiceCountry(cachedServiceCountry) !=
+            _serviceAuthContext.serviceCountry) {
+      _cachedSessionPayload = null;
+      _cachedSessionAt = null;
+      _emitAuthTrace(
+        'auth.context.replay_discarded',
+        resultCode: 'service_country_mismatch',
+        data: requestData,
+      );
+      return null;
+    }
     final cachedAuthSessionId = cachedData is Map
         ? cachedData['authSessionId'] as String?
         : null;

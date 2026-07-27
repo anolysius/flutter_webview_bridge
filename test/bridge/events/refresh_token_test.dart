@@ -190,6 +190,25 @@ void main() {
         );
       },
     );
+
+    testWidgets('stale context write는 저장 직전에 폐기한다', (tester) async {
+      SharedPreferences.setMockInitialValues({});
+      ctx = await pumpCtx(tester);
+
+      final response = await RefreshTokenEvent().process(
+        ctx,
+        action: 'write',
+        data: 'must-not-persist',
+        serviceCountry: 'KR',
+        canMutate: () => false,
+      );
+
+      expect(response['error'], 'STALE_AUTH_CONTEXT');
+      expect(
+        (await SharedPreferences.getInstance()).getString(kRefreshTokenKey),
+        isNull,
+      );
+    });
   });
 
   group('clearAllRefreshTokens — staff 국가 전환 = 완전 로그아웃', () {
@@ -220,6 +239,84 @@ void main() {
       expect(prefs.getString('flutter_webview_bridge_refresh_token'), isNull);
       expect(
         prefs.getString('flutter_webview_bridge_refresh_token__global'),
+        isNull,
+      );
+    });
+
+    testWidgets('이미 시작된 양국 write 뒤 clear barrier가 최종 token을 모두 제거한다', (
+      tester,
+    ) async {
+      SharedPreferences.setMockInitialValues({});
+      late BuildContext context;
+      await tester.pumpWidget(
+        MaterialApp(
+          home: Builder(
+            builder: (value) {
+              context = value;
+              return const SizedBox.shrink();
+            },
+          ),
+        ),
+      );
+
+      final krWrite = RefreshTokenEvent().process(
+        context,
+        action: 'write',
+        data: 'late-kr-token',
+        serviceCountry: 'KR',
+      );
+      final globalWrite = RefreshTokenEvent().process(
+        context,
+        action: 'write',
+        data: 'late-global-token',
+        serviceCountry: 'GLOBAL',
+      );
+      final clear = clearAllRefreshTokens();
+
+      await Future.wait([krWrite, globalWrite, clear]);
+      final prefs = await SharedPreferences.getInstance();
+      expect(prefs.getString(refreshTokenKeyFor('KR')), isNull);
+      expect(prefs.getString(refreshTokenKeyFor('GLOBAL')), isNull);
+    });
+
+    testWidgets('clear 뒤 queue에 들어온 stale write는 canMutate guard로 폐기한다', (
+      tester,
+    ) async {
+      SharedPreferences.setMockInitialValues({
+        refreshTokenKeyFor('KR'): 'old-token',
+      });
+      late BuildContext context;
+      await tester.pumpWidget(
+        MaterialApp(
+          home: Builder(
+            builder: (value) {
+              context = value;
+              return const SizedBox.shrink();
+            },
+          ),
+        ),
+      );
+
+      var isCurrent = true;
+      final clear = clearAllRefreshTokens();
+      isCurrent = false;
+      final staleWrite = RefreshTokenEvent().process(
+        context,
+        action: 'write',
+        data: 'must-not-return',
+        serviceCountry: 'KR',
+        canMutate: () => isCurrent,
+      );
+
+      final results = await Future.wait([clear, staleWrite]);
+      expect(
+        (results.last as Map<String, Object?>)['error'],
+        'STALE_AUTH_CONTEXT',
+      );
+      expect(
+        (await SharedPreferences.getInstance()).getString(
+          refreshTokenKeyFor('KR'),
+        ),
         isNull,
       );
     });
