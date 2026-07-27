@@ -65,6 +65,17 @@ typedef AuthProviderOperation =
       dynamic data,
     );
 
+String? _canonicalHttpOrigin(String? value) {
+  if (value == null || value.trim().isEmpty) return null;
+  final uri = Uri.tryParse(value.trim());
+  if (uri == null ||
+      (uri.scheme != 'http' && uri.scheme != 'https') ||
+      uri.host.isEmpty) {
+    return null;
+  }
+  return uri.origin;
+}
+
 class _ProcessAutoAuthWork {
   const _ProcessAutoAuthWork({
     required this.lease,
@@ -82,6 +93,27 @@ class _AuthOperationValue<T> {
 
 class _AuthOperationAborted {
   const _AuthOperationAborted();
+}
+
+class _BridgeMessageCompletion {
+  final Completer<void> completer = Completer<void>();
+  bool deferred = false;
+}
+
+class _BufferedTransitionMessage {
+  const _BufferedTransitionMessage({
+    required this.message,
+    required this.receivedNavigationGeneration,
+    required this.receivedServiceContextGeneration,
+    required this.transitionConfirmation,
+    required this.completion,
+  });
+
+  final JavaScriptMessage message;
+  final int receivedNavigationGeneration;
+  final int receivedServiceContextGeneration;
+  final Completer<int?> transitionConfirmation;
+  final _BridgeMessageCompletion completion;
 }
 
 class FlutterWebViewBridgeJavaScriptChannel {
@@ -105,8 +137,12 @@ class FlutterWebViewBridgeJavaScriptChannel {
   /// 재시작 없이 refresh-key/domainType 가 새 국가를 반영한다.
   String? _serviceCountry;
   String? get serviceCountry => _serviceCountry;
+  String? _webOrigin;
   late ServiceAuthContext _serviceAuthContext;
   bool _serviceContextTransitionInProgress = false;
+  int? _serviceContextTransitionReleaseNavigationGeneration;
+  String? _serviceContextTransitionExpectedWebOrigin;
+  Completer<int?>? _serviceContextTransitionNavigationConfirmation;
 
   /// 웹의 SERVICE_COUNTRY_CHANGE 수신 시 앱이 override+reload 하도록 위임하는 콜백.
   final void Function(String requestedCountry)? onServiceCountryChange;
@@ -117,13 +153,18 @@ class FlutterWebViewBridgeJavaScriptChannel {
   int _webDocumentNavigationGeneration;
   @visibleForTesting
   final AuthProviderOperation? testAuthProviderOperation;
+  @visibleForTesting
+  final Future<void> Function()? testClearAllRefreshTokens;
   bool _isDisposed = false;
   bool _pendingSsoRecovery = false;
   AppLifecycleState _appLifecycleState = AppLifecycleState.resumed;
   final Queue<String> _pendingPostMessages = Queue<String>();
   bool _isFlushingPendingPostMessages = false;
   Future<void> _messageSerial = Future<void>.value();
+  final Queue<_BufferedTransitionMessage> _bufferedTransitionMessages =
+      Queue<_BufferedTransitionMessage>();
   static const int _maxPendingPostMessages = 20;
+  static const int _maxBufferedTransitionMessages = 20;
   final AuthContextOperationRegistry _authContextStatusOperations =
       AuthContextOperationRegistry();
   final AuthContextRecoveryCoordinator _authContextRecoveryCoordinator =
@@ -137,6 +178,7 @@ class FlutterWebViewBridgeJavaScriptChannel {
     required this.googleServerClientId,
     required this.kakaoNativeAppKey,
     String? apiBaseUrl,
+    String? webOrigin,
     this.bridgeRevision,
     String? serviceCountry,
     this.onServiceCountryChange,
@@ -146,8 +188,10 @@ class FlutterWebViewBridgeJavaScriptChannel {
     this.onWebAuthContextCapability,
     int webDocumentNavigationGeneration = 0,
     this.testAuthProviderOperation,
+    this.testClearAllRefreshTokens,
   }) : _webDocumentNavigationGeneration = webDocumentNavigationGeneration,
        _apiBaseUrl = apiBaseUrl,
+       _webOrigin = _canonicalHttpOrigin(webOrigin),
        _serviceCountry = normalizeServiceCountry(serviceCountry) {
     validateServiceAuthContextPair(
       serviceCountry: serviceCountry,
@@ -198,10 +242,19 @@ class FlutterWebViewBridgeJavaScriptChannel {
   }
 
   /// 국가 전환의 첫 await 전에 호출한다. 이후 시작되는 인증 mutation을 target context가
-  /// 설치될 때까지 차단하고, 이미 실행 중인 모든 인증 snapshot을 stale로 만든다.
+  /// 설치되고 새 문서 탐색이 시작될 때까지 차단하며, 이미 실행 중인 모든 인증 snapshot을
+  /// stale로 만든다.
   void beginServiceContextTransition(String reason) {
     if (_isDisposed || _serviceContextTransitionInProgress) return;
     _serviceContextTransitionInProgress = true;
+    _serviceContextTransitionReleaseNavigationGeneration = null;
+    _serviceContextTransitionExpectedWebOrigin = null;
+    final previousConfirmation =
+        _serviceContextTransitionNavigationConfirmation;
+    if (previousConfirmation != null && !previousConfirmation.isCompleted) {
+      _resolveTransitionConfirmation(previousConfirmation, null);
+    }
+    _serviceContextTransitionNavigationConfirmation = Completer<int?>();
     _serviceAuthContext = _serviceAuthContext.next(
       serviceCountry: _serviceAuthContext.serviceCountry,
       apiBaseUrl: _serviceAuthContext.apiBaseUrl,
@@ -214,14 +267,24 @@ class FlutterWebViewBridgeJavaScriptChannel {
   void updateServiceContext({
     required String? serviceCountry,
     required String? apiBaseUrl,
+    String? webOrigin,
+    bool waitForNextNavigation = false,
   }) {
     if (_isDisposed) return;
     final nextCountry = normalizeServiceCountry(serviceCountry);
+    final nextWebOrigin = _canonicalHttpOrigin(webOrigin) ?? _webOrigin;
     final isSameContext =
         nextCountry == _serviceAuthContext.serviceCountry &&
-        apiBaseUrl == _serviceAuthContext.apiBaseUrl;
-    if (!_serviceContextTransitionInProgress && isSameContext) return;
+        apiBaseUrl == _serviceAuthContext.apiBaseUrl &&
+        nextWebOrigin == _webOrigin;
+    if (!_serviceContextTransitionInProgress &&
+        isSameContext &&
+        !waitForNextNavigation) {
+      return;
+    }
     if (!_serviceContextTransitionInProgress) {
+      _serviceContextTransitionInProgress = waitForNextNavigation;
+      _serviceContextTransitionReleaseNavigationGeneration = null;
       resetAuthStateForServiceCountrySwitch('service-context-direct-update');
     }
     final nextContext = _serviceAuthContext.next(
@@ -230,12 +293,50 @@ class FlutterWebViewBridgeJavaScriptChannel {
     );
     _serviceCountry = nextContext.serviceCountry;
     _apiBaseUrl = nextContext.apiBaseUrl;
+    _webOrigin = nextWebOrigin;
     _serviceAuthContext = nextContext;
+    if (waitForNextNavigation) {
+      // Context installation alone does not retire the still-visible old
+      // document. Keep the mutation fence closed until the target load
+      // synchronously claims the next navigation generation.
+      _serviceContextTransitionInProgress = true;
+      _serviceContextTransitionReleaseNavigationGeneration =
+          _webDocumentNavigationGeneration + 1;
+      _serviceContextTransitionExpectedWebOrigin = nextWebOrigin;
+      _serviceContextTransitionNavigationConfirmation ??= Completer<int?>();
+      _emitAuthTrace(
+        'auth.context.transition_context_installed',
+        data: {
+          'serviceCountry': nextCountry,
+          'domainType': _serviceAuthContext.domainType,
+          'expectedWebOrigin': nextWebOrigin,
+          'releaseNavigationGeneration':
+              _serviceContextTransitionReleaseNavigationGeneration,
+        },
+      );
+      return;
+    }
+    _completeServiceContextTransition(
+      confirmedNavigationGeneration: _webDocumentNavigationGeneration,
+    );
+  }
+
+  void _completeServiceContextTransition({int? confirmedNavigationGeneration}) {
+    final confirmation = _serviceContextTransitionNavigationConfirmation;
+    _serviceContextTransitionNavigationConfirmation = null;
     _serviceContextTransitionInProgress = false;
+    _serviceContextTransitionReleaseNavigationGeneration = null;
+    _serviceContextTransitionExpectedWebOrigin = null;
+    if (confirmation != null) {
+      _resolveTransitionConfirmation(
+        confirmation,
+        confirmedNavigationGeneration,
+      );
+    }
     _emitAuthTrace(
       'auth.context.transition_completed',
       data: {
-        'serviceCountry': nextCountry,
+        'serviceCountry': _serviceAuthContext.serviceCountry,
         'domainType': _serviceAuthContext.domainType,
       },
     );
@@ -260,6 +361,9 @@ class FlutterWebViewBridgeJavaScriptChannel {
   /// REFRESH_TOKEN_READ 에 bridge 가 TTL(120s) 내 캐시를 replay 해 재인증되어 로그아웃이
   /// 안 된다. 전환 경로에서 reload 전에 호출해 replay window 를 제거한다.
   void clearSsoTransientState(String reason) => _clearSsoTransientState(reason);
+
+  Future<void> _clearAllRefreshTokens() =>
+      testClearAllRefreshTokens?.call() ?? clearAllRefreshTokens();
 
   /// 서비스 국가 전환은 token/replay뿐 아니라 process-wide 인증 소유권까지 끊는 경계다.
   /// 남은 interactive lease가 새 origin의 REFRESH_TOKEN_READ를 막지 않게 reload 전에 호출한다.
@@ -322,6 +426,42 @@ class FlutterWebViewBridgeJavaScriptChannel {
     _webDocumentNavigationGeneration = generation;
   }
 
+  void confirmWebDocumentNavigation({
+    required int generation,
+    required String? documentUrl,
+  }) {
+    if (_isDisposed || generation != _webDocumentNavigationGeneration) return;
+    final releaseGeneration =
+        _serviceContextTransitionReleaseNavigationGeneration;
+    if (!_serviceContextTransitionInProgress ||
+        releaseGeneration == null ||
+        generation < releaseGeneration) {
+      return;
+    }
+    final expectedOrigin = _serviceContextTransitionExpectedWebOrigin;
+    final actualOrigin = _canonicalHttpOrigin(documentUrl);
+    if (expectedOrigin == null || actualOrigin != expectedOrigin) {
+      _emitAuthTrace(
+        'auth.context.transition_navigation_rejected',
+        resultCode: 'origin_mismatch',
+        data: {
+          'serviceCountry': _serviceAuthContext.serviceCountry,
+          'expectedWebOrigin': expectedOrigin,
+          'actualWebOrigin': actualOrigin,
+          'navigationGeneration': generation,
+        },
+      );
+      return;
+    }
+    // Auth requests received while origin confirmation was pending wait on the
+    // transition completion. Only requests captured from this exact target
+    // navigation are resumed; pre-navigation and superseded-document requests
+    // are discarded by their receipt generation.
+    _completeServiceContextTransition(
+      confirmedNavigationGeneration: generation,
+    );
+  }
+
   void dispose() {
     final processLease = _processAuthLease;
     final shouldEmitConvergenceHandoff = _authAttemptPhase
@@ -342,6 +482,18 @@ class FlutterWebViewBridgeJavaScriptChannel {
       _emitAuthTerminal('convergence_handoff', data: _activeAuthProtocolData());
     }
     _isDisposed = true;
+    final transitionConfirmation =
+        _serviceContextTransitionNavigationConfirmation;
+    if (transitionConfirmation != null && !transitionConfirmation.isCompleted) {
+      transitionConfirmation.complete(null);
+    }
+    _serviceContextTransitionNavigationConfirmation = null;
+    for (final buffered in _bufferedTransitionMessages) {
+      if (!buffered.completion.completer.isCompleted) {
+        buffered.completion.completer.complete();
+      }
+    }
+    _bufferedTransitionMessages.clear();
     final abortCompleter = _activeAuthAbortCompleter;
     if (abortCompleter != null && !abortCompleter.isCompleted) {
       abortCompleter.complete();
@@ -1729,14 +1881,111 @@ class FlutterWebViewBridgeJavaScriptChannel {
     // operation. Capture the navigation at receipt time so an old document's
     // queued control message is never relabelled as the current document.
     final receivedNavigationGeneration = _webDocumentNavigationGeneration;
+    final receivedServiceContextGeneration = _serviceAuthContext.generation;
+    final receivedTransitionConfirmation = _serviceContextTransitionInProgress
+        ? _serviceContextTransitionNavigationConfirmation
+        : null;
+    final completion = _BridgeMessageCompletion();
+    await _enqueueBridgeMessage(
+      message,
+      receivedNavigationGeneration: receivedNavigationGeneration,
+      receivedServiceContextGeneration: receivedServiceContextGeneration,
+      receivedTransitionConfirmation: receivedTransitionConfirmation,
+      completion: completion,
+    );
+    await completion.completer.future;
+  }
+
+  Future<void> _enqueueBridgeMessage(
+    JavaScriptMessage message, {
+    required int receivedNavigationGeneration,
+    required int receivedServiceContextGeneration,
+    required Completer<int?>? receivedTransitionConfirmation,
+    required _BridgeMessageCompletion completion,
+  }) {
+    completion.deferred = false;
     final operation = _messageSerial.then(
       (_) => _handleMessageReceived(
         message,
         receivedNavigationGeneration: receivedNavigationGeneration,
+        receivedServiceContextGeneration: receivedServiceContextGeneration,
+        receivedTransitionConfirmation: receivedTransitionConfirmation,
+        completion: completion,
       ),
+    );
+    operation.then(
+      (_) {
+        if (!completion.deferred && !completion.completer.isCompleted) {
+          completion.completer.complete();
+        }
+      },
+      onError: (Object error, StackTrace stackTrace) {
+        if (!completion.completer.isCompleted) {
+          completion.completer.completeError(error, stackTrace);
+        }
+      },
     );
     _messageSerial = operation.catchError((_) {});
     return operation;
+  }
+
+  void _bufferTransitionMessage({
+    required JavaScriptMessage message,
+    required int receivedNavigationGeneration,
+    required int receivedServiceContextGeneration,
+    required Completer<int?> transitionConfirmation,
+    required _BridgeMessageCompletion completion,
+  }) {
+    completion.deferred = true;
+    if (_bufferedTransitionMessages.length >= _maxBufferedTransitionMessages) {
+      final evicted = _bufferedTransitionMessages.removeFirst();
+      if (!evicted.completion.completer.isCompleted) {
+        evicted.completion.completer.complete();
+      }
+      _emitAuthTrace(
+        'auth.context.transition_buffer_overflow_discarded',
+        resultCode: 'oldest',
+      );
+    }
+    _bufferedTransitionMessages.add(
+      _BufferedTransitionMessage(
+        message: message,
+        receivedNavigationGeneration: receivedNavigationGeneration,
+        receivedServiceContextGeneration: receivedServiceContextGeneration,
+        transitionConfirmation: transitionConfirmation,
+        completion: completion,
+      ),
+    );
+  }
+
+  void _resolveTransitionConfirmation(
+    Completer<int?> confirmation,
+    int? navigationGeneration,
+  ) {
+    if (!confirmation.isCompleted) {
+      confirmation.complete(navigationGeneration);
+    }
+    final replay = _bufferedTransitionMessages
+        .where(
+          (buffered) =>
+              identical(buffered.transitionConfirmation, confirmation),
+        )
+        .toList(growable: false);
+    _bufferedTransitionMessages.removeWhere(
+      (buffered) => identical(buffered.transitionConfirmation, confirmation),
+    );
+    for (final buffered in replay) {
+      unawaited(
+        _enqueueBridgeMessage(
+          buffered.message,
+          receivedNavigationGeneration: buffered.receivedNavigationGeneration,
+          receivedServiceContextGeneration:
+              buffered.receivedServiceContextGeneration,
+          receivedTransitionConfirmation: confirmation,
+          completion: buffered.completion,
+        ),
+      );
+    }
   }
 
   bool _isAuthMutation(WebViewBridgeFeatureType type) => const {
@@ -1773,6 +2022,9 @@ class FlutterWebViewBridgeJavaScriptChannel {
   Future<void> _handleMessageReceived(
     JavaScriptMessage message, {
     required int receivedNavigationGeneration,
+    required int receivedServiceContextGeneration,
+    required Completer<int?>? receivedTransitionConfirmation,
+    required _BridgeMessageCompletion completion,
   }) async {
     final json = jsonDecode(message.message);
     final type = json['type'] as String?;
@@ -1799,6 +2051,25 @@ class FlutterWebViewBridgeJavaScriptChannel {
           );
           return;
         }
+        // Old web can send token payloads without document/revision metadata.
+        // A service-context generation captured at receipt distinguishes a
+        // dangerous country/boundary transition from an ordinary same-country
+        // redirect, where queued legacy write/delete must remain valid.
+        if (_isAuthMutation(webViewBridgeFeatureType) &&
+            receivedServiceContextGeneration !=
+                _serviceAuthContext.generation) {
+          _emitAuthTrace(
+            'auth.context.stale_service_context_message_discarded',
+            resultCode: webViewBridgeFeatureType.value,
+            data: {
+              if (data is Map) ...Map<String, Object?>.from(data),
+              'receivedServiceContextGeneration':
+                  receivedServiceContextGeneration,
+              'currentServiceContextGeneration': _serviceAuthContext.generation,
+            },
+          );
+          return;
+        }
         final explicitRetryAction = _isSsoLogin(webViewBridgeFeatureType)
             ? _authContextRecoveryCoordinator
                   .consumeTerminalFailureForExplicitRetry(
@@ -1818,6 +2089,56 @@ class FlutterWebViewBridgeJavaScriptChannel {
             data: data,
           );
           return;
+        }
+        if (_isAuthMutation(webViewBridgeFeatureType) &&
+            receivedTransitionConfirmation != null &&
+            explicitRetryAction !=
+                AuthContextExplicitRetryAction.reopenTransition) {
+          if (!receivedTransitionConfirmation.isCompleted) {
+            _bufferTransitionMessage(
+              message: message,
+              receivedNavigationGeneration: receivedNavigationGeneration,
+              receivedServiceContextGeneration:
+                  receivedServiceContextGeneration,
+              transitionConfirmation: receivedTransitionConfirmation,
+              completion: completion,
+            );
+            return;
+          }
+          final confirmedNavigationGeneration =
+              await receivedTransitionConfirmation.future;
+          if (_isDisposed) return;
+          final isConfirmedTargetDocument =
+              confirmedNavigationGeneration != null &&
+              receivedNavigationGeneration == confirmedNavigationGeneration &&
+              receivedServiceContextGeneration ==
+                  _serviceAuthContext.generation;
+          if (!isConfirmedTargetDocument) {
+            _emitAuthTrace(
+              'auth.context.transition_buffered_message_discarded',
+              resultCode: webViewBridgeFeatureType.value,
+              data: {
+                if (data is Map) ...Map<String, Object?>.from(data),
+                'receivedNavigationGeneration': receivedNavigationGeneration,
+                'confirmedNavigationGeneration': confirmedNavigationGeneration,
+                'receivedServiceContextGeneration':
+                    receivedServiceContextGeneration,
+                'currentServiceContextGeneration':
+                    _serviceAuthContext.generation,
+              },
+            );
+            return;
+          }
+          if (isNavigationScopedControlMessage &&
+              receivedNavigationGeneration !=
+                  _webDocumentNavigationGeneration) {
+            _emitAuthTrace(
+              'auth.context.stale_navigation_message_discarded',
+              resultCode: webViewBridgeFeatureType.value,
+              data: data,
+            );
+            return;
+          }
         }
         if (_serviceContextTransitionInProgress &&
             _isAuthMutation(webViewBridgeFeatureType)) {
@@ -1855,7 +2176,7 @@ class FlutterWebViewBridgeJavaScriptChannel {
                   isCurrentTransition: () =>
                       _serviceContextTransitionInProgress &&
                       _serviceAuthContext.generation == retryGeneration,
-                  clearTokens: clearAllRefreshTokens,
+                  clearTokens: _clearAllRefreshTokens,
                   clearTransient: () =>
                       _clearSsoTransientState('auth-context-explicit-retry'),
                 );
@@ -1910,6 +2231,8 @@ class FlutterWebViewBridgeJavaScriptChannel {
             updateServiceContext(
               serviceCountry: _serviceAuthContext.serviceCountry,
               apiBaseUrl: _serviceAuthContext.apiBaseUrl,
+              webOrigin: _webOrigin,
+              waitForNextNavigation: false,
             );
             _emitAuthTrace(
               'auth.context.explicit_retry_transition_reopened',
@@ -2303,7 +2626,7 @@ class FlutterWebViewBridgeJavaScriptChannel {
                   recoveryTransitionGeneration = _serviceAuthContext.generation;
                   return _serviceContextTransitionInProgress;
                 },
-                clearTokens: clearAllRefreshTokens,
+                clearTokens: _clearAllRefreshTokens,
                 clearTransient: () =>
                     _clearSsoTransientState('auth-context-mismatch'),
                 completeTransition: () {
@@ -2315,6 +2638,8 @@ class FlutterWebViewBridgeJavaScriptChannel {
                   updateServiceContext(
                     serviceCountry: currentCountry,
                     apiBaseUrl: currentApiBaseUrl,
+                    webOrigin: _webOrigin,
+                    waitForNextNavigation: true,
                   );
                   return true;
                 },

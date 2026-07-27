@@ -21,6 +21,7 @@ class WebViewBridgeController {
   /// init 시 주입. 미주입=null → payload 에서 'KR' 기본값.
   String? _serviceCountry;
   String? _apiBaseUrl;
+  String? _webOrigin;
   int _webDocumentNavigationGeneration = 0;
 
   @visibleForTesting
@@ -35,6 +36,7 @@ class WebViewBridgeController {
     required String? googleServerClientId,
     required String? kakaoNativeAppKey,
     String? apiBaseUrl,
+    String? webOrigin,
     String? serviceCountry,
     String? bridgeRevision,
     void Function(String requestedCountry)? onServiceCountryChange,
@@ -50,9 +52,12 @@ class WebViewBridgeController {
     );
     final normalizedCountry = normalizeServiceCountry(serviceCountry);
     final serviceContextChanged =
-        _serviceCountry != normalizedCountry || _apiBaseUrl != apiBaseUrl;
+        _serviceCountry != normalizedCountry ||
+        _apiBaseUrl != apiBaseUrl ||
+        _webOrigin != webOrigin;
     _serviceCountry = normalizedCountry;
     _apiBaseUrl = apiBaseUrl;
+    _webOrigin = webOrigin;
     if (_channel != null) {
       // WebView 재생성 시 channel handler 는 유지, controller 만 swap.
       // addJavaScriptChannel 중복 호출은 stale handler 위험만 키우므로 회피.
@@ -61,6 +66,7 @@ class WebViewBridgeController {
         _channel!.updateServiceContext(
           serviceCountry: normalizedCountry,
           apiBaseUrl: apiBaseUrl,
+          webOrigin: webOrigin,
         );
       }
       _channel!.updateWebDocumentNavigationGeneration(
@@ -78,6 +84,7 @@ class WebViewBridgeController {
       googleServerClientId: googleServerClientId,
       kakaoNativeAppKey: kakaoNativeAppKey,
       apiBaseUrl: apiBaseUrl,
+      webOrigin: webOrigin,
       serviceCountry: normalizedCountry,
       bridgeRevision: bridgeRevision,
       onServiceCountryChange: onServiceCountryChange,
@@ -172,6 +179,14 @@ class WebViewBridgeController {
     return _webDocumentNavigationGeneration;
   }
 
+  void confirmWebDocumentNavigation({
+    required int generation,
+    required String? documentUrl,
+  }) => _channel?.confirmWebDocumentNavigation(
+    generation: generation,
+    documentUrl: documentUrl,
+  );
+
   void beginServiceContextTransition() =>
       _channel?.beginServiceContextTransition('service-country-switch');
 
@@ -179,6 +194,8 @@ class WebViewBridgeController {
   void updateServiceContext({
     required String? serviceCountry,
     required String? apiBaseUrl,
+    String? webOrigin,
+    bool waitForNextNavigation = false,
   }) {
     validateServiceAuthContextPair(
       serviceCountry: serviceCountry,
@@ -188,9 +205,12 @@ class WebViewBridgeController {
     _channel?.updateServiceContext(
       serviceCountry: normalizedCountry,
       apiBaseUrl: apiBaseUrl,
+      webOrigin: webOrigin,
+      waitForNextNavigation: waitForNextNavigation,
     );
     _serviceCountry = normalizedCountry;
     _apiBaseUrl = apiBaseUrl;
+    if (webOrigin != null) _webOrigin = webOrigin;
   }
 
   /// legacy caller 호환.
