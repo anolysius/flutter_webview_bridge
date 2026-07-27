@@ -154,10 +154,11 @@ class SignInKakao {
           '[SignInKakao] OUTER CATCH — throw AuthError: ${e.runtimeType}',
         );
         final code = mapKakaoError(e);
+        final safeCause = mapKakaoSafeCause(e);
         throw AuthError(
           code,
           e.runtimeType.toString(),
-          nativeSdkErrorCode: 'KAKAO_$code',
+          nativeSdkErrorCode: 'KAKAO_${safeCause.toUpperCase()}',
         );
       }
     }

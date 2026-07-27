@@ -1,9 +1,31 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 import '../../models/types.dart';
 
 const kRefreshTokenKey = 'flutter_webview_bridge_refresh_token';
+
+Completer<void>? _activeRefreshTokenMutation;
+
+Future<T> _serializeRefreshTokenMutation<T>(
+  Future<T> Function() operation,
+) async {
+  while (_activeRefreshTokenMutation != null) {
+    await _activeRefreshTokenMutation!.future;
+  }
+  final lock = Completer<void>();
+  _activeRefreshTokenMutation = lock;
+  try {
+    return await operation();
+  } finally {
+    if (identical(_activeRefreshTokenMutation, lock)) {
+      _activeRefreshTokenMutation = null;
+    }
+    if (!lock.isCompleted) lock.complete();
+  }
+}
 
 /// 서비스 국가별 RefreshToken 저장 키 (APP-300 R5 — 도메인별 세션 격리).
 ///
@@ -22,9 +44,22 @@ String refreshTokenKeyFor(String? serviceCountry) {
 /// 키를 **둘 다** 제거한다 — 전환 후 어느 도메인도 자동로그인되지 않도록. 단일 키만 지우는
 /// 기존 `RefreshTokenEvent(action: 'delete')`(웹 메시지 기반) 와 달리 네이티브가 직접 호출한다.
 Future<void> clearAllRefreshTokens() async {
-  final SharedPreferences prefs = await SharedPreferences.getInstance();
-  await prefs.remove(refreshTokenKeyFor('KR')); // 레거시 키
-  await prefs.remove(refreshTokenKeyFor('GLOBAL')); // __global
+  await _serializeRefreshTokenMutation(() async {
+    final SharedPreferences prefs = await SharedPreferences.getInstance();
+    for (final key in [
+      refreshTokenKeyFor('KR'),
+      refreshTokenKeyFor('GLOBAL'),
+    ]) {
+      await prefs.remove(key);
+      if (prefs.getString(key) != null) {
+        // transient platform write failure를 한 번 더 회수한다.
+        await prefs.remove(key);
+      }
+      if (prefs.getString(key) != null) {
+        throw StateError('Failed to clear refresh token key: $key');
+      }
+    }
+  });
 }
 
 class RefreshTokenEvent {
@@ -34,6 +69,25 @@ class RefreshTokenEvent {
     dynamic data,
     String? serviceCountry,
     int? authRevision,
+    bool Function()? canMutate,
+  }) => _serializeRefreshTokenMutation(
+    () => _process(
+      context,
+      action: action,
+      data: data,
+      serviceCountry: serviceCountry,
+      authRevision: authRevision,
+      canMutate: canMutate,
+    ),
+  );
+
+  Future<Map<String, Object?>> _process(
+    BuildContext context, {
+    required String action,
+    dynamic data,
+    String? serviceCountry,
+    int? authRevision,
+    bool Function()? canMutate,
   }) async {
     Map<String, Object?> sendData = {};
 
@@ -75,6 +129,10 @@ class RefreshTokenEvent {
       }
     } else if (action == 'write') {
       sendData['type'] = WebViewBridgeFeatureType.refreshTokenWrite.value;
+      if (canMutate != null && !canMutate()) {
+        sendData['error'] = 'STALE_AUTH_CONTEXT';
+        return sendData;
+      }
 
       // Set the refresh token. Newer web clients send confirm metadata together
       // with the token so native can tell which document confirmed SSO.
@@ -84,6 +142,10 @@ class RefreshTokenEvent {
           ? (data['refreshToken'] ?? data['token']) as String?
           : null;
       if (refreshToken != null) {
+        if (canMutate != null && !canMutate()) {
+          sendData['error'] = 'STALE_AUTH_CONTEXT';
+          return sendData;
+        }
         final r = await prefs.setString(storageKey, refreshToken);
         if (r == true && prefs.getString(storageKey) == refreshToken) {
           sendData['data'] = isV2 ? v2Response(status: 'stored') : refreshToken;

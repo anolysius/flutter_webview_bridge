@@ -241,6 +241,60 @@ void main() {
       expect(coordinator.isActive(interactive), isFalse);
     });
 
+    test('선점된 attempt의 late signal 24개 순열은 새 owner를 변경하지 않는다', () {
+      List<List<int>> permutations(List<int> values) {
+        if (values.length <= 1) return [values];
+        return [
+          for (var index = 0; index < values.length; index += 1)
+            for (final tail in permutations([
+              ...values.take(index),
+              ...values.skip(index + 1),
+            ]))
+              [values[index], ...tail],
+        ];
+      }
+
+      final orders = permutations([0, 1, 2, 3]);
+      expect(orders, hasLength(24));
+      for (final order in orders) {
+        final coordinator = ProcessAuthAttemptCoordinator();
+        final stale = coordinator.beginInteractive(
+          attemptId: 'stale-attempt',
+          onSuperseded: () {},
+          onSettled: () {},
+        );
+        final current = coordinator.beginInteractive(
+          attemptId: 'current-attempt',
+          onSuperseded: () {},
+          onSettled: () {},
+        );
+        final staleActions = <void Function()>[
+          () => coordinator.complete(stale),
+          () => coordinator.recordConvergenceHandoff(
+            lease: stale,
+            convergenceKey: 'KR:7',
+          ),
+          () => coordinator.settleTerminal(
+            attemptId: 'stale-attempt',
+            revision: 7,
+          ),
+          () => coordinator.settleTerminal(
+            attemptId: 'unrelated-attempt',
+            revision: 7,
+          ),
+        ];
+
+        for (final actionIndex in order) {
+          staleActions[actionIndex]();
+          expect(
+            coordinator.isActive(current),
+            isTrue,
+            reason: 'order=$order action=$actionIndex',
+          );
+        }
+      }
+    });
+
     test('active auto가 있으면 두 번째 bridge의 auto attempt를 억제한다', () {
       final coordinator = ProcessAuthAttemptCoordinator();
       final first = coordinator.tryBeginAutomatic(

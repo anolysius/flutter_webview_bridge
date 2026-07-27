@@ -7,6 +7,7 @@ import 'package:flutter/cupertino.dart';
 import 'package:flutter_webview_bridge/flutter_webview_bridge.dart';
 import 'package:webview_flutter/webview_flutter.dart';
 
+import 'auth/service_auth_context.dart';
 import 'events/refresh_token.dart' as refresh_token;
 
 class WebViewBridgeController {
@@ -19,6 +20,15 @@ class WebViewBridgeController {
   /// PUSH_TOKEN payload 에 동봉할 서비스 국가 (APP-300 R6 — 푸시 segmentation).
   /// init 시 주입. 미주입=null → payload 에서 'KR' 기본값.
   String? _serviceCountry;
+  String? _apiBaseUrl;
+  String? _webOrigin;
+  int _webDocumentNavigationGeneration = 0;
+
+  @visibleForTesting
+  String? get debugServiceCountry => _serviceCountry;
+
+  @visibleForTesting
+  String? get debugApiBaseUrl => _apiBaseUrl;
 
   void initFlutterWebViewBridgeJavaScriptChannel(
     BuildContext context,
@@ -26,17 +36,42 @@ class WebViewBridgeController {
     required String? googleServerClientId,
     required String? kakaoNativeAppKey,
     String? apiBaseUrl,
+    String? webOrigin,
     String? serviceCountry,
     String? bridgeRevision,
     void Function(String requestedCountry)? onServiceCountryChange,
     AuthTraceCallback? onAuthTrace,
+    AuthContextStatusCallback? onAuthContextStatus,
+    AuthContextRestartCallback? onAuthContextRestart,
+    WebAuthContextCapabilityCallback? onWebAuthContextCapability,
   }) {
     _isTerminated = false;
-    _serviceCountry = serviceCountry;
+    validateServiceAuthContextPair(
+      serviceCountry: serviceCountry,
+      apiBaseUrl: apiBaseUrl,
+    );
+    final normalizedCountry = normalizeServiceCountry(serviceCountry);
+    final serviceContextChanged =
+        _serviceCountry != normalizedCountry ||
+        _apiBaseUrl != apiBaseUrl ||
+        _webOrigin != webOrigin;
+    _serviceCountry = normalizedCountry;
+    _apiBaseUrl = apiBaseUrl;
+    _webOrigin = webOrigin;
     if (_channel != null) {
       // WebView 재생성 시 channel handler 는 유지, controller 만 swap.
       // addJavaScriptChannel 중복 호출은 stale handler 위험만 키우므로 회피.
       _channel!.updateWebViewController(webViewController, newContext: context);
+      if (serviceContextChanged) {
+        _channel!.updateServiceContext(
+          serviceCountry: normalizedCountry,
+          apiBaseUrl: apiBaseUrl,
+          webOrigin: webOrigin,
+        );
+      }
+      _channel!.updateWebDocumentNavigationGeneration(
+        _webDocumentNavigationGeneration,
+      );
       _channel!.updateAppLifecycleState(_appLifecycleState);
       _completeInitialization();
       _processQueue();
@@ -49,10 +84,15 @@ class WebViewBridgeController {
       googleServerClientId: googleServerClientId,
       kakaoNativeAppKey: kakaoNativeAppKey,
       apiBaseUrl: apiBaseUrl,
-      serviceCountry: serviceCountry,
+      webOrigin: webOrigin,
+      serviceCountry: normalizedCountry,
       bridgeRevision: bridgeRevision,
       onServiceCountryChange: onServiceCountryChange,
       onAuthTrace: onAuthTrace,
+      onAuthContextStatus: onAuthContextStatus,
+      onAuthContextRestart: onAuthContextRestart,
+      onWebAuthContextCapability: onWebAuthContextCapability,
+      webDocumentNavigationGeneration: _webDocumentNavigationGeneration,
     );
     _channel!.updateAppLifecycleState(_appLifecycleState);
     _channel!.addJavaScriptChannel();
@@ -131,11 +171,55 @@ class WebViewBridgeController {
   /// SharedPreferences 직접 조작이라 채널 미초기화/terminated 와 무관하게 동작.
   Future<void> clearAllRefreshTokens() => refresh_token.clearAllRefreshTokens();
 
-  /// 세션 내 serviceCountry 갱신 — 컨트롤러의 PUSH_TOKEN payload 국가 + 채널의
-  /// refresh-key/SSO domainType 분기를 둘 다 새 국가로. 재시작 불요.
+  int beginWebDocumentNavigation() {
+    _webDocumentNavigationGeneration += 1;
+    _channel?.updateWebDocumentNavigationGeneration(
+      _webDocumentNavigationGeneration,
+    );
+    return _webDocumentNavigationGeneration;
+  }
+
+  void confirmWebDocumentNavigation({
+    required int generation,
+    required String? documentUrl,
+  }) => _channel?.confirmWebDocumentNavigation(
+    generation: generation,
+    documentUrl: documentUrl,
+  );
+
+  void beginServiceContextTransition() =>
+      _channel?.beginServiceContextTransition('service-country-switch');
+
+  /// 세션 내 serviceCountry + API origin 원자 갱신.
+  void updateServiceContext({
+    required String? serviceCountry,
+    required String? apiBaseUrl,
+    String? webOrigin,
+    bool waitForNextNavigation = false,
+  }) {
+    validateServiceAuthContextPair(
+      serviceCountry: serviceCountry,
+      apiBaseUrl: apiBaseUrl,
+    );
+    final normalizedCountry = normalizeServiceCountry(serviceCountry);
+    _channel?.updateServiceContext(
+      serviceCountry: normalizedCountry,
+      apiBaseUrl: apiBaseUrl,
+      webOrigin: webOrigin,
+      waitForNextNavigation: waitForNextNavigation,
+    );
+    _serviceCountry = normalizedCountry;
+    _apiBaseUrl = apiBaseUrl;
+    if (webOrigin != null) _webOrigin = webOrigin;
+  }
+
+  /// legacy caller 호환.
   void updateServiceCountry(String? code) {
-    _serviceCountry = code;
-    _channel?.updateServiceCountry(code);
+    final targetApiBaseUrl = apiBaseUrlForServiceCountry(
+      apiBaseUrl: _apiBaseUrl,
+      serviceCountry: code,
+    );
+    updateServiceContext(serviceCountry: code, apiBaseUrl: targetApiBaseUrl);
   }
 
   /// staff 서비스 국가 전환 시 채널의 in-memory SSO transient 상태(replay 캐시 등) 정리.

@@ -28,7 +28,13 @@ enum WebViewBridgeFeatureType {
   authError,
   authTokensReady,
   authUiCommitted,
+  authOnboardingReady,
+  authReauthCommitted,
+  authReauthRequired,
   authAttemptStarted,
+  authContextStatus,
+  authContextStatusAck,
+  authContextMismatchClearAndRestart,
   serviceCountryQuery,
   serviceCountryChange,
 }
@@ -94,8 +100,20 @@ extension WebViewBridgeFeatureTypeValue on WebViewBridgeFeatureType {
         return 'AUTH_TOKENS_READY';
       case WebViewBridgeFeatureType.authUiCommitted:
         return 'AUTH_UI_COMMITTED';
+      case WebViewBridgeFeatureType.authOnboardingReady:
+        return 'AUTH_ONBOARDING_READY';
+      case WebViewBridgeFeatureType.authReauthCommitted:
+        return 'AUTH_REAUTH_COMMITTED';
+      case WebViewBridgeFeatureType.authReauthRequired:
+        return 'AUTH_REAUTH_REQUIRED';
       case WebViewBridgeFeatureType.authAttemptStarted:
         return 'AUTH_ATTEMPT_STARTED';
+      case WebViewBridgeFeatureType.authContextStatus:
+        return 'AUTH_CONTEXT_STATUS';
+      case WebViewBridgeFeatureType.authContextStatusAck:
+        return 'AUTH_CONTEXT_STATUS_ACK';
+      case WebViewBridgeFeatureType.authContextMismatchClearAndRestart:
+        return 'AUTH_CONTEXT_MISMATCH_CLEAR_AND_RESTART';
       case WebViewBridgeFeatureType.serviceCountryQuery:
         return 'SERVICE_COUNTRY_QUERY';
       case WebViewBridgeFeatureType.serviceCountryChange:
@@ -165,6 +183,20 @@ extension WebViewBridgeFeatureTypeString on String {
         return WebViewBridgeFeatureType.authTokensReady;
       case 'AUTH_UI_COMMITTED':
         return WebViewBridgeFeatureType.authUiCommitted;
+      case 'AUTH_ONBOARDING_READY':
+        return WebViewBridgeFeatureType.authOnboardingReady;
+      case 'AUTH_REAUTH_COMMITTED':
+        return WebViewBridgeFeatureType.authReauthCommitted;
+      case 'AUTH_REAUTH_REQUIRED':
+        return WebViewBridgeFeatureType.authReauthRequired;
+      case 'AUTH_ATTEMPT_STARTED':
+        return WebViewBridgeFeatureType.authAttemptStarted;
+      case 'AUTH_CONTEXT_STATUS':
+        return WebViewBridgeFeatureType.authContextStatus;
+      case 'AUTH_CONTEXT_STATUS_ACK':
+        return WebViewBridgeFeatureType.authContextStatusAck;
+      case 'AUTH_CONTEXT_MISMATCH_CLEAR_AND_RESTART':
+        return WebViewBridgeFeatureType.authContextMismatchClearAndRestart;
       case 'SERVICE_COUNTRY_QUERY':
         return WebViewBridgeFeatureType.serviceCountryQuery;
       case 'SERVICE_COUNTRY_CHANGE':
