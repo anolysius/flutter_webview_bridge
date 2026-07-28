@@ -1,10 +1,16 @@
 const int legacyAuthProtocolVersion = 2;
 const int currentAuthProtocolVersion = 3;
+const String criticalAuthDeliveryAckCapability = 'criticalAuthDeliveryAck';
 
-const Set<String> authProtocolV3Capabilities = {
+const Set<String> requiredAuthProtocolV3Capabilities = {
   'softConvergenceDeadline',
   'onboardingHandoff',
   'reauthRequiredCommit',
+};
+
+const Set<String> authProtocolV3Capabilities = {
+  ...requiredAuthProtocolV3Capabilities,
+  criticalAuthDeliveryAckCapability,
 };
 
 int authProtocolVersionOf(dynamic data) =>
@@ -27,7 +33,39 @@ int negotiateAuthProtocolVersion(dynamic data) {
       base >= currentAuthProtocolVersion ||
       (maxVersion is int && maxVersion >= currentAuthProtocolVersion);
 
-  return offersV3 && capabilities.containsAll(authProtocolV3Capabilities)
+  return offersV3 &&
+          capabilities.containsAll(requiredAuthProtocolV3Capabilities)
       ? currentAuthProtocolVersion
       : legacyAuthProtocolVersion;
+}
+
+Set<String> negotiateAuthProtocolCapabilities(dynamic data) {
+  if (negotiateAuthProtocolVersion(data) < currentAuthProtocolVersion ||
+      data is! Map) {
+    return const <String>{};
+  }
+  final rawCapabilities = data['authCapabilities'];
+  final offered = rawCapabilities is List
+      ? rawCapabilities.whereType<String>().toSet()
+      : const <String>{};
+  return offered.intersection(authProtocolV3Capabilities);
+}
+
+bool supportsCriticalAuthDeliveryAck(dynamic data) =>
+    negotiateAuthProtocolCapabilities(
+      data,
+    ).contains(criticalAuthDeliveryAckCapability);
+
+Map<String, Object?> authProtocolCapabilityResponse(dynamic data) {
+  if (data is! Map || data['authCapabilities'] is! List) {
+    return const <String, Object?>{};
+  }
+  final version = negotiateAuthProtocolVersion(data);
+  return <String, Object?>{
+    'authProtocolVersion': version,
+    if (version >= currentAuthProtocolVersion)
+      'authCapabilities': negotiateAuthProtocolCapabilities(
+        data,
+      ).toList(growable: false),
+  };
 }

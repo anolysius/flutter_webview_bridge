@@ -31,7 +31,9 @@ Map<String, Object?>? buildPendingReauthReplay({
 
   return <String, Object?>{
     'protocolVersion': currentAuthProtocolVersion,
-    'authCapabilities': authProtocolV3Capabilities.toList(growable: false),
+    'authCapabilities': negotiateAuthProtocolCapabilities(
+      requestData,
+    ).toList(growable: false),
     'requestId': requestId,
     'authSessionId': activeAuthSessionId,
     'documentId': documentId,

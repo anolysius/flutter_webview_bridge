@@ -35,6 +35,58 @@ void main() {
     );
   });
 
+  test('new optional capability is not required for existing v3 web', () {
+    const existingWeb = {
+      'protocolVersion': 2,
+      'maxProtocolVersion': 3,
+      'authCapabilities': [
+        'softConvergenceDeadline',
+        'onboardingHandoff',
+        'reauthRequiredCommit',
+      ],
+    };
+
+    expect(
+      negotiateAuthProtocolVersion(existingWeb),
+      currentAuthProtocolVersion,
+    );
+    expect(
+      negotiateAuthProtocolCapabilities(existingWeb),
+      requiredAuthProtocolV3Capabilities,
+    );
+    expect(supportsCriticalAuthDeliveryAck(existingWeb), isFalse);
+  });
+
+  test('critical delivery ACK is selected only when web offers it', () {
+    const newWeb = {
+      'protocolVersion': 2,
+      'maxProtocolVersion': 3,
+      'authCapabilities': [
+        'softConvergenceDeadline',
+        'onboardingHandoff',
+        'reauthRequiredCommit',
+        'criticalAuthDeliveryAck',
+      ],
+    };
+
+    expect(
+      negotiateAuthProtocolCapabilities(newWeb),
+      authProtocolV3Capabilities,
+    );
+    expect(supportsCriticalAuthDeliveryAck(newWeb), isTrue);
+    expect(authProtocolCapabilityResponse(newWeb), {
+      'authProtocolVersion': 3,
+      'authCapabilities': authProtocolV3Capabilities.toList(growable: false),
+    });
+  });
+
+  test('legacy DEVICE_INFO without auth offer gets no additive response', () {
+    expect(
+      authProtocolCapabilityResponse(const {'authContextProtocolVersion': 1}),
+      isEmpty,
+    );
+  });
+
   test('legacy v1 producer remains v1', () {
     expect(negotiateAuthProtocolVersion(const {'protocolVersion': 1}), 1);
   });
