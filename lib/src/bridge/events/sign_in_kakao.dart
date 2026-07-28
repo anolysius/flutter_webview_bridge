@@ -7,6 +7,7 @@ import 'package:kakao_flutter_sdk/kakao_flutter_sdk.dart';
 import '../../models/types.dart';
 import 'auth_error.dart';
 import 'auth_error_mapper.dart';
+import 'kakao_token_policy.dart';
 
 class SignInKakao {
   static final SignInKakao _instance = SignInKakao._internal();
@@ -119,19 +120,18 @@ class SignInKakao {
           scopes.add("age_range");
         }
 
-        if (scopes.isNotEmpty) {
-          // OpenID Connect 사용 시
-          // scope 목록에 "openid" 문자열을 추가하고 요청해야 함
-          // 해당 문자열을 포함하지 않은 경우, ID 토큰이 재발급되지 않음
-          // scopes.add("openid")
-
+        final consentScopes = kakaoConsentScopesWithOpenId(scopes);
+        if (consentScopes.isNotEmpty) {
           // scope 목록을 전달하여 동의항목 추가 동의 요청
           // 지정된 동의항목에 대한 동의 화면을 거쳐 다시 카카오 로그인 수행
           try {
             OAuthToken token = await UserApi.instance.loginWithNewScopes(
-              scopes,
+              consentScopes,
             );
-            idToken = token.idToken;
+            idToken = selectKakaoIdToken(
+              current: idToken,
+              reissued: token.idToken,
+            );
           } catch (e) {
             rethrow;
           }
