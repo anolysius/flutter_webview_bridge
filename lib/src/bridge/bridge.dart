@@ -167,6 +167,9 @@ class FlutterWebViewBridgeJavaScriptChannel {
   static const int _maxPendingPostMessages = 20;
   static const int _maxBufferedTransitionMessages = 20;
   int _authAttemptAckDeliveryGeneration = 0;
+  WebViewBridgeFeatureType? _activeAuthRequestType;
+  int? _activeAuthRequestRevision;
+  int? _activeAuthRequestNavigationGeneration;
   final AuthContextOperationRegistry _authContextStatusOperations =
       AuthContextOperationRegistry();
   final AuthContextRecoveryCoordinator _authContextRecoveryCoordinator =
@@ -1522,9 +1525,34 @@ class FlutterWebViewBridgeJavaScriptChannel {
     _autoAuthAttempt.bindToResponse(response);
   }
 
+  bool _matchesActiveCriticalAuthRequest(
+    WebViewBridgeFeatureType type,
+    dynamic data,
+  ) {
+    final attemptId = _authSessionIdOf(data);
+    final requestId = _requestIdOf(data);
+    final documentId = _stringFieldOf(data, 'documentId');
+    final provider = _providerOfRequest(data) ?? _providerNameOf(type);
+    return _ownsActiveInteractiveLease &&
+        _awaitingAuthTerminal &&
+        _activeAuthCapabilities.contains(criticalAuthDeliveryAckCapability) &&
+        supportsCriticalAuthDeliveryAck(data) &&
+        attemptId != null &&
+        attemptId == _activeAuthSessionId &&
+        requestId != null &&
+        requestId == _activeRequestId &&
+        documentId != null &&
+        documentId == _activeDocumentId &&
+        type == _activeAuthRequestType &&
+        provider == _activeAuthProvider &&
+        _authRevisionOf(data) == _activeAuthRequestRevision &&
+        !_isInvalidatedAuthDocumentMessage(data);
+  }
+
   Future<int> _beginAuthTransaction(
     WebViewBridgeFeatureType type,
     dynamic data,
+    int receivedNavigationGeneration,
   ) async {
     late final ProcessAuthAttemptLease processLease;
     late final int transactionEpoch;
@@ -1543,16 +1571,7 @@ class FlutterWebViewBridgeJavaScriptChannel {
       },
     );
     if (claimedLease == null) {
-      final duplicateAttemptId = _authSessionIdOf(data);
-      final duplicateRequestId = _requestIdOf(data);
-      final isSameActiveRequest =
-          _ownsActiveInteractiveLease &&
-          duplicateAttemptId != null &&
-          duplicateAttemptId == _activeAuthSessionId &&
-          duplicateRequestId != null &&
-          duplicateRequestId == _activeRequestId;
-      if (isSameActiveRequest &&
-          _activeAuthCapabilities.contains(criticalAuthDeliveryAckCapability)) {
+      if (_matchesActiveCriticalAuthRequest(type, data)) {
         _emitAuthTrace(
           'auth.attempt.duplicate_ack_replayed',
           resultCode: 'same_request_in_flight',
@@ -1577,6 +1596,9 @@ class FlutterWebViewBridgeJavaScriptChannel {
     _activeReauthSemanticReason = null;
     _activeRequestId = _requestIdOf(data);
     _activeDocumentId = _stringFieldOf(data, 'documentId');
+    _activeAuthRequestType = type;
+    _activeAuthRequestRevision = _authRevisionOf(data);
+    _activeAuthRequestNavigationGeneration = receivedNavigationGeneration;
     _activeProtocolVersion = negotiateAuthProtocolVersion(data);
     _activeAuthCapabilities = negotiateAuthProtocolCapabilities(data);
     _authTotalElapsed
@@ -1753,6 +1775,9 @@ class FlutterWebViewBridgeJavaScriptChannel {
     _activeAuthJourney = null;
     _activeReauthSemanticReason = null;
     _activeAuthCapabilities = const <String>{};
+    _activeAuthRequestType = null;
+    _activeAuthRequestRevision = null;
+    _activeAuthRequestNavigationGeneration = null;
     _authAttemptAckDeliveryGeneration += 1;
     _autoAuthAttempt.clearActiveAttempt();
     _authAttemptPhase.settle();
@@ -2023,6 +2048,13 @@ class FlutterWebViewBridgeJavaScriptChannel {
     final receivedTransitionConfirmation = _serviceContextTransitionInProgress
         ? _serviceContextTransitionNavigationConfirmation
         : null;
+    if (await _replayActiveCriticalAuthAckBeforeSerial(
+      message,
+      receivedNavigationGeneration: receivedNavigationGeneration,
+      receivedServiceContextGeneration: receivedServiceContextGeneration,
+    )) {
+      return;
+    }
     final completion = _BridgeMessageCompletion();
     await _enqueueBridgeMessage(
       message,
@@ -2032,6 +2064,55 @@ class FlutterWebViewBridgeJavaScriptChannel {
       completion: completion,
     );
     await completion.completer.future;
+  }
+
+  Future<bool> _replayActiveCriticalAuthAckBeforeSerial(
+    JavaScriptMessage message, {
+    required int receivedNavigationGeneration,
+    required int receivedServiceContextGeneration,
+  }) async {
+    if (_isDisposed ||
+        _serviceContextTransitionInProgress ||
+        receivedServiceContextGeneration != _serviceAuthContext.generation ||
+        receivedNavigationGeneration !=
+            _activeAuthRequestNavigationGeneration ||
+        !_ownsActiveInteractiveLease ||
+        !_awaitingAuthTerminal ||
+        !_activeAuthCapabilities.contains(criticalAuthDeliveryAckCapability)) {
+      return false;
+    }
+
+    dynamic decoded;
+    try {
+      decoded = jsonDecode(message.message);
+    } catch (_) {
+      return false;
+    }
+    if (decoded is! Map) return false;
+    final type = decoded['type'];
+    final data = decoded['data'];
+    if (type is! String || data is! Map) return false;
+    final featureType = type.webViewBridgeFeatureType;
+    if (featureType == null ||
+        !_isSsoLogin(featureType) ||
+        !supportsCriticalAuthDeliveryAck(data)) {
+      return false;
+    }
+
+    if (!_matchesActiveCriticalAuthRequest(featureType, data)) return false;
+
+    _emitAuthTrace(
+      'auth.attempt.duplicate_ack_replayed',
+      resultCode: 'same_request_in_flight_fast_path',
+      data: data,
+    );
+    await _sendAuthAttemptStartedAck();
+    _emitAuthTrace(
+      'auth.attempt.duplicate_ignored',
+      resultCode: 'duplicate_in_flight',
+      data: data,
+    );
+    return true;
   }
 
   Future<void> _enqueueBridgeMessage(
@@ -2384,6 +2465,7 @@ class FlutterWebViewBridgeJavaScriptChannel {
             authEpoch = await _beginAuthTransaction(
               webViewBridgeFeatureType,
               data,
+              receivedNavigationGeneration,
             );
             if (!context.mounted) return;
           }
