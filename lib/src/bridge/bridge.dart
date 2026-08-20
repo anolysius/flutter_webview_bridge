@@ -147,6 +147,7 @@ class FlutterWebViewBridgeJavaScriptChannel {
 
   /// 웹의 SERVICE_COUNTRY_CHANGE 수신 시 앱이 override+reload 하도록 위임하는 콜백.
   final void Function(String requestedCountry)? onServiceCountryChange;
+  final Future<void> Function()? onClearBadge;
   final AuthTraceCallback? onAuthTrace;
   final AuthContextStatusCallback? onAuthContextStatus;
   final AuthContextRestartCallback? onAuthContextRestart;
@@ -187,6 +188,7 @@ class FlutterWebViewBridgeJavaScriptChannel {
     this.bridgeRevision,
     String? serviceCountry,
     this.onServiceCountryChange,
+    this.onClearBadge,
     this.onAuthTrace,
     this.onAuthContextStatus,
     this.onAuthContextRestart,
@@ -2476,6 +2478,9 @@ class FlutterWebViewBridgeJavaScriptChannel {
             case WebViewBridgeFeatureType.pushToken:
               sendData = await PushTokenEvent().process(context);
               break;
+            case WebViewBridgeFeatureType.clearBadge:
+              await onClearBadge?.call();
+              return;
             case WebViewBridgeFeatureType.deviceInfo:
               onWebAuthContextCapability?.call(
                 supported: supportsWebAuthContextProtocol(data),
