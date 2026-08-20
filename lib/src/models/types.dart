@@ -1,6 +1,7 @@
 enum WebViewBridgeFeatureType {
   appStateChange,
   pushToken,
+  clearBadge,
   deviceInfo,
   cameraAccess,
   photoLibraryAccess,
@@ -46,6 +47,8 @@ extension WebViewBridgeFeatureTypeValue on WebViewBridgeFeatureType {
         return 'APP_STATE_CHANGE';
       case WebViewBridgeFeatureType.pushToken:
         return 'PUSH_TOKEN';
+      case WebViewBridgeFeatureType.clearBadge:
+        return 'CLEAR_BADGE';
       case WebViewBridgeFeatureType.deviceInfo:
         return 'DEVICE_INFO';
       case WebViewBridgeFeatureType.cameraAccess:
@@ -129,6 +132,8 @@ extension WebViewBridgeFeatureTypeString on String {
         return WebViewBridgeFeatureType.appStateChange;
       case 'PUSH_TOKEN':
         return WebViewBridgeFeatureType.pushToken;
+      case 'CLEAR_BADGE':
+        return WebViewBridgeFeatureType.clearBadge;
       case 'DEVICE_INFO':
         return WebViewBridgeFeatureType.deviceInfo;
       case 'CAMERA_ACCESS':
