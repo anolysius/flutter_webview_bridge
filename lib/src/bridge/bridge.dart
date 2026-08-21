@@ -11,6 +11,7 @@ import '../auth/sso_exchange.dart';
 import '../device/device_info.dart';
 import '../models/types.dart';
 import 'events/app_state_change.dart';
+import 'events/apps_flyer_analytics.dart';
 import 'events/auth_error.dart';
 import 'events/auth_error_mapper.dart';
 import 'events/camera_access.dart';
@@ -148,6 +149,7 @@ class FlutterWebViewBridgeJavaScriptChannel {
   /// 웹의 SERVICE_COUNTRY_CHANGE 수신 시 앱이 override+reload 하도록 위임하는 콜백.
   final void Function(String requestedCountry)? onServiceCountryChange;
   final Future<void> Function()? onClearBadge;
+  final AppsFlyerAnalyticsCallback? onAppsFlyerAnalytics;
   final AuthTraceCallback? onAuthTrace;
   final AuthContextStatusCallback? onAuthContextStatus;
   final AuthContextRestartCallback? onAuthContextRestart;
@@ -189,6 +191,7 @@ class FlutterWebViewBridgeJavaScriptChannel {
     String? serviceCountry,
     this.onServiceCountryChange,
     this.onClearBadge,
+    this.onAppsFlyerAnalytics,
     this.onAuthTrace,
     this.onAuthContextStatus,
     this.onAuthContextRestart,
@@ -2491,6 +2494,7 @@ class FlutterWebViewBridgeJavaScriptChannel {
               final responseData = sendData['data'];
               if (responseData is Map) {
                 responseData['bridgeRevision'] = bridgeRevision ?? 'unknown';
+                responseData['appsFlyerAnalyticsV1'] = true;
                 responseData.addAll(authProtocolCapabilityResponse(data));
               }
               break;
@@ -2522,8 +2526,10 @@ class FlutterWebViewBridgeJavaScriptChannel {
               sendData = await GoogleAnalyticsEvent().process(context, data);
               break;
             case WebViewBridgeFeatureType.appsFlyerAnalytics:
-              // TODO: Handle this case.
-              throw UnimplementedError();
+              sendData = await AppsFlyerAnalyticsEvent(
+                onEvent: onAppsFlyerAnalytics,
+              ).process(data);
+              break;
             case WebViewBridgeFeatureType.exitApp:
               sendData = await ExitAppEvent().process(context);
               break;
