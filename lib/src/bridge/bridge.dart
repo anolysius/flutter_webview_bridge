@@ -12,6 +12,7 @@ import '../device/device_info.dart';
 import '../models/types.dart';
 import 'events/app_state_change.dart';
 import 'events/apps_flyer_analytics.dart';
+import 'events/airbridge_analytics.dart';
 import 'events/auth_error.dart';
 import 'events/auth_error_mapper.dart';
 import 'events/camera_access.dart';
@@ -150,6 +151,7 @@ class FlutterWebViewBridgeJavaScriptChannel {
   final void Function(String requestedCountry)? onServiceCountryChange;
   final Future<void> Function()? onClearBadge;
   final AppsFlyerAnalyticsCallback? onAppsFlyerAnalytics;
+  final AirbridgeAnalyticsCallback? onAirbridgeAnalytics;
   final AuthTraceCallback? onAuthTrace;
   final AuthContextStatusCallback? onAuthContextStatus;
   final AuthContextRestartCallback? onAuthContextRestart;
@@ -192,6 +194,7 @@ class FlutterWebViewBridgeJavaScriptChannel {
     this.onServiceCountryChange,
     this.onClearBadge,
     this.onAppsFlyerAnalytics,
+    this.onAirbridgeAnalytics,
     this.onAuthTrace,
     this.onAuthContextStatus,
     this.onAuthContextRestart,
@@ -2495,6 +2498,7 @@ class FlutterWebViewBridgeJavaScriptChannel {
               if (responseData is Map) {
                 responseData['bridgeRevision'] = bridgeRevision ?? 'unknown';
                 responseData['appsFlyerAnalyticsV1'] = true;
+                responseData['airbridgeAnalyticsV1'] = true;
                 responseData.addAll(authProtocolCapabilityResponse(data));
               }
               break;
@@ -2528,6 +2532,11 @@ class FlutterWebViewBridgeJavaScriptChannel {
             case WebViewBridgeFeatureType.appsFlyerAnalytics:
               sendData = await AppsFlyerAnalyticsEvent(
                 onEvent: onAppsFlyerAnalytics,
+              ).process(data);
+              break;
+            case WebViewBridgeFeatureType.airbridgeAnalytics:
+              sendData = await AirbridgeAnalyticsEvent(
+                onEvent: onAirbridgeAnalytics,
               ).process(data);
               break;
             case WebViewBridgeFeatureType.exitApp:

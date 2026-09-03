@@ -454,7 +454,47 @@ sendToNative({ type: "GOOGLE_ANALYTICS", data: {
 
 // AppsFlyer Analytics 이벤트 전송 (응답 없음)
 sendToNative({ type: "APPS_FLYER_ANALYTICS", data: null });
+
+// Airbridge Analytics 이벤트 전송 (typed ACK 응답)
+sendToNative({ type: "AIRBRIDGE_ANALYTICS", data: {
+    schemaVersion: 1,
+    requestId: "request-1",
+    eventId: "purchase:order-1",
+    category: "airbridge.ecommerce.order.completed",
+    occurredAt: "2026-09-04T12:00:00.000Z",
+    userId: "user-1",
+    semanticAttributes: {
+        transactionID: "order-1",
+        value: 2000,
+        currency: "KRW",
+        products: [{
+            productID: "item-1",
+            name: "Camera",
+            price: 1000,
+            quantity: 2,
+            currency: "KRW",
+        }],
+    },
+} });
 ```
+
+지원 category는 아래 8개로 제한됩니다.
+
+| 서비스 이벤트 | Airbridge category |
+| --- | --- |
+| 구매 완료 | `airbridge.ecommerce.order.completed` |
+| 결제 시작 | `airbridge.initiateCheckout` |
+| 장바구니 추가 | `airbridge.ecommerce.product.addedToCart` |
+| 관심상품 추가 | `airbridge.addToWishlist` |
+| 상품 조회 | `airbridge.ecommerce.product.viewed` |
+| 검색 | `airbridge.ecommerce.searchResults.viewed` |
+| 로그인 | `airbridge.user.signin` |
+| 회원가입 | `airbridge.user.signup` |
+
+`schemaVersion`은 `1`이며 구매 완료는 `eventId=purchase:<transactionID>` 형식을 사용합니다.
+응답 `data.status`는 `accepted`, `duplicate`, `failed`, `rejected` 중 하나이고 원 요청의
+`requestId`를 포함합니다. 토큰·이메일·전화번호 등 민감정보 key와 허용 목록 밖의 semantic
+attribute는 거부됩니다.
 
 ### 채널톡
 
