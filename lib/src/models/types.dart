@@ -13,6 +13,7 @@ enum WebViewBridgeFeatureType {
   exitApp,
   googleAnalytics,
   appsFlyerAnalytics,
+  airbridgeAnalytics,
   googleSignInLogin,
   googleSignInLogout,
   appleSignInLogin,
@@ -71,6 +72,8 @@ extension WebViewBridgeFeatureTypeValue on WebViewBridgeFeatureType {
         return 'GOOGLE_ANALYTICS';
       case WebViewBridgeFeatureType.appsFlyerAnalytics:
         return 'APPS_FLYER_ANALYTICS';
+      case WebViewBridgeFeatureType.airbridgeAnalytics:
+        return 'AIRBRIDGE_ANALYTICS';
       case WebViewBridgeFeatureType.googleSignInLogin:
         return 'GOOGLE_SIGN_IN_LOGIN';
       case WebViewBridgeFeatureType.googleSignInLogout:
@@ -156,6 +159,8 @@ extension WebViewBridgeFeatureTypeString on String {
         return WebViewBridgeFeatureType.googleAnalytics;
       case 'APPS_FLYER_ANALYTICS':
         return WebViewBridgeFeatureType.appsFlyerAnalytics;
+      case 'AIRBRIDGE_ANALYTICS':
+        return WebViewBridgeFeatureType.airbridgeAnalytics;
       case 'GOOGLE_SIGN_IN_LOGIN':
         return WebViewBridgeFeatureType.googleSignInLogin;
       case 'GOOGLE_SIGN_IN_LOGOUT':
