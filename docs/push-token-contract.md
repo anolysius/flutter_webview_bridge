@@ -1,3 +1,5 @@
+> 2026-09-21: 아래 구 계약의 null 등록 생략/영구 dedup/초기→갱신 순서 설명은 문서 끝의 상태 확장 정책으로 대체됩니다.
+
 # Push Token Bridge Contract
 
 > Flutter ↔ WebView FCM 푸시 토큰 전달 규약 (v1.0)
@@ -201,3 +203,19 @@ async function handlePushToken({ token, platform, isRefresh }: PushTokenData) {
 | 일자 | 버전 | 변경 |
 |---|---|---|
 | 2026-05-25 | 1.0 | 신규. PUSH_TOKEN 단일 이벤트 + token nullable + isRefresh 플래그. push-deeplink-recovery 이니셔티브 task push-token-contract 산출물. |
+
+## 상태 확장 (2026-09-21, additive)
+
+PUSH_TOKEN의 자동 송신과 캐시 조회 응답은 같은 상태 모델을 사용한다.
+`token`, `platform`, `isRefresh`는 유지하고 `serviceCountry`, `tokenStatus`
+(`ready|pending|error`), 선택 `permissionStatus`
+(`authorized|provisional|denied|notDetermined`) 및 선택
+`isNotificationPermissionGranted`를 함께 전달한다.
+
+- 캐시가 비었거나 발급 대기/오류이면 서버 등록을 보류한다. null은 거부의 근거가 아니다.
+- 명시 거부 시 캐시 토큰도 null로 정규화한다. 웹은 KR 서버에 토큰 없이 false를 등록한다.
+- authorized/provisional + ready이면 토큰과 true를 등록한다.
+- 구앱의 token-only non-null 메시지는 계속 지원한다.
+- 영구 token-only dedup 대신 인증 세션/국가/기기/권한별 성공 상태를 사용한다.
+- 초기/갱신 순서는 보장되지 않는다. 준비 대기 중 이전 송신은 최신 상태가 대체한다.
+- 신규 웹을 먼저 배포한다. 구웹은 null을 무시하므로 명시 거부 동기화는 신웹에서 완성된다.
