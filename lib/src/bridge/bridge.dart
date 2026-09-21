@@ -158,6 +158,7 @@ class FlutterWebViewBridgeJavaScriptChannel {
   final void Function(String requestedCountry)? onServiceCountryChange;
   final Future<void> Function()? onClearBadge;
   final AppsFlyerAnalyticsCallback? onAppsFlyerAnalytics;
+  final bool appsFlyerAnalyticsEnabled;
   final AirbridgeAnalyticsCallback? onAirbridgeAnalytics;
   final AuthTraceCallback? onAuthTrace;
   final AuthContextStatusCallback? onAuthContextStatus;
@@ -204,6 +205,7 @@ class FlutterWebViewBridgeJavaScriptChannel {
     this.onServiceCountryChange,
     this.onClearBadge,
     this.onAppsFlyerAnalytics,
+    this.appsFlyerAnalyticsEnabled = true,
     this.onAirbridgeAnalytics,
     this.onAuthTrace,
     this.onAuthContextStatus,
@@ -2508,7 +2510,8 @@ class FlutterWebViewBridgeJavaScriptChannel {
               final responseData = sendData['data'];
               if (responseData is Map) {
                 responseData['bridgeRevision'] = bridgeRevision ?? 'unknown';
-                responseData['appsFlyerAnalyticsV1'] = true;
+                responseData['appsFlyerAnalyticsV1'] =
+                    appsFlyerAnalyticsEnabled;
                 responseData['airbridgeAnalyticsV1'] = true;
                 responseData.addAll(authProtocolCapabilityResponse(data));
               }
@@ -2543,6 +2546,7 @@ class FlutterWebViewBridgeJavaScriptChannel {
             case WebViewBridgeFeatureType.appsFlyerAnalytics:
               sendData = await AppsFlyerAnalyticsEvent(
                 onEvent: onAppsFlyerAnalytics,
+                enabled: appsFlyerAnalyticsEnabled,
               ).process(data);
               break;
             case WebViewBridgeFeatureType.airbridgeAnalytics:

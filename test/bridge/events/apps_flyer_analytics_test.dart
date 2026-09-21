@@ -105,6 +105,59 @@ Future<BuildContext> _mountedContext(WidgetTester tester) async {
 void main() {
   TestWidgetsFlutterBinding.ensureInitialized();
 
+  test('disabled handles all legacy events without delivery', () async {
+    var calls = 0;
+    final event = AppsFlyerAnalyticsEvent(
+      enabled: false,
+      onEvent: (_) async {
+        calls++;
+        return const AppsFlyerDeliveryResult.accepted();
+      },
+    );
+    for (final name in appsFlyerEventNames) {
+      final response = await event.process(_payload(name));
+      expect(response['data'], {
+        'requestId': 'request-$name',
+        'status': 'skipped',
+        'supported': false,
+        'reason': 'disabled',
+      });
+    }
+    expect(calls, 0);
+  });
+
+  testWidgets('disabled channel acknowledges legacy web without callback', (
+    tester,
+  ) async {
+    final context = await _mountedContext(tester);
+    final controller = _FakePlatformWebViewController();
+    var calls = 0;
+    final channel = FlutterWebViewBridgeJavaScriptChannel(
+      context: context,
+      webViewController: WebViewController.fromPlatform(controller),
+      googleServerClientId: null,
+      kakaoNativeAppKey: null,
+      appsFlyerAnalyticsEnabled: false,
+      onAppsFlyerAnalytics: (_) async {
+        calls++;
+        return const AppsFlyerDeliveryResult.accepted();
+      },
+    );
+    await channel.onMessageReceived(
+      JavaScriptMessage(
+        message: jsonEncode({
+          'type': 'APPS_FLYER_ANALYTICS',
+          'data': _payload('af_login'),
+        }),
+      ),
+    );
+    expect(calls, 0);
+    expect(controller.evaluatedScripts, hasLength(1));
+    expect(controller.evaluatedScripts.single, contains('request-af_login'));
+    expect(controller.evaluatedScripts.single, contains('skipped'));
+    expect(channel.appsFlyerAnalyticsEnabled, false);
+  });
+
   test('8개 allowlist event를 typed callback으로 전달한다', () async {
     final received = <AppsFlyerAnalyticsRequest>[];
     final event = AppsFlyerAnalyticsEvent(
