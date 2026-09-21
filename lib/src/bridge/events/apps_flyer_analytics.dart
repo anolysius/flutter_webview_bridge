@@ -71,11 +71,25 @@ class AppsFlyerAnalyticsParseResult {
 }
 
 class AppsFlyerAnalyticsEvent {
-  const AppsFlyerAnalyticsEvent({this.onEvent});
+  const AppsFlyerAnalyticsEvent({this.onEvent, this.enabled = true});
+
+  final bool enabled;
 
   final AppsFlyerAnalyticsCallback? onEvent;
 
   Future<Map<String, Object?>> process(dynamic data) async {
+    // Retained for cached/older web documents: terminal no-op, never SDK delivery.
+    if (!enabled) {
+      return {
+        'type': WebViewBridgeFeatureType.appsFlyerAnalytics.value,
+        'data': {
+          'requestId': _stringField(data, 'requestId'),
+          'status': 'skipped',
+          'supported': false,
+          'reason': 'disabled',
+        },
+      };
+    }
     final parsed = parse(data);
     final request = parsed.request;
     final requestId = _stringField(data, 'requestId');
