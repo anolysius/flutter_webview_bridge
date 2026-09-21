@@ -59,6 +59,7 @@ class WebViewBridgeController {
         _apiBaseUrl != apiBaseUrl ||
         _webOrigin != webOrigin;
     _serviceCountry = normalizedCountry;
+    WebViewToken.serviceCountry = normalizedCountry;
     _apiBaseUrl = apiBaseUrl;
     _webOrigin = webOrigin;
     if (_channel != null) {
@@ -150,22 +151,30 @@ class WebViewBridgeController {
   }
 
   Future<void> runJavaScriptSetPushToken(
-    String token, {
+    String? token, {
     required bool isRefresh,
+    bool? isNotificationPermissionGranted,
+    String? permissionStatus,
+    String? tokenStatus,
   }) async {
     if (_isTerminated) return;
-
+    WebViewToken.update(
+      token: token,
+      permissionGranted: isNotificationPermissionGranted,
+      permission: permissionStatus,
+      status: tokenStatus,
+    );
+    final revision = WebViewToken.revision;
     return _executeOrQueue(
       operation: () async {
-        Map<String, Object?> sendData = {
+        // A newer state may have arrived while the web view was initializing.
+        if (revision != WebViewToken.revision) return;
+        final sendData = {
           'type': WebViewBridgeFeatureType.pushToken.value,
-          'data': {
-            'token': token,
-            'platform': Platform.isIOS ? 'ios' : 'android',
-            'isRefresh': isRefresh,
-            // APP-300 R6: 푸시 country segmentation (서버 등록 시 활용). KR 기본값.
-            'serviceCountry': _serviceCountry ?? 'KR',
-          },
+          'data': WebViewToken.payload(
+            platform: Platform.isIOS ? 'ios' : 'android',
+            isRefresh: isRefresh,
+          ),
         };
         await _channel!.runJavaScriptPostMessage(jsonEncode(sendData));
       },
@@ -215,6 +224,7 @@ class WebViewBridgeController {
       waitForNextNavigation: waitForNextNavigation,
     );
     _serviceCountry = normalizedCountry;
+    WebViewToken.serviceCountry = normalizedCountry;
     _apiBaseUrl = apiBaseUrl;
     if (webOrigin != null) _webOrigin = webOrigin;
   }
@@ -251,8 +261,13 @@ class WebViewBridgeController {
       _requestQueue.add(
         _QueuedRequest(operation: operation, completer: completer),
       );
-      await _waitForInitialization();
-      return completer.future;
+      // Observe both futures immediately: teardown may reject the queued request
+      // before initialization finishes, which must not become an unhandled error.
+      final results = await Future.wait<Object?>([
+        _waitForInitialization(),
+        completer.future,
+      ], eagerError: true);
+      return results.last as T;
     }
     return operation();
   }

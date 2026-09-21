@@ -103,6 +103,13 @@ class _BridgeMessageCompletion {
   bool deferred = false;
 }
 
+class _PendingPostMessage {
+  const _PendingPostMessage(this.jsonData, {this.pushRevision});
+
+  final String jsonData;
+  final int? pushRevision;
+}
+
 class _BufferedTransitionMessage {
   const _BufferedTransitionMessage({
     required this.message,
@@ -164,7 +171,10 @@ class FlutterWebViewBridgeJavaScriptChannel {
   bool _isDisposed = false;
   bool _pendingSsoRecovery = false;
   AppLifecycleState _appLifecycleState = AppLifecycleState.resumed;
-  final Queue<String> _pendingPostMessages = Queue<String>();
+  final Queue<_PendingPostMessage> _pendingPostMessages =
+      Queue<_PendingPostMessage>();
+  int _pushDeliveryRevision = 0;
+  Future<void> _pushDeliverySerial = Future<void>.value();
   bool _isFlushingPendingPostMessages = false;
   Future<void> _messageSerial = Future<void>.value();
   final Queue<_BufferedTransitionMessage> _bufferedTransitionMessages =
@@ -1777,6 +1787,7 @@ class FlutterWebViewBridgeJavaScriptChannel {
     // background 중 old document로 보내려다 보류된 응답도 같은 auth boundary에
     // 속한다. 국가 전환/명시적 로그아웃 뒤 resume에서 재전달되지 않게 함께 폐기한다.
     _pendingPostMessages.clear();
+    _pushDeliveryRevision += 1;
     _completeProcessAuthLease();
     _activeAuthSessionId = null;
     _activeAuthProvider = null;
@@ -4171,23 +4182,40 @@ class FlutterWebViewBridgeJavaScriptChannel {
   Future<bool> _runJavaScriptPostMessageWithReceipt(String jsonData) async {
     if (!_canTouchWebView) return false;
 
+    int? pushRevision;
+    if (_isPushTokenPostMessage(jsonData)) {
+      pushRevision = ++_pushDeliveryRevision;
+      // Lifecycle suspension needs the latest snapshot, not its history.
+      _pendingPostMessages.removeWhere((item) => item.pushRevision != null);
+    }
+    final message = _PendingPostMessage(jsonData, pushRevision: pushRevision);
     if (!_isAppResumed) {
-      _enqueuePendingPostMessage(jsonData);
+      _enqueuePendingPostMessage(message);
       return false;
     }
 
-    return _sendPostMessageNow(jsonData);
+    return _sendPendingPostMessage(message);
   }
 
   Future<void> runJavaScriptReturningResultPostMessage(String jsonData) {
     return runJavaScriptPostMessage(jsonData);
   }
 
-  void _enqueuePendingPostMessage(String jsonData) {
+  bool _isPushTokenPostMessage(String jsonData) {
+    try {
+      final message = jsonDecode(jsonData);
+      return message is Map &&
+          message['type'] == WebViewBridgeFeatureType.pushToken.value;
+    } on FormatException {
+      return false;
+    }
+  }
+
+  void _enqueuePendingPostMessage(_PendingPostMessage message) {
     if (_pendingPostMessages.length >= _maxPendingPostMessages) {
       _pendingPostMessages.removeFirst();
     }
-    _pendingPostMessages.add(jsonData);
+    _pendingPostMessages.add(message);
     debugPrint(
       '[Bridge] postMessage queued appLifecycle=${_appLifecycleState.name} '
       'queue=${_pendingPostMessages.length}',
@@ -4204,12 +4232,30 @@ class FlutterWebViewBridgeJavaScriptChannel {
     try {
       while (_pendingPostMessages.isNotEmpty &&
           _canRunLifecycleSensitiveWebViewWork) {
-        final jsonData = _pendingPostMessages.removeFirst();
-        await _sendPostMessageNow(jsonData);
+        final message = _pendingPostMessages.removeFirst();
+        await _sendPendingPostMessage(message);
       }
     } finally {
       _isFlushingPendingPostMessages = false;
     }
+  }
+
+  Future<bool> _sendPendingPostMessage(_PendingPostMessage message) {
+    final revision = message.pushRevision;
+    if (revision == null) return _sendPostMessageNow(message.jsonData);
+
+    // A delayed JS evaluation already in flight must settle before a newer
+    // push is dispatched. Check freshness again after waiting for that send.
+    final delivery = _pushDeliverySerial.then((_) async {
+      if (!_canTouchWebView || revision != _pushDeliveryRevision) return false;
+      if (!_isAppResumed) {
+        _enqueuePendingPostMessage(message);
+        return false;
+      }
+      return _sendPostMessageNow(message.jsonData);
+    });
+    _pushDeliverySerial = delivery.then<void>((_) {});
+    return delivery;
   }
 
   Future<bool> _sendPostMessageNow(String jsonData) {
