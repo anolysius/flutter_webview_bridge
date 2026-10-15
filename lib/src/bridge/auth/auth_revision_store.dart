@@ -1,12 +1,15 @@
 import 'package:shared_preferences/shared_preferences.dart';
 
+import 'service_auth_context.dart';
+
 const kAuthRevisionKey = 'flutter_webview_bridge_auth_revision_v2';
 
 String authRevisionKeyFor(String? serviceCountry) {
-  if (serviceCountry == null || serviceCountry == 'KR') {
+  final country = normalizeServiceCountry(serviceCountry);
+  if (country == 'KR') {
     return kAuthRevisionKey;
   }
-  return '${kAuthRevisionKey}__${serviceCountry.toLowerCase()}';
+  return '${kAuthRevisionKey}__${country.toLowerCase()}';
 }
 
 /// refresh-token read가 await 하는 동안 서비스 국가/인증 경계가 바뀌었는지 판별한다.

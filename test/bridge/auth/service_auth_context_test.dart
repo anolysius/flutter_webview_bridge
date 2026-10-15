@@ -5,6 +5,111 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:flutter_webview_bridge/src/bridge/auth/service_auth_context.dart';
 
 void main() {
+  test('JP is explicit and unknown country codes cannot fall back to KR', () {
+    expect(supportsJapanServiceCountry, isTrue);
+    expect(normalizeServiceCountry(null), 'KR');
+    expect(normalizeServiceCountry('JP'), 'JP');
+    expect(domainTypeForServiceCountry('JP'), 'sazo-japan-shop');
+    for (final country in ['', 'jp', 'JAPAN', 'US']) {
+      expect(() => normalizeServiceCountry(country), throwsArgumentError);
+      expect(
+        () => validateServiceAuthContextPair(
+          serviceCountry: country,
+          apiBaseUrl: null,
+        ),
+        throwsArgumentError,
+      );
+    }
+  });
+
+  test('all known service hosts reject every cross-country combination', () {
+    const origins = {
+      'KR': 'https://qa.api.sazo.kr',
+      'GLOBAL': 'https://qa.api.sazoshop.com',
+      'JP': 'https://qa2.api.sazo.shop',
+    };
+    for (final country in origins.keys) {
+      for (final entry in origins.entries) {
+        expect(
+          () => validateServiceAuthContextPair(
+            serviceCountry: country,
+            apiBaseUrl: entry.value,
+          ),
+          country == entry.key ? returnsNormally : throwsArgumentError,
+        );
+      }
+    }
+    expect(
+      () => apiBaseUrlForServiceCountry(
+        apiBaseUrl: origins['KR'],
+        serviceCountry: 'JP',
+      ),
+      throwsArgumentError,
+    );
+    expect(
+      apiBaseUrlForServiceCountry(
+        apiBaseUrl: origins['JP'],
+        serviceCountry: 'JP',
+      ),
+      origins['JP'],
+    );
+  });
+
+  test('JP transition accepts only the explicit QA2 mobile redirect', () {
+    for (final origin in ['https://qa2.sazo.shop', 'https://qa2.m.sazo.shop']) {
+      expect(
+        matchesServiceWebOrigin(
+          serviceCountry: 'JP',
+          expectedOrigin: 'https://qa2.sazo.shop',
+          actualOrigin: origin,
+        ),
+        isTrue,
+      );
+    }
+    for (final origin in [
+      null,
+      'http://qa2.m.sazo.shop',
+      'https://qa2.m.sazo.shop:8443',
+      'https://qa2.api.sazo.shop',
+      'https://m.sazo.shop',
+      'https://qa2.m.sazo.shop.attacker.example',
+    ]) {
+      expect(
+        matchesServiceWebOrigin(
+          serviceCountry: 'JP',
+          expectedOrigin: 'https://qa2.sazo.shop',
+          actualOrigin: origin,
+        ),
+        isFalse,
+      );
+    }
+    expect(
+      matchesServiceWebOrigin(
+        serviceCountry: 'KR',
+        expectedOrigin: 'https://qa2.sazo.shop',
+        actualOrigin: 'https://qa2.m.sazo.shop',
+      ),
+      isFalse,
+    );
+  });
+
+  test(
+    'JP replay cannot consume legacy, unknown or other-country sessions',
+    () {
+      for (final country in ['KR', 'GLOBAL', 'JP']) {
+        for (final cached in [null, 'KR', 'GLOBAL', 'JP', 'UNKNOWN']) {
+          expect(
+            matchesCachedServiceCountry(
+              serviceCountry: country,
+              cachedServiceCountry: cached,
+            ),
+            cached == null ? country != 'JP' : cached == country,
+          );
+        }
+      }
+    },
+  );
+
   test('web auth-context capability는 명시적 protocol version으로만 활성화된다', () {
     expect(
       supportsWebAuthContextProtocol({
@@ -875,6 +980,30 @@ void main() {
     'before_delivery',
   ];
   const directions = [
+    (
+      fromCountry: 'KR',
+      fromApi: 'https://api.sazo.kr',
+      toCountry: 'JP',
+      toApi: 'https://qa2.api.sazo.shop',
+    ),
+    (
+      fromCountry: 'GLOBAL',
+      fromApi: 'https://api.sazoshop.com',
+      toCountry: 'JP',
+      toApi: 'https://qa2.api.sazo.shop',
+    ),
+    (
+      fromCountry: 'JP',
+      fromApi: 'https://qa2.api.sazo.shop',
+      toCountry: 'KR',
+      toApi: 'https://api.sazo.kr',
+    ),
+    (
+      fromCountry: 'JP',
+      fromApi: 'https://qa2.api.sazo.shop',
+      toCountry: 'GLOBAL',
+      toApi: 'https://api.sazoshop.com',
+    ),
     (
       fromCountry: 'KR',
       fromApi: 'https://api.sazo.kr',

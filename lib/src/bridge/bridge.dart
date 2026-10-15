@@ -140,7 +140,7 @@ class FlutterWebViewBridgeJavaScriptChannel {
   String? get apiBaseUrl => _apiBaseUrl;
   final String? bridgeRevision;
 
-  /// 서비스 국가 코드 (APP-300 R5 — 'KR' / 'GLOBAL'). 미주입(null)=KR/레거시 동작.
+  /// 서비스 국가 코드 ('KR' / 'GLOBAL' / 'JP'). 미주입(null)=KR/레거시 동작.
   /// RefreshToken 키 + SSO domainType 분기에 사용. KR/null 은 현행과 byte-identical.
   ///
   /// staff 국가 전환(SERVICE_COUNTRY_CHANGE) 시 [updateServiceCountry] 로 세션 내 갱신 →
@@ -169,6 +169,13 @@ class FlutterWebViewBridgeJavaScriptChannel {
   final AuthProviderOperation? testAuthProviderOperation;
   @visibleForTesting
   final Future<void> Function()? testClearAllRefreshTokens;
+  @visibleForTesting
+  final Future<Map<String, Object?>> Function()? testDeviceInfoOperation;
+  @visibleForTesting
+  final SsoExchange Function(String apiBaseUrl, String domainType)?
+  testSsoExchangeFactory;
+  @visibleForTesting
+  final Map<String, String>? testDeviceHeaders;
   bool _isDisposed = false;
   bool _pendingSsoRecovery = false;
   AppLifecycleState _appLifecycleState = AppLifecycleState.resumed;
@@ -191,6 +198,10 @@ class FlutterWebViewBridgeJavaScriptChannel {
   final AuthContextRecoveryCoordinator _authContextRecoveryCoordinator =
       AuthContextRecoveryCoordinator();
   final AuthDocumentBoundary _authDocumentBoundary = AuthDocumentBoundary();
+  String? _webSessionImportDocumentId;
+  Map<String, Object?>? _webSessionImportOriginalRequest;
+  String? _webSessionImportDestinationPath;
+  String? _webSessionImportPostOnboardingDestinationPath;
 
   FlutterWebViewBridgeJavaScriptChannel({
     required this.context,
@@ -214,6 +225,9 @@ class FlutterWebViewBridgeJavaScriptChannel {
     int webDocumentNavigationGeneration = 0,
     this.testAuthProviderOperation,
     this.testClearAllRefreshTokens,
+    this.testDeviceInfoOperation,
+    this.testSsoExchangeFactory,
+    this.testDeviceHeaders,
   }) : _webDocumentNavigationGeneration = webDocumentNavigationGeneration,
        _apiBaseUrl = apiBaseUrl,
        _webOrigin = _canonicalHttpOrigin(webOrigin),
@@ -466,7 +480,11 @@ class FlutterWebViewBridgeJavaScriptChannel {
     }
     final expectedOrigin = _serviceContextTransitionExpectedWebOrigin;
     final actualOrigin = _canonicalHttpOrigin(documentUrl);
-    if (expectedOrigin == null || actualOrigin != expectedOrigin) {
+    if (!matchesServiceWebOrigin(
+      serviceCountry: _serviceAuthContext.serviceCountry,
+      expectedOrigin: expectedOrigin,
+      actualOrigin: actualOrigin,
+    )) {
       _emitAuthTrace(
         'auth.context.transition_navigation_rejected',
         resultCode: 'origin_mismatch',
@@ -1366,6 +1384,9 @@ class FlutterWebViewBridgeJavaScriptChannel {
     final hadPayload = _cachedSessionPayload != null;
     _cachedSessionPayload = null;
     _cachedSessionAt = null;
+    _webSessionImportOriginalRequest = null;
+    _webSessionImportDestinationPath = null;
+    _webSessionImportPostOnboardingDestinationPath = null;
     if (hadPayload) {
       // ignore: avoid_print
       print('[SsoExchange] session replay clear ($reason)');
@@ -2060,6 +2081,353 @@ class FlutterWebViewBridgeJavaScriptChannel {
   }
   // ───────────────────────────────────────────────────────────────────────────
 
+  // Web member authentication imports only server-issued JP DB sessions. Passwords
+  // never cross this boundary, and token-bearing maps must not reach trace/error helpers.
+  Map<String, Object?> _webSessionImportMetadata(dynamic data) => {
+    if (data is Map)
+      for (final key in const [
+        'protocolVersion',
+        'maxProtocolVersion',
+        'authCapabilities',
+        'authSessionId',
+        'requestId',
+        'documentId',
+        'authRevision',
+        'serviceContextGeneration',
+        'navigationGeneration',
+        'serviceCountry',
+        'domainType',
+        'provider',
+        'returnTo',
+      ])
+        if (data.containsKey(key)) key: data[key],
+  };
+
+  String? _nonEmptyImportString(dynamic data, String key) {
+    final value = data is Map ? data[key] : null;
+    return value is String && value.isNotEmpty ? value : null;
+  }
+
+  ({String provider, String userId})? _webSessionTokenClaims(String token) {
+    try {
+      final parts = token.split('.');
+      if (parts.length != 3) return null;
+      final payload = jsonDecode(
+        utf8.decode(base64Url.decode(base64Url.normalize(parts[1]))),
+      );
+      final provider = payload is Map ? payload['provider'] : null;
+      final userId = payload is Map ? payload['user_id'] : null;
+      if (provider is! Map ||
+          provider['provider'] is! String ||
+          userId is! String ||
+          userId.trim().isEmpty) {
+        return null;
+      }
+      return (provider: provider['provider'] as String, userId: userId);
+    } on FormatException {
+      return null;
+    }
+  }
+
+  String _authCommitPath(String value) {
+    final path = Uri.tryParse(value)?.path ?? '';
+    final stripped = path.replaceFirst(RegExp(r'^/(ko|ja|en)(?=/|$)'), '');
+    return stripped.isEmpty ? '/' : stripped;
+  }
+
+  String? _validatedImportDestination(String? value) {
+    if (value == null || value.startsWith('//')) return null;
+    final uri = Uri.tryParse(value);
+    if (uri == null ||
+        uri.userInfo.isNotEmpty ||
+        uri.path.contains('..') ||
+        (uri.hasAuthority && !uri.hasScheme)) {
+      return null;
+    }
+    final path = _authCommitPath(value);
+    if ((path == '/auth' || path.startsWith('/auth/')) &&
+        path != '/auth/signup') {
+      return null;
+    }
+    if (!uri.hasScheme) {
+      return value.startsWith('/') ? path : null;
+    }
+    final origin = _canonicalHttpOrigin(value);
+    if (!matchesServiceWebOrigin(
+      serviceCountry: 'JP',
+      expectedOrigin: _webOrigin,
+      actualOrigin: origin,
+    )) {
+      return null;
+    }
+    return _authCommitPath(value);
+  }
+
+  bool _matchesAuthCommitDestination(String? value, {required bool native}) {
+    if (_activeAuthRequestType !=
+            WebViewBridgeFeatureType.authWebSessionImport ||
+        _webSessionImportDestinationPath == null) {
+      return _isHomePath(value);
+    }
+    if (value == null) return false;
+    if (native &&
+        !matchesServiceWebOrigin(
+          serviceCountry: 'JP',
+          expectedOrigin: _webOrigin,
+          actualOrigin: _canonicalHttpOrigin(value),
+        )) {
+      return false;
+    }
+    if (_webSessionImportDestinationPath == '/auth/signup' &&
+        _activeAuthJourney == 'signup_onboarding') {
+      return _authCommitPath(value) ==
+          (_webSessionImportPostOnboardingDestinationPath ?? '/');
+    }
+    return _authCommitPath(value) == _webSessionImportDestinationPath;
+  }
+
+  bool _canReplayWebSessionImport(dynamic data) {
+    final original = _webSessionImportOriginalRequest;
+    final payload = _cachedSessionPayload;
+    final at = _cachedSessionAt;
+    if (data is! Map ||
+        original == null ||
+        payload == null ||
+        at == null ||
+        DateTime.now().difference(at) > _sessionReplayTtl) {
+      return false;
+    }
+    for (final key in const [
+      'authSessionId',
+      'requestId',
+      'documentId',
+      'authRevision',
+      'serviceContextGeneration',
+      'navigationGeneration',
+      'returnTo',
+      'provider',
+      'serviceCountry',
+      'domainType',
+    ]) {
+      if (data[key] != original[key]) return false;
+    }
+    final tokens = payload['data'];
+    return tokens is Map &&
+        data['accessToken'] == tokens['accessToken'] &&
+        data['refreshToken'] == tokens['refreshToken'] &&
+        tokens['authRevision'] == _activeAuthRevision &&
+        data['serviceContextGeneration'] == _serviceAuthContext.generation &&
+        data['navigationGeneration'] == _webDocumentNavigationGeneration;
+  }
+
+  Future<void> _rejectWebSessionImport(
+    dynamic data,
+    String failureCode, {
+    int? revision,
+    bool ownsAttempt = false,
+  }) async {
+    final metadata = _webSessionImportMetadata(data);
+    final safeData = <String, Object?>{
+      ...metadata,
+      'protocolVersion': 3,
+      if (revision != null) 'authRevision': revision,
+      'code': 'WEB_SESSION_IMPORT_FAILED',
+      'failureStage': 'web_session_import',
+      'failureCode': failureCode,
+      'message': '',
+    };
+    // Never terminate an unrelated active attempt for a stale/invalid import.
+    if (ownsAttempt) {
+      _emitAuthTerminal('code_failure:web_session_import', data: safeData);
+      _invalidateAuthTransaction('web_session_import_failed');
+    }
+    await runJavaScriptPostMessage(
+      jsonEncode({'type': 'AUTH_ERROR', 'data': safeData}),
+    );
+  }
+
+  Future<void> _handleWebSessionImport(
+    dynamic data, {
+    required int receivedNavigationGeneration,
+    required int receivedServiceContextGeneration,
+  }) async {
+    if (_isDisposed) return;
+    final metadata = _webSessionImportMetadata(data);
+    final accessToken = _nonEmptyImportString(data, 'accessToken');
+    final refreshToken = _nonEmptyImportString(data, 'refreshToken');
+    final destination = _validatedImportDestination(
+      _nonEmptyImportString(data, 'returnTo'),
+    );
+    final onboardingRedirect = destination == '/auth/signup'
+        ? Uri.tryParse(
+                _nonEmptyImportString(data, 'returnTo') ?? '',
+              )?.queryParameters['redirect'] ??
+              '/'
+        : null;
+    final postOnboardingDestination = onboardingRedirect == null
+        ? null
+        : _validatedImportDestination(onboardingRedirect);
+    if (data is! Map ||
+        (onboardingRedirect != null &&
+            (postOnboardingDestination == null ||
+                postOnboardingDestination.startsWith('/auth'))) ||
+        accessToken == null ||
+        refreshToken == null ||
+        destination == null ||
+        [
+          'authSessionId',
+          'requestId',
+          'documentId',
+        ].any((key) => _nonEmptyImportString(data, key) == null) ||
+        data['authRevision'] is! int ||
+        data['serviceContextGeneration'] is! int ||
+        data['navigationGeneration'] is! int ||
+        !negotiateAuthProtocolCapabilities(data).containsAll({
+          webSessionImportCapability,
+          criticalAuthDeliveryAckCapability,
+        })) {
+      await _rejectWebSessionImport(metadata, 'WEB_SESSION_IMPORT_INVALID');
+      return;
+    }
+    final accessClaims = _webSessionTokenClaims(accessToken);
+    final refreshClaims = _webSessionTokenClaims(refreshToken);
+    if (_serviceAuthContext.serviceCountry != 'JP' ||
+        data['serviceCountry'] != 'JP' ||
+        data['domainType'] != 'sazo-japan-shop' ||
+        data['provider'] != 'JAPAN_DB' ||
+        accessClaims?.provider != 'JAPAN_DB' ||
+        refreshClaims?.provider != 'JAPAN_DB' ||
+        accessClaims?.userId != refreshClaims?.userId) {
+      await _rejectWebSessionImport(
+        metadata,
+        'WEB_SESSION_IMPORT_PROVIDER_MISMATCH',
+      );
+      return;
+    }
+    bool isCurrentDocument() =>
+        !_isDisposed &&
+        !_serviceContextTransitionInProgress &&
+        receivedNavigationGeneration == _webDocumentNavigationGeneration &&
+        data['navigationGeneration'] == _webDocumentNavigationGeneration &&
+        receivedServiceContextGeneration == _serviceAuthContext.generation &&
+        data['serviceContextGeneration'] == _serviceAuthContext.generation &&
+        data['documentId'] == _webSessionImportDocumentId &&
+        !_isInvalidatedAuthDocumentMessage(data);
+    if (!isCurrentDocument()) {
+      await _rejectWebSessionImport(metadata, 'WEB_SESSION_IMPORT_STALE');
+      return;
+    }
+    if (_canReplayWebSessionImport(data)) {
+      await _sendAuthAttemptStartedAck();
+      await runJavaScriptPostMessage(jsonEncode(_cachedSessionPayload));
+      return;
+    }
+    final requestSnapshot = _serviceAuthContext;
+    int? epoch;
+    AuthContextWorkFence? importFence;
+    var storageAttempted = false;
+    try {
+      final currentRevision = await const AuthRevisionStore().current(
+        serviceCountry: 'JP',
+      );
+      if (!isCurrentDocument() ||
+          !requestSnapshot.matches(_serviceAuthContext) ||
+          data['authRevision'] != currentRevision) {
+        await _rejectWebSessionImport(metadata, 'WEB_SESSION_IMPORT_STALE');
+        return;
+      }
+      _authContextRecoveryCoordinator.beginExplicitAuthAttempt();
+      epoch = await _beginAuthTransaction(
+        WebViewBridgeFeatureType.authWebSessionImport,
+        metadata,
+        receivedNavigationGeneration,
+      );
+      if (!isCurrentDocument() ||
+          !_isCurrentAuthTransaction(epoch, metadata) ||
+          !context.mounted) {
+        return;
+      }
+      final fence = _authContextWorkFence(_captureAuthWorkContext(), metadata);
+      importFence = fence;
+      storageAttempted = true;
+      final persisted = await RefreshTokenEvent().process(
+        context,
+        action: 'write',
+        data: refreshToken,
+        serviceCountry: 'JP',
+        authRevision: _activeAuthRevision,
+        canMutate: () => fence.canMutate && isCurrentDocument(),
+      );
+      if (!fence.checkpoint('web_import:after_persist') ||
+          !isCurrentDocument() ||
+          !context.mounted) {
+        return;
+      }
+      if (persisted['error'] != null) {
+        // SharedPreferences may update its memory cache before a platform write
+        // reports failure. Never leave that unconfirmed session available to read.
+        await RefreshTokenEvent().process(
+          context,
+          action: 'delete',
+          serviceCountry: 'JP',
+          canMutate: () => fence.canMutate && isCurrentDocument(),
+        );
+        if (!fence.checkpoint('web_import:after_failed_persist_cleanup')) {
+          return;
+        }
+        await _rejectWebSessionImport(
+          metadata,
+          'WEB_SESSION_IMPORT_PERSIST_FAILED',
+          revision: _activeAuthRevision,
+          ownsAttempt: true,
+        );
+        return;
+      }
+      final response = <String, Object?>{
+        'type': 'AUTH_TOKENS_READY',
+        'data': {
+          ..._activeAuthProtocolData(),
+          'provider': 'JAPAN_DB',
+          'serviceCountry': 'JP',
+          'domainType': 'sazo-japan-shop',
+          'accessToken': accessToken,
+          'refreshToken': refreshToken,
+          'returnTo': data['returnTo'],
+        },
+      };
+      _cachedSessionPayload = response;
+      _cachedSessionAt = DateTime.now();
+      _webSessionImportOriginalRequest = metadata;
+      _webSessionImportDestinationPath = destination;
+      _webSessionImportPostOnboardingDestinationPath =
+          postOnboardingDestination;
+      _markProviderCompleted(metadata);
+      _authAttemptPhase.completeProviderInteraction();
+      _startAttemptTerminalDeadline();
+      // Existing refresh replay and critical result retry recover dropped delivery.
+      await runJavaScriptPostMessage(jsonEncode(response));
+    } catch (error) {
+      if (error is _AuthOperationAborted) return;
+      final ownsAttempt =
+          epoch != null && _isCurrentAuthTransaction(epoch, metadata);
+      if (storageAttempted && ownsAttempt && context.mounted) {
+        await RefreshTokenEvent().process(
+          context,
+          action: 'delete',
+          serviceCountry: 'JP',
+          canMutate: () =>
+              importFence?.canMutate == true && isCurrentDocument(),
+        );
+      }
+      await _rejectWebSessionImport(
+        metadata,
+        'WEB_SESSION_IMPORT_PERSIST_FAILED',
+        revision: ownsAttempt ? _activeAuthRevision : null,
+        ownsAttempt: ownsAttempt,
+      );
+    }
+  }
+
   Future<void> onMessageReceived(JavaScriptMessage message) async {
     // JavaScriptChannel callbacks can wait behind a long-running provider
     // operation. Capture the navigation at receipt time so an old document's
@@ -2115,12 +2483,18 @@ class FlutterWebViewBridgeJavaScriptChannel {
     if (type is! String || data is! Map) return false;
     final featureType = type.webViewBridgeFeatureType;
     if (featureType == null ||
-        !_isSsoLogin(featureType) ||
+        (!_isSsoLogin(featureType) &&
+            featureType != WebViewBridgeFeatureType.authWebSessionImport) ||
         !supportsCriticalAuthDeliveryAck(data)) {
       return false;
     }
 
     if (!_matchesActiveCriticalAuthRequest(featureType, data)) return false;
+    if (featureType == WebViewBridgeFeatureType.authWebSessionImport &&
+        _webSessionImportOriginalRequest != null &&
+        !_canReplayWebSessionImport(data)) {
+      return false;
+    }
 
     _emitAuthTrace(
       'auth.attempt.duplicate_ack_replayed',
@@ -2128,6 +2502,10 @@ class FlutterWebViewBridgeJavaScriptChannel {
       data: data,
     );
     await _sendAuthAttemptStartedAck();
+    if (featureType == WebViewBridgeFeatureType.authWebSessionImport &&
+        _canReplayWebSessionImport(data)) {
+      await runJavaScriptPostMessage(jsonEncode(_cachedSessionPayload));
+    }
     _emitAuthTrace(
       'auth.attempt.duplicate_ignored',
       resultCode: 'duplicate_in_flight',
@@ -2272,6 +2650,15 @@ class FlutterWebViewBridgeJavaScriptChannel {
     if (type != null) {
       final webViewBridgeFeatureType = type.webViewBridgeFeatureType;
       if (webViewBridgeFeatureType != null) {
+        if (webViewBridgeFeatureType ==
+            WebViewBridgeFeatureType.authWebSessionImport) {
+          await _handleWebSessionImport(
+            data,
+            receivedNavigationGeneration: receivedNavigationGeneration,
+            receivedServiceContextGeneration: receivedServiceContextGeneration,
+          );
+          return;
+        }
         final isNavigationScopedControlMessage =
             webViewBridgeFeatureType == WebViewBridgeFeatureType.deviceInfo ||
             webViewBridgeFeatureType ==
@@ -2506,7 +2893,9 @@ class FlutterWebViewBridgeJavaScriptChannel {
                 documentId: _stringFieldOf(data, 'documentId'),
                 navigationGeneration: receivedNavigationGeneration,
               );
-              sendData = await DeviceInfoEvent().process(context);
+              sendData =
+                  await (testDeviceInfoOperation?.call() ??
+                      DeviceInfoEvent().process(context));
               final responseData = sendData['data'];
               if (responseData is Map) {
                 responseData['bridgeRevision'] = bridgeRevision ?? 'unknown';
@@ -2514,6 +2903,33 @@ class FlutterWebViewBridgeJavaScriptChannel {
                     appsFlyerAnalyticsEnabled;
                 responseData['airbridgeAnalyticsV1'] = true;
                 responseData.addAll(authProtocolCapabilityResponse(data));
+                if (negotiateAuthProtocolCapabilities(
+                  data,
+                ).contains(webSessionImportCapability)) {
+                  final snapshot = _serviceAuthContext;
+                  final revision = await const AuthRevisionStore().current(
+                    serviceCountry: snapshot.serviceCountry,
+                  );
+                  if (!snapshot.matches(_serviceAuthContext) ||
+                      receivedNavigationGeneration !=
+                          _webDocumentNavigationGeneration) {
+                    return;
+                  }
+                  _webSessionImportDocumentId = _stringFieldOf(
+                    data,
+                    'documentId',
+                  );
+                  responseData.addAll(<String, Object?>{
+                    'authRevision': revision,
+                    'documentId': _webSessionImportDocumentId,
+                    if (data is Map && data['requestId'] is String)
+                      'requestId': data['requestId'],
+                    'serviceCountry': snapshot.serviceCountry,
+                    'domainType': snapshot.domainType,
+                    'serviceContextGeneration': snapshot.generation,
+                    'navigationGeneration': receivedNavigationGeneration,
+                  });
+                }
               }
               break;
             case WebViewBridgeFeatureType.cameraAccess:
@@ -2834,6 +3250,7 @@ class FlutterWebViewBridgeJavaScriptChannel {
                       data: adaptRefreshTokenRequestForStorage(data),
                       serviceCountry: country,
                       authRevision: _activeAuthRevision,
+                      canMutate: () => deleteFence.canMutate,
                     ),
                   );
               if (deleteResponse == null) return;
@@ -2999,6 +3416,9 @@ class FlutterWebViewBridgeJavaScriptChannel {
               return;
             case WebViewBridgeFeatureType.authAttemptStarted:
               // native → web acknowledgement only.
+              return;
+            case WebViewBridgeFeatureType.authWebSessionImport:
+              // Handled before the legacy bridge dispatch above.
               return;
           }
         } catch (e) {
@@ -3312,6 +3732,7 @@ class FlutterWebViewBridgeJavaScriptChannel {
 
   Future<void> _revokeNativeSsoSessions(dynamic data) async {
     if (!_shouldRevokeNativeSso(data)) return;
+    if (_providerOfRequest(data)?.trim().toUpperCase() == 'JAPAN_DB') return;
 
     final provider = _normalizedProviderOf(data);
     final providers = provider == null
@@ -3437,8 +3858,11 @@ class FlutterWebViewBridgeJavaScriptChannel {
         // bridge의 local active attempt는 비어 있거나 이전 document 값일 수 있다.
         activeAuthSessionId: workSnapshot.attemptId,
         activeAuthRevision: _activeAuthRevision,
-        nativeIsHome: _isHomePath(currentUrl),
-        webIsHome: _isHomePath(_stringFieldOf(data, 'pathname')),
+        nativeIsHome: _matchesAuthCommitDestination(currentUrl, native: true),
+        webIsHome: _matchesAuthCommitDestination(
+          _stringFieldOf(data, 'pathname'),
+          native: false,
+        ),
       );
       if (!decision.isAccepted) {
         _emitAuthTrace(
@@ -3585,8 +4009,19 @@ class FlutterWebViewBridgeJavaScriptChannel {
         activeRequestId: _activeRequestId,
         activeAuthSessionId: _activeAuthSessionId,
         activeAuthRevision: _activeAuthRevision,
-        nativeRouteMatches: _isSignupPath(currentUrl),
-        webRouteMatches: _isSignupPath(_stringFieldOf(data, 'pathname')),
+        nativeRouteMatches:
+            _isSignupPath(currentUrl) &&
+            (_activeAuthRequestType !=
+                    WebViewBridgeFeatureType.authWebSessionImport ||
+                _matchesAuthCommitDestination(currentUrl, native: true)),
+        webRouteMatches:
+            _isSignupPath(_stringFieldOf(data, 'pathname')) &&
+            (_activeAuthRequestType !=
+                    WebViewBridgeFeatureType.authWebSessionImport ||
+                _matchesAuthCommitDestination(
+                  _stringFieldOf(data, 'pathname'),
+                  native: false,
+                )),
       );
       if (!decision.isAccepted) {
         _emitAuthTrace(
@@ -3762,6 +4197,7 @@ class FlutterWebViewBridgeJavaScriptChannel {
   }
 
   Future<Map<String, String>> _deviceHeaders() async {
+    if (testDeviceHeaders != null) return testDeviceHeaders!;
     final info = await WebViewDeviceInfo.fromData();
     return {
       if (info?.bundleId != null) 'x-sazo-app-id': info!.bundleId!,
@@ -3787,10 +4223,15 @@ class FlutterWebViewBridgeJavaScriptChannel {
     final workFence = _authContextWorkFence(authContext, requestData);
 
     try {
-      final sso = SsoExchange(
-        apiBaseUrl: snapshotApiBaseUrl,
-        domainType: authContext.service.domainType,
-      );
+      final sso =
+          testSsoExchangeFactory?.call(
+            snapshotApiBaseUrl,
+            authContext.service.domainType,
+          ) ??
+          SsoExchange(
+            apiBaseUrl: snapshotApiBaseUrl,
+            domainType: authContext.service.domainType,
+          );
       final deviceHeaders = await _deviceHeaders();
       if (!workFence.checkpoint('refresh:after_device_headers')) return null;
       final result = await sso.refreshToAccess(
@@ -3857,11 +4298,15 @@ class FlutterWebViewBridgeJavaScriptChannel {
       final semanticReason = error is SsoExchangeException
           ? error.semanticReason
           : null;
-      if (statusCode != null &&
-          statusCode >= 400 &&
-          statusCode < 500 &&
-          statusCode != 408 &&
-          statusCode != 429 &&
+      final mismatchedService =
+          error is SsoExchangeException &&
+          error.failureCode == 'SSO_SERVICE_COUNTRY_MISMATCH';
+      if ((mismatchedService ||
+              (statusCode != null &&
+                  statusCode >= 400 &&
+                  statusCode < 500 &&
+                  statusCode != 408 &&
+                  statusCode != 429)) &&
           context.mounted) {
         await RefreshTokenEvent().process(
           context,
@@ -3949,7 +4394,7 @@ class FlutterWebViewBridgeJavaScriptChannel {
     if (snapshotApiBaseUrl == null) return sendData;
     final workFence = _authContextWorkFence(authContext, requestData);
     try {
-      // domainType: KR(또는 null)=sazo-korea-shop(현행) / GLOBAL=sazo-global-shop
+      // Snapshot country owns the KR/GLOBAL/JP domain type and SSO endpoint.
       // (웹 배포 계약 09-env-runtime 확인값). KR 경로 byte-identical.
       final sso = SsoExchange(
         apiBaseUrl: snapshotApiBaseUrl,
@@ -4103,9 +4548,10 @@ class FlutterWebViewBridgeJavaScriptChannel {
     final cachedServiceCountry = cachedData is Map
         ? cachedData['serviceCountry'] as String?
         : null;
-    if (cachedServiceCountry != null &&
-        normalizeServiceCountry(cachedServiceCountry) !=
-            _serviceAuthContext.serviceCountry) {
+    if (!matchesCachedServiceCountry(
+      serviceCountry: _serviceAuthContext.serviceCountry,
+      cachedServiceCountry: cachedServiceCountry,
+    )) {
       _cachedSessionPayload = null;
       _cachedSessionAt = null;
       _emitAuthTrace(

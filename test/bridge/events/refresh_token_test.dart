@@ -39,6 +39,64 @@ void main() {
       return c;
     }
 
+    testWidgets(
+      'JP write/read/delete is isolated from legacy and global tokens',
+      (tester) async {
+        SharedPreferences.setMockInitialValues({
+          refreshTokenKeyFor('KR'): 'kr',
+          refreshTokenKeyFor('GLOBAL'): 'global',
+        });
+        ctx = await pumpCtx(tester);
+        expect(
+          refreshTokenKeyFor('JP'),
+          'flutter_webview_bridge_refresh_token__jp',
+        );
+        await RefreshTokenEvent().process(
+          ctx,
+          action: 'write',
+          data: 'jp',
+          serviceCountry: 'JP',
+        );
+        final read = await RefreshTokenEvent().process(
+          ctx,
+          action: 'read',
+          serviceCountry: 'JP',
+        );
+        expect(read['data'], 'jp');
+        await RefreshTokenEvent().process(
+          ctx,
+          action: 'delete',
+          serviceCountry: 'JP',
+        );
+        final prefs = await SharedPreferences.getInstance();
+        expect(prefs.getString(refreshTokenKeyFor('JP')), isNull);
+        expect(prefs.getString(refreshTokenKeyFor('KR')), 'kr');
+        expect(prefs.getString(refreshTokenKeyFor('GLOBAL')), 'global');
+      },
+    );
+
+    testWidgets('stale JP failure cleanup cannot delete a newer session', (
+      tester,
+    ) async {
+      SharedPreferences.setMockInitialValues({
+        refreshTokenKeyFor('JP'): 'new-session',
+      });
+      ctx = await pumpCtx(tester);
+      final result = await RefreshTokenEvent().process(
+        ctx,
+        action: 'delete',
+        serviceCountry: 'JP',
+        canMutate: () => false,
+      );
+      expect(result['error'], 'STALE_AUTH_CONTEXT');
+      expect(
+        (await SharedPreferences.getInstance()).getString(
+          refreshTokenKeyFor('JP'),
+        ),
+        'new-session',
+      );
+    });
+
     testWidgets('KR write 는 레거시 키에 저장 (기존과 동일 위치)', (tester) async {
       SharedPreferences.setMockInitialValues({});
       ctx = await pumpCtx(tester);
@@ -212,15 +270,17 @@ void main() {
   });
 
   group('clearAllRefreshTokens — staff 국가 전환 = 완전 로그아웃', () {
-    test('양쪽 키(KR 레거시 + GLOBAL) 모두 삭제', () async {
+    test('KR 레거시 + GLOBAL + JP 모두 삭제', () async {
       SharedPreferences.setMockInitialValues({
         'flutter_webview_bridge_refresh_token': 'kr-token',
         'flutter_webview_bridge_refresh_token__global': 'global-token',
+        refreshTokenKeyFor('JP'): 'jp-token',
       });
 
       await clearAllRefreshTokens();
 
       final prefs = await SharedPreferences.getInstance();
+      expect(prefs.getString(refreshTokenKeyFor('JP')), isNull);
       expect(prefs.getString('flutter_webview_bridge_refresh_token'), isNull);
       expect(
         prefs.getString('flutter_webview_bridge_refresh_token__global'),
@@ -271,12 +331,19 @@ void main() {
         data: 'late-global-token',
         serviceCountry: 'GLOBAL',
       );
+      final jpWrite = RefreshTokenEvent().process(
+        context,
+        action: 'write',
+        data: 'late-jp-token',
+        serviceCountry: 'JP',
+      );
       final clear = clearAllRefreshTokens();
 
-      await Future.wait([krWrite, globalWrite, clear]);
+      await Future.wait([krWrite, globalWrite, jpWrite, clear]);
       final prefs = await SharedPreferences.getInstance();
       expect(prefs.getString(refreshTokenKeyFor('KR')), isNull);
       expect(prefs.getString(refreshTokenKeyFor('GLOBAL')), isNull);
+      expect(prefs.getString(refreshTokenKeyFor('JP')), isNull);
     });
 
     testWidgets('clear 뒤 queue에 들어온 stale write는 canMutate guard로 폐기한다', (

@@ -69,15 +69,37 @@ void main() {
       ],
     };
 
-    expect(
-      negotiateAuthProtocolCapabilities(newWeb),
-      authProtocolV3Capabilities,
-    );
+    expect(negotiateAuthProtocolCapabilities(newWeb), {
+      ...requiredAuthProtocolV3Capabilities,
+      criticalAuthDeliveryAckCapability,
+    });
     expect(supportsCriticalAuthDeliveryAck(newWeb), isTrue);
     expect(authProtocolCapabilityResponse(newWeb), {
       'authProtocolVersion': 3,
-      'authCapabilities': authProtocolV3Capabilities.toList(growable: false),
+      'authCapabilities': [
+        ...requiredAuthProtocolV3Capabilities,
+        criticalAuthDeliveryAckCapability,
+      ],
     });
+  });
+
+  test('web session import is additive and explicitly negotiated', () {
+    final offer = {
+      'protocolVersion': 3,
+      'authCapabilities': authProtocolV3Capabilities.toList(),
+    };
+    expect(
+      negotiateAuthProtocolCapabilities(offer),
+      contains(webSessionImportCapability),
+    );
+    expect(
+      authProtocolCapabilityResponse(offer)['authCapabilities'],
+      contains(webSessionImportCapability),
+    );
+    expect(
+      negotiateAuthProtocolCapabilities({'protocolVersion': 2}),
+      isNot(contains(webSessionImportCapability)),
+    );
   });
 
   test('legacy DEVICE_INFO without auth offer gets no additive response', () {
