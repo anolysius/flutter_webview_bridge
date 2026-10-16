@@ -18,6 +18,22 @@ void main() {
     expect(await const AuthRevisionStore().current(serviceCountry: 'KR'), 1);
   });
 
+  test(
+    'JP revision survives store recreation without touching KR/GLOBAL',
+    () async {
+      expect(await const AuthRevisionStore().next(serviceCountry: 'JP'), 1);
+      expect(await const AuthRevisionStore().next(serviceCountry: 'JP'), 2);
+      expect(await const AuthRevisionStore().current(serviceCountry: 'JP'), 2);
+      expect(await const AuthRevisionStore().current(serviceCountry: 'KR'), 0);
+      expect(
+        await const AuthRevisionStore().current(serviceCountry: 'GLOBAL'),
+        0,
+      );
+      expect(authRevisionKeyFor(null), authRevisionKeyFor('KR'));
+      expect(() => authRevisionKeyFor('UNKNOWN'), throwsArgumentError);
+    },
+  );
+
   test('여러 bridge의 동시 next 요청도 중복 없이 단조 증가한다', () async {
     final revisions = await Future.wait(
       List.generate(

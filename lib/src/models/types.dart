@@ -34,6 +34,7 @@ enum WebViewBridgeFeatureType {
   authReauthCommitted,
   authReauthRequired,
   authAttemptStarted,
+  authWebSessionImport,
   authContextStatus,
   authContextStatusAck,
   authContextMismatchClearAndRestart,
@@ -114,6 +115,8 @@ extension WebViewBridgeFeatureTypeValue on WebViewBridgeFeatureType {
         return 'AUTH_REAUTH_REQUIRED';
       case WebViewBridgeFeatureType.authAttemptStarted:
         return 'AUTH_ATTEMPT_STARTED';
+      case WebViewBridgeFeatureType.authWebSessionImport:
+        return 'AUTH_WEB_SESSION_IMPORT';
       case WebViewBridgeFeatureType.authContextStatus:
         return 'AUTH_CONTEXT_STATUS';
       case WebViewBridgeFeatureType.authContextStatusAck:
@@ -201,6 +204,8 @@ extension WebViewBridgeFeatureTypeString on String {
         return WebViewBridgeFeatureType.authReauthRequired;
       case 'AUTH_ATTEMPT_STARTED':
         return WebViewBridgeFeatureType.authAttemptStarted;
+      case 'AUTH_WEB_SESSION_IMPORT':
+        return WebViewBridgeFeatureType.authWebSessionImport;
       case 'AUTH_CONTEXT_STATUS':
         return WebViewBridgeFeatureType.authContextStatus;
       case 'AUTH_CONTEXT_STATUS_ACK':

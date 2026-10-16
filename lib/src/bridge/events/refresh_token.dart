@@ -4,6 +4,7 @@ import 'package:flutter/material.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 import '../../models/types.dart';
+import '../auth/service_auth_context.dart';
 
 const kRefreshTokenKey = 'flutter_webview_bridge_refresh_token';
 
@@ -30,26 +31,25 @@ Future<T> _serializeRefreshTokenMutation<T>(
 /// 서비스 국가별 RefreshToken 저장 키 (APP-300 R5 — 도메인별 세션 격리).
 ///
 /// ⚠️ **KR / null 은 레거시 키 그대로** — 기존 KR 사용자의 저장된 토큰을 보존해
-/// 업그레이드 시 자동로그인이 깨지지 않게 한다(회귀 0). 그 외(GLOBAL)는 접미사 키.
+/// 업그레이드 시 자동로그인이 깨지지 않게 한다(회귀 0). GLOBAL/JP는 접미사 키.
 String refreshTokenKeyFor(String? serviceCountry) {
-  if (serviceCountry == null || serviceCountry == 'KR') {
+  final country = normalizeServiceCountry(serviceCountry);
+  if (country == 'KR') {
     return kRefreshTokenKey;
   }
-  return '${kRefreshTokenKey}__${serviceCountry.toLowerCase()}';
+  return '${kRefreshTokenKey}__${country.toLowerCase()}';
 }
 
 /// 모든 서비스 국가의 RefreshToken 을 일괄 삭제한다.
 ///
-/// 서비스 국가 전환(staff)은 "완전 로그아웃" 의미이므로 KR 레거시 키와 GLOBAL(`__global`)
-/// 키를 **둘 다** 제거한다 — 전환 후 어느 도메인도 자동로그인되지 않도록. 단일 키만 지우는
+/// 서비스 국가 전환(staff)은 "완전 로그아웃" 의미이므로 KR/GLOBAL/JP 키를
+/// 모두 제거한다 — 전환 후 어느 도메인도 자동로그인되지 않도록. 단일 키만 지우는
 /// 기존 `RefreshTokenEvent(action: 'delete')`(웹 메시지 기반) 와 달리 네이티브가 직접 호출한다.
 Future<void> clearAllRefreshTokens() async {
   await _serializeRefreshTokenMutation(() async {
     final SharedPreferences prefs = await SharedPreferences.getInstance();
-    for (final key in [
-      refreshTokenKeyFor('KR'),
-      refreshTokenKeyFor('GLOBAL'),
-    ]) {
+    for (final country in supportedServiceCountries) {
+      final key = refreshTokenKeyFor(country);
       await prefs.remove(key);
       if (prefs.getString(key) != null) {
         // transient platform write failure를 한 번 더 회수한다.
@@ -158,6 +158,10 @@ class RefreshTokenEvent {
       }
     } else if (action == 'delete') {
       sendData['type'] = WebViewBridgeFeatureType.refreshTokenDelete.value;
+      if (canMutate != null && !canMutate()) {
+        sendData['error'] = 'STALE_AUTH_CONTEXT';
+        return sendData;
+      }
 
       // Delete the stored refresh token
       final r = await prefs.remove(storageKey);

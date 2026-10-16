@@ -63,6 +63,39 @@ void main() {
     expect(recovered?.authRevision, 8);
   });
 
+  test(
+    'JP interrupted attempt is isolated and consumed once after restart',
+    () async {
+      await store.markStarted(
+        attempt: attempt(id: 'jp-attempt'),
+        serviceCountry: 'JP',
+      );
+      for (final country in ['KR', 'GLOBAL']) {
+        expect(
+          await store.takeInterrupted(
+            currentProcessInstanceId: 'process-b',
+            serviceCountry: country,
+          ),
+          isNull,
+        );
+      }
+      expect(
+        (await const PendingAuthAttemptStore().takeInterrupted(
+          currentProcessInstanceId: 'process-b',
+          serviceCountry: 'JP',
+        ))?.attemptId,
+        'jp-attempt',
+      );
+      expect(
+        await store.takeInterrupted(
+          currentProcessInstanceId: 'process-c',
+          serviceCountry: 'JP',
+        ),
+        isNull,
+      );
+    },
+  );
+
   test('국가별 pending attempt는 서로 격리한다', () async {
     await store.markStarted(attempt: attempt(), serviceCountry: 'KR');
     await store.markStarted(

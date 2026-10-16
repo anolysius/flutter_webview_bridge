@@ -91,6 +91,24 @@ void main() {
     );
   });
 
+  test('JP success marker cannot acknowledge a KR/GLOBAL attempt', () async {
+    await const AuthTerminalStore().markSuccess(
+      authSessionId: 'same-attempt',
+      authRevision: 5,
+      serviceCountry: 'JP',
+    );
+    for (final country in ['KR', 'GLOBAL', 'JP']) {
+      expect(
+        await const AuthTerminalStore().matchesSuccess(
+          authSessionId: 'same-attempt',
+          authRevision: 5,
+          serviceCountry: country,
+        ),
+        country == 'JP',
+      );
+    }
+  });
+
   test('terminal key는 attempt와 revision을 함께 사용한다', () {
     expect(
       authTerminalKey(authSessionId: 'attempt-1', authRevision: 5),

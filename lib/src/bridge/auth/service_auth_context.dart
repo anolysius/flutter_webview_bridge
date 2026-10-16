@@ -3,30 +3,67 @@ import 'dart:collection';
 
 const webAuthContextProtocolVersion = 1;
 
+/// Compile-time capability marker for apps that require Japan authentication.
+const supportsJapanServiceCountry = true;
+const supportedServiceCountries = ['KR', 'GLOBAL', 'JP'];
+
 bool supportsWebAuthContextProtocol(Object? data) {
   if (data is! Map) return false;
   final version = data['authContextProtocolVersion'];
   return version is int && version >= webAuthContextProtocolVersion;
 }
 
-String normalizeServiceCountry(String? value) =>
-    value == 'GLOBAL' ? 'GLOBAL' : 'KR';
+String normalizeServiceCountry(String? value) {
+  if (value == null) return 'KR';
+  if (supportedServiceCountries.contains(value)) return value;
+  throw ArgumentError.value(
+    value,
+    'serviceCountry',
+    'Unsupported service country',
+  );
+}
 
 String domainTypeForServiceCountry(String? value) =>
-    normalizeServiceCountry(value) == 'GLOBAL'
-    ? 'sazo-global-shop'
-    : 'sazo-korea-shop';
+    switch (normalizeServiceCountry(value)) {
+      'GLOBAL' => 'sazo-global-shop',
+      'JP' => 'sazo-japan-shop',
+      _ => 'sazo-korea-shop',
+    };
+
+/// Only the observed QA2 desktop-to-mobile redirect is an alternate origin.
+/// Authentication transitions must not accept arbitrary Japan subdomains.
+bool matchesServiceWebOrigin({
+  required String serviceCountry,
+  required String? expectedOrigin,
+  required String? actualOrigin,
+}) {
+  if (expectedOrigin == null || actualOrigin == null) return false;
+  if (expectedOrigin == actualOrigin) return true;
+  return serviceCountry == 'JP' &&
+      expectedOrigin == 'https://qa2.sazo.shop' &&
+      actualOrigin == 'https://qa2.m.sazo.shop';
+}
+
+/// Legacy payloads without a country remain valid only for existing services.
+/// JP always requires its explicit context; unknown country codes never replay.
+bool matchesCachedServiceCountry({
+  required String serviceCountry,
+  required String? cachedServiceCountry,
+}) => cachedServiceCountry == null
+    ? serviceCountry != 'JP'
+    : supportedServiceCountries.contains(cachedServiceCountry) &&
+          cachedServiceCountry == serviceCountry;
 
 String? apiBaseUrlForServiceCountry({
   required String? apiBaseUrl,
   required String? serviceCountry,
 }) {
+  final country = normalizeServiceCountry(serviceCountry);
   if (apiBaseUrl == null || apiBaseUrl.trim().isEmpty) return apiBaseUrl;
   final uri = Uri.tryParse(apiBaseUrl);
   final host = uri?.host.toLowerCase();
   if (uri == null || host == null || host.isEmpty) return apiBaseUrl;
 
-  final country = normalizeServiceCountry(serviceCountry);
   const krSuffix = 'sazo.kr';
   const globalSuffix = 'sazoshop.com';
   String replaceSuffix(String value, String from, String to) => value == from
@@ -45,6 +82,12 @@ String? apiBaseUrlForServiceCountry({
         .replace(host: replaceSuffix(host, krSuffix, globalSuffix))
         .toString();
   }
+  // Japan's QA2 origin has a distinct prefix. Require the app to supply the
+  // explicit origin instead of inventing one by swapping domain suffixes.
+  validateServiceAuthContextPair(
+    serviceCountry: country,
+    apiBaseUrl: apiBaseUrl,
+  );
   return apiBaseUrl;
 }
 
@@ -56,12 +99,13 @@ bool shouldRejectRetiredAuthMessage({
 
 /// SAZO 운영/QA API host가 service country와 반대로 결합되는 것을 차단한다.
 ///
-/// localhost·개발 프록시·null은 기존 개발/fallback 경로를 보존한다. 반면 알려진 KR/Global
+/// localhost·개발 프록시·null은 기존 개발/fallback 경로를 보존한다. 반면 알려진 KR/Global/JP
 /// 운영 domain끼리의 교차 결합은 token exchange 전에 즉시 실패시킨다.
 void validateServiceAuthContextPair({
   required String? serviceCountry,
   required String? apiBaseUrl,
 }) {
+  final country = normalizeServiceCountry(serviceCountry);
   if (apiBaseUrl == null || apiBaseUrl.trim().isEmpty) return;
 
   final uri = Uri.tryParse(apiBaseUrl);
@@ -70,9 +114,11 @@ void validateServiceAuthContextPair({
 
   final isKrApi = host == 'sazo.kr' || host.endsWith('.sazo.kr');
   final isGlobalApi = host == 'sazoshop.com' || host.endsWith('.sazoshop.com');
-  final country = normalizeServiceCountry(serviceCountry);
+  final isJapanApi = host == 'sazo.shop' || host.endsWith('.sazo.shop');
   final mismatched =
-      (country == 'KR' && isGlobalApi) || (country == 'GLOBAL' && isKrApi);
+      (isKrApi && country != 'KR') ||
+      (isGlobalApi && country != 'GLOBAL') ||
+      (isJapanApi && country != 'JP');
   if (mismatched) {
     throw ArgumentError.value(
       apiBaseUrl,

@@ -46,6 +46,69 @@ void main() {
     SharedPreferences.setMockInitialValues({});
   });
 
+  testWidgets('JP transition resumes only after confirmed QA2 mobile origin', (
+    tester,
+  ) async {
+    final context = await _mountedContext(tester);
+    final platformController = _FakePlatformWebViewController();
+    final traces = <Map<String, Object?>>[];
+    expect(supportsJapanServiceCountry, isTrue);
+    final channel = FlutterWebViewBridgeJavaScriptChannel(
+      context: context,
+      webViewController: WebViewController.fromPlatform(platformController),
+      googleServerClientId: null,
+      kakaoNativeAppKey: null,
+      serviceCountry: 'KR',
+      apiBaseUrl: 'https://qa.api.sazo.kr',
+      webOrigin: 'https://qa.m.sazo.kr',
+      webDocumentNavigationGeneration: 1,
+      onAuthTrace: traces.add,
+    );
+    channel.beginServiceContextTransition('kr-to-jp');
+    channel.updateServiceContext(
+      serviceCountry: 'JP',
+      apiBaseUrl: 'https://qa2.api.sazo.shop',
+      webOrigin: 'https://qa2.sazo.shop',
+      waitForNextNavigation: true,
+    );
+    channel.updateWebDocumentNavigationGeneration(2);
+    final write = channel.onMessageReceived(
+      _message('REFRESH_TOKEN_WRITE', 'jp-token'),
+    );
+    await tester.pump();
+    final prefs = await SharedPreferences.getInstance();
+    expect(prefs.getString('flutter_webview_bridge_refresh_token__jp'), isNull);
+    channel.confirmWebDocumentNavigation(
+      generation: 2,
+      documentUrl: 'https://qa2.api.sazo.shop/',
+    );
+    await tester.pump();
+    expect(prefs.getString('flutter_webview_bridge_refresh_token__jp'), isNull);
+    expect(
+      traces.any(
+        (trace) =>
+            trace['event'] == 'auth.context.transition_navigation_rejected',
+      ),
+      isTrue,
+    );
+    channel.confirmWebDocumentNavigation(
+      generation: 2,
+      documentUrl: 'https://qa2.m.sazo.shop/auth/signin',
+    );
+    await write;
+    expect(channel.serviceCountry, 'JP');
+    expect(
+      prefs.getString('flutter_webview_bridge_refresh_token__jp'),
+      'jp-token',
+    );
+    expect(prefs.getString('flutter_webview_bridge_refresh_token'), isNull);
+    expect(
+      prefs.getString('flutter_webview_bridge_refresh_token__global'),
+      isNull,
+    );
+    channel.dispose();
+  });
+
   testWidgets(
     'provider await 중 direct context update는 current 결과와 queued retired mutation을 폐기한다',
     (tester) async {

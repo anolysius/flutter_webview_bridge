@@ -1,6 +1,7 @@
 const int legacyAuthProtocolVersion = 2;
 const int currentAuthProtocolVersion = 3;
 const String criticalAuthDeliveryAckCapability = 'criticalAuthDeliveryAck';
+const String webSessionImportCapability = 'webSessionImport';
 
 const Set<String> requiredAuthProtocolV3Capabilities = {
   'softConvergenceDeadline',
@@ -11,6 +12,7 @@ const Set<String> requiredAuthProtocolV3Capabilities = {
 const Set<String> authProtocolV3Capabilities = {
   ...requiredAuthProtocolV3Capabilities,
   criticalAuthDeliveryAckCapability,
+  webSessionImportCapability,
 };
 
 int authProtocolVersionOf(dynamic data) =>

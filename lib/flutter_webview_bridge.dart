@@ -1,4 +1,6 @@
 export 'src/bridge/bridge.dart';
+export 'src/bridge/auth/service_auth_context.dart'
+    show supportsJapanServiceCountry;
 export 'src/bridge/bridge_controller.dart';
 export 'src/bridge/events/apps_flyer_analytics.dart';
 export 'src/bridge/events/airbridge_analytics.dart';

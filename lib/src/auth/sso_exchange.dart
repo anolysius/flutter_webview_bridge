@@ -61,6 +61,20 @@ class SsoExchange {
   });
 
   String _idTokenPath(SsoProvider provider) {
+    if (domainType == 'sazo-japan-shop') {
+      switch (provider) {
+        case SsoProvider.google:
+          return '/api/user/auth/japan-google/id-token';
+        case SsoProvider.apple:
+          return '/api/user/auth/japan-apple/id-token';
+        case SsoProvider.kakao:
+          throw const SsoExchangeException(
+            'Provider is not supported for Japan',
+            failureStage: 'id_token_exchange',
+            failureCode: 'SSO_UNSUPPORTED_PROVIDER',
+          );
+      }
+    }
     switch (provider) {
       case SsoProvider.kakao:
         return '/api/user/auth/kakao/id-token';
@@ -197,10 +211,41 @@ class SsoExchange {
         failureCode: 'SSO_REFRESH_MISSING_ACCESS',
       );
     }
+    _validateAccessTokenService(accessToken);
     return SsoExchangeResult(
       accessToken: accessToken,
       refreshToken: finalRefresh,
     );
+  }
+
+  /// A JP endpoint must not relabel a known KR/Global token as a JP session.
+  /// This checks realm evidence only; signature verification stays on the server.
+  /// Existing KR/Global generic-provider compatibility remains unchanged.
+  void _validateAccessTokenService(String accessToken) {
+    if (domainType != 'sazo-japan-shop') return;
+    String? provider;
+    try {
+      final segments = accessToken.split('.');
+      if (segments.length != 3) return;
+      final payload = jsonDecode(
+        utf8.decode(base64Url.decode(base64Url.normalize(segments[1]))),
+      );
+      final tokenProvider = payload is Map ? payload['provider'] : null;
+      final value = tokenProvider is Map ? tokenProvider['provider'] : null;
+      if (value is String) provider = value.trim().toUpperCase();
+    } on FormatException {
+      // No realm evidence. Web validation still owns malformed/unknown tokens.
+      return;
+    }
+    if (provider == null) return;
+    if (const {'GOOGLE', 'APPLE', 'KAKAO', 'NAVER'}.contains(provider) ||
+        provider.startsWith('GLOBAL_')) {
+      throw const SsoExchangeException(
+        'Access token service does not match Japan',
+        failureStage: 'auth_context_validation',
+        failureCode: 'SSO_SERVICE_COUNTRY_MISMATCH',
+      );
+    }
   }
 
   /// 로그인 직후 me(내정보)를 네이티브에서 직접 GET 한다.
