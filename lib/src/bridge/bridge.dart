@@ -15,6 +15,7 @@ import 'events/apps_flyer_analytics.dart';
 import 'events/airbridge_analytics.dart';
 import 'events/auth_error.dart';
 import 'events/auth_error_mapper.dart';
+import 'events/auth_failure_cause.dart';
 import 'events/camera_access.dart';
 import 'events/channel_talk.dart';
 import 'events/device_info.dart';
@@ -51,6 +52,11 @@ import 'auth/service_auth_context.dart';
 import 'auth/unexpected_auth_failure.dart';
 
 typedef AuthTraceCallback = void Function(Map<String, Object?> event);
+
+/// 실패 순간의 네이티브 진단값 (예 iOS `iosKeyWindowPresent`·`iosSceneActivationState`).
+/// 앱이 주입한다 — 브릿지는 순수 Dart 라 UIKit 상태를 직접 읽지 못한다.
+/// 값은 [authFailureTraceStringKeys]·[authFailureTraceBoolKeys] 에 있는 키만 원격 로그로 나간다.
+typedef AuthFailureDiagnosticsProvider = Future<Map<String, Object>> Function();
 typedef AuthContextStatusCallback =
     FutureOr<void> Function(Map<String, Object?> status);
 typedef AuthContextRestartCallback =
@@ -161,6 +167,7 @@ class FlutterWebViewBridgeJavaScriptChannel {
   final bool appsFlyerAnalyticsEnabled;
   final AirbridgeAnalyticsCallback? onAirbridgeAnalytics;
   final AuthTraceCallback? onAuthTrace;
+  final AuthFailureDiagnosticsProvider? authFailureDiagnostics;
   final AuthContextStatusCallback? onAuthContextStatus;
   final AuthContextRestartCallback? onAuthContextRestart;
   final WebAuthContextCapabilityCallback? onWebAuthContextCapability;
@@ -219,6 +226,7 @@ class FlutterWebViewBridgeJavaScriptChannel {
     this.appsFlyerAnalyticsEnabled = true,
     this.onAirbridgeAnalytics,
     this.onAuthTrace,
+    this.authFailureDiagnostics,
     this.onAuthContextStatus,
     this.onAuthContextRestart,
     this.onWebAuthContextCapability,
@@ -805,6 +813,12 @@ class FlutterWebViewBridgeJavaScriptChannel {
         'semanticReason': data['semanticReason'] as String,
       if (data is Map && data['nativeSdkCause'] is String)
         'nativeSdkCause': data['nativeSdkCause'] as String,
+      for (final key in authFailureTraceStringKeys)
+        if (data is Map && data[key] is String) key: data[key] as String,
+      for (final key in authFailureTraceIntKeys)
+        if (data is Map && data[key] is int) key: data[key] as int,
+      for (final key in authFailureTraceBoolKeys)
+        if (data is Map && data[key] is bool) key: data[key] as bool,
       if (data is Map && data['providerElapsedMs'] is int)
         'providerElapsedMs': data['providerElapsedMs'] as int,
       if (data is Map && data['convergenceElapsedMs'] is int)
@@ -814,18 +828,42 @@ class FlutterWebViewBridgeJavaScriptChannel {
     });
   }
 
+  /// [failureCause] 를 생략하면 [failureCode] 를 그대로 쓴다 — 단일 원인 코드(예
+  /// `AUTH_TERMINAL_TIMEOUT`)는 이미 1코드=1원인이다. 여러 원인을 묶는 코드
+  /// (`NATIVE_INTERNAL_ERROR`, `NETWORK_ERROR`, `SSO_*_HTTP`)는 호출부가 원인을 넘긴다.
   Map<String, Object?> _failureData(
     dynamic data, {
     required String failureStage,
     required String failureCode,
     int? httpStatus,
+    String? failureCause,
+    Map<String, Object> failureContext = const {},
   }) => <String, Object?>{
     if (data is Map)
       for (final entry in data.entries)
         if (entry.key is String) entry.key as String: entry.value,
     'failureStage': failureStage,
     'failureCode': failureCode,
+    'failureCause': failureCause ?? failureCode,
+    ...failureContext,
     if (httpStatus != null) 'httpStatus': httpStatus,
+  };
+
+  /// 예외 → 1코드=1원인. 교환 예외는 발생 지점에서 만든 원인을, 그 외는 단계·예외 타입별 원인.
+  String _failureCauseOf(Object error, String failureStage) {
+    if (error is SsoExchangeException) {
+      return error.failureCause ?? error.failureCode;
+    }
+    if (error is StateError &&
+        error.message == 'REFRESH_TOKEN_PERSIST_FAILED') {
+      return 'REFRESH_TOKEN_PERSIST_FAILED';
+    }
+    return nativeFailureCause(failureStage, error);
+  }
+
+  Map<String, Object> _failureContextOf(Object error) => {
+    if (error is SsoExchangeException && error.serverErrorCode != null)
+      'serverErrorCode': error.serverErrorCode!,
   };
 
   String _failureStageOf(Object error, String fallback) {
@@ -996,6 +1034,9 @@ class FlutterWebViewBridgeJavaScriptChannel {
       if (_authTotalElapsed.isRunning ||
           _authTotalElapsed.elapsed > Duration.zero)
         'totalElapsedMs': _authTotalElapsed.elapsedMilliseconds,
+      // 실패 순간 앱 상태 — 동기로 읽히므로 terminal 에 바로 싣는다.
+      if (data is Map && data['failureCause'] is String)
+        'appLifecycleState': ?WidgetsBinding.instance.lifecycleState?.name,
     };
     _authTotalElapsed.stop();
     final key = _terminalKeyOf(terminalData);
@@ -1029,7 +1070,34 @@ class FlutterWebViewBridgeJavaScriptChannel {
     _settleAuthTerminalTracking();
     _emitAuthTrace('auth.terminal', resultCode: resultCode, data: terminalData);
     _completeProcessAuthLease();
+    if (terminalData['failureCause'] is String) {
+      unawaited(_emitAuthFailureDiagnostics(resultCode, terminalData));
+    }
   }
+
+  /// 네이티브 진단값은 비동기라 terminal 과 웹 AUTH_ERROR 를 기다리게 하지 않는다 (UX 지연 0).
+  /// 같은 attempt 의 별도 이벤트로 남기고, 최대 [_authFailureDiagnosticsTimeout] 안에 못 받으면 생략한다.
+  Future<void> _emitAuthFailureDiagnostics(
+    String resultCode,
+    Map<String, Object?> terminalData,
+  ) async {
+    final provider = authFailureDiagnostics;
+    if (provider == null) return;
+    Map<String, Object> diagnostics;
+    try {
+      diagnostics = await provider().timeout(_authFailureDiagnosticsTimeout);
+    } catch (_) {
+      return;
+    }
+    if (_isDisposed || diagnostics.isEmpty) return;
+    _emitAuthTrace(
+      'auth.failure.diagnostics',
+      resultCode: resultCode,
+      data: {...terminalData, ...diagnostics},
+    );
+  }
+
+  static const _authFailureDiagnosticsTimeout = Duration(milliseconds: 300);
 
   void _completeProcessAuthLease() {
     final lease = _processAuthLease;
@@ -3434,12 +3502,19 @@ class FlutterWebViewBridgeJavaScriptChannel {
               data,
               failureStage: 'native_sdk',
               failureCode: e.code,
+              failureCause: e.failureCause,
+              failureContext: e.failureContext,
             )..['nativeSdkErrorCode'] = e.nativeSdkErrorCode;
             if (nativeSdkCause != null) {
               failureData['nativeSdkCause'] = nativeSdkCause;
             }
+            // KPI 분류는 원인 코드 표(SSOT)로 — 시스템 오류가 '취소'로 새지 않는다.
+            // 웹 화면용 `code` 는 아래 AUTH_ERROR 에 기존 값 그대로 싣는다 (화면 변화 0).
+            final failureCause = e.failureCause;
             _emitAuthTerminal(
-              e.code == 'USER_CANCELLED'
+              failureCause != null
+                  ? resultCodeForFailureCause(failureCause)
+                  : e.code == 'USER_CANCELLED'
                   ? 'user_cancelled'
                   : const {'NETWORK_ERROR', 'PROVIDER_ERROR'}.contains(e.code)
                   ? 'excluded_external_failure'
@@ -3466,6 +3541,8 @@ class FlutterWebViewBridgeJavaScriptChannel {
                     'nativeSdkErrorCode': e.nativeSdkErrorCode,
                     if (nativeSdkCause != null)
                       'nativeSdkCause': nativeSdkCause,
+                    'failureCause': failureData['failureCause'],
+                    ...e.failureContext,
                   },
                 }),
               );
@@ -3482,6 +3559,7 @@ class FlutterWebViewBridgeJavaScriptChannel {
               data,
               failureStage: unexpectedFailureStage,
               failureCode: 'NATIVE_INTERNAL_ERROR',
+              failureCause: nativeFailureCause(unexpectedFailureStage, e),
             );
             _emitAuthTerminal(
               'code_failure:native_internal',
@@ -4336,11 +4414,14 @@ class FlutterWebViewBridgeJavaScriptChannel {
       }
       final failureStage = _failureStageOf(error, 'refresh_exchange');
       final failureCode = _failureCodeOf(error, 'NATIVE_INTERNAL_ERROR');
+      final failureCause = _failureCauseOf(error, failureStage);
       final failureData = _failureData(
         requestData,
         failureStage: failureStage,
         failureCode: failureCode,
         httpStatus: statusCode,
+        failureCause: failureCause,
+        failureContext: _failureContextOf(error),
       );
       _emitAuthTerminal(
         _isExternalSsoFailure(error)
@@ -4363,6 +4444,7 @@ class FlutterWebViewBridgeJavaScriptChannel {
           'authRevision': _activeAuthRevision,
           'failureStage': failureStage,
           'failureCode': failureCode,
+          'failureCause': failureCause,
           if (statusCode != null) 'httpStatus': statusCode,
         },
       };
@@ -4496,11 +4578,14 @@ class FlutterWebViewBridgeJavaScriptChannel {
       final statusCode = e is SsoExchangeException ? e.statusCode : null;
       final failureStage = _failureStageOf(e, 'unknown');
       final failureCode = _failureCodeOf(e, 'NATIVE_INTERNAL_ERROR');
+      final failureCause = _failureCauseOf(e, failureStage);
       final failureData = _failureData(
         requestData,
         failureStage: failureStage,
         failureCode: failureCode,
         httpStatus: statusCode,
+        failureCause: failureCause,
+        failureContext: _failureContextOf(e),
       );
       _emitAuthTerminal(
         _isExternalSsoFailure(e)
@@ -4521,6 +4606,7 @@ class FlutterWebViewBridgeJavaScriptChannel {
           'authRevision': _activeAuthRevision,
           'failureStage': failureStage,
           'failureCode': failureCode,
+          'failureCause': failureCause,
           if (statusCode != null) 'httpStatus': statusCode,
         },
       };

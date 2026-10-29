@@ -19,8 +19,21 @@ class AuthError implements Exception {
   /// persisted because they may contain account or response details.
   final String nativeSdkErrorCode;
 
-  const AuthError(this.code, this.message, {String? nativeSdkErrorCode})
-    : nativeSdkErrorCode = nativeSdkErrorCode ?? code;
+  /// 1코드=1원인 실패 원인 (`auth_failure_cause.dart`). 원격 로그 집계 단위.
+  /// [code]·[nativeSdkErrorCode] 는 하위호환으로 그대로 두고 이 값을 추가로 싣는다.
+  final String? failureCause;
+
+  /// 원인만으로 설명되지 않는 "왜" — 단계 소요시간·직전 단계 실패 원인 등.
+  /// 값은 bool / int / allowlist 문자열만 (raw message 금지).
+  final Map<String, Object> failureContext;
+
+  const AuthError(
+    this.code,
+    this.message, {
+    String? nativeSdkErrorCode,
+    this.failureCause,
+    this.failureContext = const {},
+  }) : nativeSdkErrorCode = nativeSdkErrorCode ?? code;
 
   @override
   String toString() => 'AuthError($code): $message';

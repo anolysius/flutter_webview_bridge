@@ -7,6 +7,7 @@ import 'package:kakao_flutter_sdk/kakao_flutter_sdk.dart';
 import '../../models/types.dart';
 import 'auth_error.dart';
 import 'auth_error_mapper.dart';
+import 'auth_failure_cause.dart';
 import 'kakao_token_policy.dart';
 
 class SignInKakao {
@@ -15,6 +16,16 @@ class SignInKakao {
   SignInKakao._internal();
 
   bool _isInitialized = false;
+
+  /// 테스트 seam — 단계별 실패 원인 추적을 SDK 없이 검증하기 위해 SDK 호출만 교체 가능하게 둔다.
+  @visibleForTesting
+  Future<bool> Function() talkInstalled = isKakaoTalkInstalled;
+  @visibleForTesting
+  Future<OAuthToken> Function() loginWithTalk = () =>
+      UserApi.instance.loginWithKakaoTalk();
+  @visibleForTesting
+  Future<OAuthToken> Function() loginWithAccount = () =>
+      UserApi.instance.loginWithKakaoAccount();
 
   void initialize({required String? nativeAppKey, String? javaScriptAppKey}) {
     if (_isInitialized) return;
@@ -34,14 +45,23 @@ class SignInKakao {
     if (action == 'login') {
       sendData['type'] = WebViewBridgeFeatureType.kakaoSignInLogin.value;
 
+      // 실패 원인 추적 — 실패한 단계·직전 단계의 실패 원인·단계 소요시간 (auth_failure_cause.dart).
+      var step = KakaoAuthStep.account;
+      final stepWatch = Stopwatch()..start();
+      String? fallbackFromCause;
+      bool? kakaoTalkInstalled;
+
       try {
         String? idToken;
 
         debugPrint('[SignInKakao] START — isKakaoTalkInstalled check');
-        if (await isKakaoTalkInstalled()) {
+        kakaoTalkInstalled = await talkInstalled();
+        if (kakaoTalkInstalled) {
           debugPrint('[SignInKakao] STEP loginWithKakaoTalk');
+          step = KakaoAuthStep.talk;
+          stepWatch.reset();
           try {
-            OAuthToken token = await UserApi.instance.loginWithKakaoTalk();
+            OAuthToken token = await loginWithTalk();
             idToken = token.idToken;
             debugPrint('[SignInKakao] loginWithKakaoTalk OK');
           } catch (error) {
@@ -54,8 +74,12 @@ class SignInKakao {
               rethrow;
             }
             // 카카오톡에 연결된 카카오계정이 없는 경우, 카카오계정으로 로그인
+            // 카카오톡이 왜 실패했는지는 fallback 실패 원인과 함께 남긴다 (1차 원인 보존).
+            fallbackFromCause = kakaoFailureCause(KakaoAuthStep.talk, error);
+            step = KakaoAuthStep.fallback;
+            stepWatch.reset();
             try {
-              OAuthToken token = await UserApi.instance.loginWithKakaoAccount();
+              OAuthToken token = await loginWithAccount();
               idToken = token.idToken;
             } catch (error) {
               rethrow;
@@ -64,7 +88,7 @@ class SignInKakao {
         } else {
           debugPrint('[SignInKakao] STEP loginWithKakaoAccount (no KakaoTalk)');
           try {
-            OAuthToken token = await UserApi.instance.loginWithKakaoAccount();
+            OAuthToken token = await loginWithAccount();
             idToken = token.idToken;
           } catch (error) {
             rethrow;
@@ -124,6 +148,8 @@ class SignInKakao {
         if (consentScopes.isNotEmpty) {
           // scope 목록을 전달하여 동의항목 추가 동의 요청
           // 지정된 동의항목에 대한 동의 화면을 거쳐 다시 카카오 로그인 수행
+          step = KakaoAuthStep.scopes;
+          stepWatch.reset();
           try {
             OAuthToken token = await UserApi.instance.loginWithNewScopes(
               consentScopes,
@@ -138,6 +164,8 @@ class SignInKakao {
         }
 
         if (idToken == null || idToken.isEmpty) {
+          step = KakaoAuthStep.idToken;
+          stepWatch.reset();
           throw StateError('KAKAO_ID_TOKEN_MISSING');
         }
         sendData['data'] = {
@@ -159,6 +187,12 @@ class SignInKakao {
           code,
           e.runtimeType.toString(),
           nativeSdkErrorCode: 'KAKAO_${safeCause.toUpperCase()}',
+          failureCause: kakaoFailureCause(step, e),
+          failureContext: {
+            'stepElapsedMs': stepWatch.elapsedMilliseconds,
+            'kakaoTalkInstalled': ?kakaoTalkInstalled,
+            'fallbackFromCause': ?fallbackFromCause,
+          },
         );
       }
     }

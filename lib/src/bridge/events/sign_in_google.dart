@@ -6,6 +6,7 @@ import 'package:google_sign_in/google_sign_in.dart';
 import '../../models/types.dart';
 import 'auth_error.dart';
 import 'auth_error_mapper.dart';
+import 'auth_failure_cause.dart';
 
 class SignInGoogle {
   static final SignInGoogle _instance = SignInGoogle._internal();
@@ -13,6 +14,14 @@ class SignInGoogle {
   SignInGoogle._internal();
 
   bool _isInitialized = false;
+
+  /// 테스트 seam — 실패 원인 추적을 SDK 없이 검증하기 위해 SDK 호출만 교체 가능하게 둔다.
+  @visibleForTesting
+  bool Function() supportsAuthenticate = () =>
+      GoogleSignIn.instance.supportsAuthenticate();
+  @visibleForTesting
+  Future<GoogleSignInAccount> Function(List<String> scopeHint) authenticate =
+      (scopeHint) => GoogleSignIn.instance.authenticate(scopeHint: scopeHint);
 
   // Completer<GoogleSignInAccount?>? _loginCompleter;
 
@@ -43,18 +52,18 @@ class SignInGoogle {
 
     if (action == 'login') {
       sendData['type'] = WebViewBridgeFeatureType.googleSignInLogin.value;
-      if (!GoogleSignIn.instance.supportsAuthenticate()) {
+      if (!supportsAuthenticate()) {
         // 이전엔 빈 {} return → webview silent fail. SDK 가용 불가 명시 통보.
         throw AuthError(
           AuthErrorCode.sdkInitFailed,
           'Google sign-in not supported on this platform',
           nativeSdkErrorCode: 'GOOGLE_SDK_INIT_FAILED',
+          failureCause: 'GOOGLE_SIGN_IN_AUTHENTICATE_UNSUPPORTED',
         );
       }
+      final stepWatch = Stopwatch()..start();
       try {
-        final user = await GoogleSignIn.instance.authenticate(
-          scopeHint: scopes,
-        );
+        final user = await authenticate(scopes);
 
         final GoogleSignInAuthentication authentication = user.authentication;
         final String? idToken = authentication.idToken;
@@ -72,7 +81,13 @@ class SignInGoogle {
             ? _errorMessageFromSignInException(e)
             : 'Unknown error: $e';
         final code = mapGoogleError(e);
-        throw AuthError(code, message, nativeSdkErrorCode: 'GOOGLE_$code');
+        throw AuthError(
+          code,
+          message,
+          nativeSdkErrorCode: 'GOOGLE_$code',
+          failureCause: googleFailureCause(e),
+          failureContext: {'stepElapsedMs': stepWatch.elapsedMilliseconds},
+        );
       }
     }
 
