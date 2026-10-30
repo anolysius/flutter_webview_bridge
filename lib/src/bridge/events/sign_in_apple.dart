@@ -6,11 +6,22 @@ import 'package:sign_in_with_apple/sign_in_with_apple.dart';
 import '../../models/types.dart';
 import 'auth_error.dart';
 import 'auth_error_mapper.dart';
+import 'auth_failure_cause.dart';
 
 class SignInApple {
   static final SignInApple _instance = SignInApple._internal();
   static SignInApple get shared => _instance;
   SignInApple._internal();
+
+  /// 테스트 seam — 실패 원인 추적을 SDK 없이 검증하기 위해 SDK 호출만 교체 가능하게 둔다.
+  @visibleForTesting
+  Future<AuthorizationCredentialAppleID> Function() getCredential = () =>
+      SignInWithApple.getAppleIDCredential(
+        scopes: [
+          AppleIDAuthorizationScopes.email,
+          AppleIDAuthorizationScopes.fullName,
+        ],
+      );
 
   Future<Map<String, Object?>> process(
     BuildContext context, {
@@ -21,16 +32,11 @@ class SignInApple {
     if (action == 'login') {
       sendData['type'] = WebViewBridgeFeatureType.appleSignInLogin.value;
 
+      final stepWatch = Stopwatch()..start();
       try {
         String? familyName, givenName, displayName;
 
-        AuthorizationCredentialAppleID appleCredential =
-            await SignInWithApple.getAppleIDCredential(
-              scopes: [
-                AppleIDAuthorizationScopes.email,
-                AppleIDAuthorizationScopes.fullName,
-              ],
-            );
+        AuthorizationCredentialAppleID appleCredential = await getCredential();
 
         familyName = appleCredential.familyName;
         givenName = appleCredential.givenName;
@@ -51,7 +57,13 @@ class SignInApple {
         };
       } catch (e) {
         final code = mapAppleError(e);
-        throw AuthError(code, e.toString(), nativeSdkErrorCode: 'APPLE_$code');
+        throw AuthError(
+          code,
+          e.toString(),
+          nativeSdkErrorCode: 'APPLE_$code',
+          failureCause: appleFailureCause(e),
+          failureContext: {'stepElapsedMs': stepWatch.elapsedMilliseconds},
+        );
       }
     }
 

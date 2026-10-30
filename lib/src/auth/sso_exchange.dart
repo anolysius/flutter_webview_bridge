@@ -1,6 +1,10 @@
+import 'dart:async' show TimeoutException;
 import 'dart:convert';
+import 'dart:io' show SocketException;
 
 import 'package:http/http.dart' as http;
+
+import '../bridge/events/auth_failure_cause.dart';
 
 /// SSO 토큰 교환을 네이티브(Dart HTTP)에서 수행한다 (B2).
 ///
@@ -32,6 +36,13 @@ class SsoExchangeException implements Exception {
   final bool externalFailure;
   final int? statusCode;
   final String? semanticReason;
+
+  /// 1코드=1원인 (`auth_failure_cause.dart`). [failureCode] 는 웹 allowlist 하위호환용 분류.
+  final String? failureCause;
+
+  /// 서버 응답 envelope 의 오류 코드 (allowlist 통과분만).
+  final String? serverErrorCode;
+
   const SsoExchangeException(
     this.message, {
     required this.failureStage,
@@ -39,6 +50,8 @@ class SsoExchangeException implements Exception {
     this.externalFailure = false,
     this.statusCode,
     this.semanticReason,
+    this.failureCause,
+    this.serverErrorCode,
   });
 
   @override
@@ -72,6 +85,7 @@ class SsoExchange {
             'Provider is not supported for Japan',
             failureStage: 'id_token_exchange',
             failureCode: 'SSO_UNSUPPORTED_PROVIDER',
+            failureCause: 'SSO_IDTOKEN_UNSUPPORTED_PROVIDER',
           );
       }
     }
@@ -90,6 +104,33 @@ class SsoExchange {
     'x-domain-type': domainType,
     'Accept-Language': 'ko-KR,ko;q=0.9',
   };
+
+  /// HTTP 응답 이전 실패(소켓·타임아웃·http ClientException)를 단계가 붙은 외부 실패로 감싼다.
+  /// [SsoExchangeException.failureCode] 는 기존과 같은 `NETWORK_ERROR` (웹 allowlist 하위호환).
+  Future<http.Response> _postStep(
+    String step,
+    String failureStage,
+    Uri url, {
+    required Map<String, String> headers,
+    Object? body,
+  }) async {
+    try {
+      return await _post(url, headers: headers, body: body);
+    } on Object catch (e) {
+      if (e is SocketException ||
+          e is TimeoutException ||
+          e is http.ClientException) {
+        throw SsoExchangeException(
+          '$step transport ${e.runtimeType}',
+          failureStage: failureStage,
+          failureCode: 'NETWORK_ERROR',
+          externalFailure: true,
+          failureCause: ssoTransportFailureCause(step, e),
+        );
+      }
+      rethrow;
+    }
+  }
 
   Future<http.Response> _post(
     Uri url, {
@@ -121,7 +162,9 @@ class SsoExchange {
     required Map<String, String> deviceHeaders,
   }) async {
     // 1) id-token 교환 → refreshToken
-    final idRes = await _post(
+    final idRes = await _postStep(
+      'IDTOKEN',
+      'id_token_exchange',
       Uri.parse('$apiBaseUrl${_idTokenPath(provider)}'),
       headers: {..._baseHeaders(), ...deviceHeaders},
       body: jsonEncode({
@@ -131,12 +174,19 @@ class SsoExchange {
       }),
     );
     if (idRes.statusCode < 200 || idRes.statusCode >= 300) {
+      final serverErrorCode = serverErrorCodeFromBody(idRes.body);
       throw SsoExchangeException(
         'id-token HTTP ${idRes.statusCode}',
         failureStage: 'id_token_exchange',
         failureCode: 'SSO_ID_TOKEN_HTTP',
         externalFailure: _isExternalStatus(idRes.statusCode),
         statusCode: idRes.statusCode,
+        serverErrorCode: serverErrorCode,
+        failureCause: ssoHttpFailureCause(
+          'IDTOKEN',
+          idRes.statusCode,
+          serverErrorCode,
+        ),
       );
     }
     final Map<String, dynamic> idBody;
@@ -147,6 +197,7 @@ class SsoExchange {
         'id-token response invalid JSON',
         failureStage: 'id_token_exchange',
         failureCode: 'SSO_ID_TOKEN_INVALID_RESPONSE',
+        failureCause: 'SSO_IDTOKEN_INVALID_JSON',
       );
     }
     final refreshToken = idBody['refreshToken'] as String?;
@@ -155,6 +206,7 @@ class SsoExchange {
         'id-token response missing refreshToken',
         failureStage: 'id_token_exchange',
         failureCode: 'SSO_ID_TOKEN_MISSING_REFRESH',
+        failureCause: 'SSO_IDTOKEN_MISSING_REFRESH',
       );
     }
 
@@ -175,12 +227,15 @@ class SsoExchange {
     required String refreshToken,
     required Map<String, String> deviceHeaders,
   }) async {
-    final rfRes = await _post(
+    final rfRes = await _postStep(
+      'REFRESH',
+      'refresh_exchange',
       Uri.parse('$apiBaseUrl/api/user/auth/token/refresh'),
       headers: {..._baseHeaders(), ...deviceHeaders},
       body: jsonEncode({'refreshToken': refreshToken}),
     );
     if (rfRes.statusCode < 200 || rfRes.statusCode >= 300) {
+      final serverErrorCode = serverErrorCodeFromBody(rfRes.body);
       throw SsoExchangeException(
         'refresh HTTP ${rfRes.statusCode}',
         failureStage: 'refresh_exchange',
@@ -188,6 +243,12 @@ class SsoExchange {
         externalFailure: _isExternalStatus(rfRes.statusCode),
         statusCode: rfRes.statusCode,
         semanticReason: _refreshSemanticReason(rfRes.body),
+        serverErrorCode: serverErrorCode,
+        failureCause: ssoHttpFailureCause(
+          'REFRESH',
+          rfRes.statusCode,
+          serverErrorCode,
+        ),
       );
     }
     final Map<String, dynamic> rfBody;
@@ -198,6 +259,7 @@ class SsoExchange {
         'refresh response invalid JSON',
         failureStage: 'refresh_exchange',
         failureCode: 'SSO_REFRESH_INVALID_RESPONSE',
+        failureCause: 'SSO_REFRESH_INVALID_JSON',
       );
     }
     final data = rfBody['data'];
@@ -209,6 +271,7 @@ class SsoExchange {
         'refresh response missing accessToken',
         failureStage: 'refresh_exchange',
         failureCode: 'SSO_REFRESH_MISSING_ACCESS',
+        failureCause: 'SSO_REFRESH_MISSING_ACCESS',
       );
     }
     _validateAccessTokenService(accessToken);
@@ -244,6 +307,7 @@ class SsoExchange {
         'Access token service does not match Japan',
         failureStage: 'auth_context_validation',
         failureCode: 'SSO_SERVICE_COUNTRY_MISMATCH',
+        failureCause: 'SSO_REFRESH_SERVICE_COUNTRY_MISMATCH',
       );
     }
   }

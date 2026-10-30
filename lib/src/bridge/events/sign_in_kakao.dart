@@ -7,6 +7,7 @@ import 'package:kakao_flutter_sdk/kakao_flutter_sdk.dart';
 import '../../models/types.dart';
 import 'auth_error.dart';
 import 'auth_error_mapper.dart';
+import 'auth_failure_cause.dart';
 import 'kakao_token_policy.dart';
 
 class SignInKakao {
@@ -15,6 +16,52 @@ class SignInKakao {
   SignInKakao._internal();
 
   bool _isInitialized = false;
+
+  /// 테스트 seam — 단계별 실패 원인 추적을 SDK 없이 검증하기 위해 SDK 호출만 교체 가능하게 둔다.
+  @visibleForTesting
+  Future<bool> Function() talkInstalled = isKakaoTalkInstalled;
+  @visibleForTesting
+  Future<OAuthToken> Function() loginWithTalk = () =>
+      UserApi.instance.loginWithKakaoTalk();
+  @visibleForTesting
+  Future<OAuthToken> Function() loginWithAccount = () =>
+      UserApi.instance.loginWithKakaoAccount();
+  @visibleForTesting
+  AppLifecycleState? Function() lifecycleState = () =>
+      WidgetsBinding.instance.lifecycleState;
+  @visibleForTesting
+  Future<void> Function(Duration timeout) waitForResumed = _waitForResumed;
+
+  /// 카카오톡 → 카카오계정 fallback 전 앱 활성 대기 상한.
+  static const fallbackResumeTimeout = Duration(milliseconds: 2000);
+
+  /// 이번 로그인의 카카오톡 실패 → 카카오계정 fallback 문맥. 성공한 시도에서도 원격 로그에
+  /// 싣기 위해(구제 수 측정) bridge 가 provider 완료 시점에 [takeFallbackContext] 로 가져간다.
+  Map<String, Object> _fallbackContext = const {};
+
+  /// fallback 문맥을 꺼내고 비운다. 한 번만 돌려주므로 다음 시도로 새지 않는다.
+  Map<String, Object> takeFallbackContext() {
+    final context = _fallbackContext;
+    _fallbackContext = const {};
+    return context;
+  }
+
+  static Future<void> _waitForResumed(Duration timeout) async {
+    final resumed = Completer<void>();
+    final listener = AppLifecycleListener(
+      onResume: () {
+        if (!resumed.isCompleted) resumed.complete();
+      },
+    );
+    try {
+      if (WidgetsBinding.instance.lifecycleState == AppLifecycleState.resumed) {
+        return;
+      }
+      await resumed.future.timeout(timeout, onTimeout: () {});
+    } finally {
+      listener.dispose();
+    }
+  }
 
   void initialize({required String? nativeAppKey, String? javaScriptAppKey}) {
     if (_isInitialized) return;
@@ -34,14 +81,27 @@ class SignInKakao {
     if (action == 'login') {
       sendData['type'] = WebViewBridgeFeatureType.kakaoSignInLogin.value;
 
+      // 실패 원인 추적 — 실패한 단계·직전 단계의 실패 원인·단계 소요시간 (auth_failure_cause.dart).
+      var step = KakaoAuthStep.account;
+      final stepWatch = Stopwatch()..start();
+      String? fallbackFromCause;
+      String? fallbackFromDetail;
+      int? fallbackFromElapsedMs;
+      int? fallbackWaitMs;
+      bool? kakaoTalkInstalled;
+      _fallbackContext = const {};
+
       try {
         String? idToken;
 
         debugPrint('[SignInKakao] START — isKakaoTalkInstalled check');
-        if (await isKakaoTalkInstalled()) {
+        kakaoTalkInstalled = await talkInstalled();
+        if (kakaoTalkInstalled) {
           debugPrint('[SignInKakao] STEP loginWithKakaoTalk');
+          step = KakaoAuthStep.talk;
+          stepWatch.reset();
           try {
-            OAuthToken token = await UserApi.instance.loginWithKakaoTalk();
+            OAuthToken token = await loginWithTalk();
             idToken = token.idToken;
             debugPrint('[SignInKakao] loginWithKakaoTalk OK');
           } catch (error) {
@@ -53,9 +113,29 @@ class SignInKakao {
             if (error is PlatformException && error.code == 'CANCELED') {
               rethrow;
             }
-            // 카카오톡에 연결된 카카오계정이 없는 경우, 카카오계정으로 로그인
+            // 그 외 카카오톡 실패(카카오톡의 사용자 취소 error=cancelled 포함)는 카카오계정으로 로그인
+            // — 카카오 공식 구현 예제. 카카오톡이 왜 실패했는지는 1차 원인으로 함께 남긴다.
+            fallbackFromCause = kakaoFailureCause(KakaoAuthStep.talk, error);
+            fallbackFromDetail = kakaoErrorDetail(error);
+            fallbackFromElapsedMs = stepWatch.elapsedMilliseconds;
+            // 카카오톡에서 막 돌아온 순간은 앱이 아직 비활성이라 iOS 가 카카오계정 창
+            // (ASWebAuthenticationSession)을 즉시 거부한다(오류 3, 2026-10-30 실측 8ms).
+            // 활성화될 때까지 기다린 뒤 띄운다. 상한을 넘기면 그대로 진행한다.
+            final waitWatch = Stopwatch()..start();
+            if (lifecycleState() != AppLifecycleState.resumed) {
+              await waitForResumed(fallbackResumeTimeout);
+            }
+            fallbackWaitMs = waitWatch.elapsedMilliseconds;
+            _fallbackContext = {
+              'fallbackFromCause': fallbackFromCause,
+              'fallbackFromDetail': ?fallbackFromDetail,
+              'fallbackFromElapsedMs': fallbackFromElapsedMs,
+              'fallbackWaitMs': fallbackWaitMs,
+            };
+            step = KakaoAuthStep.fallback;
+            stepWatch.reset();
             try {
-              OAuthToken token = await UserApi.instance.loginWithKakaoAccount();
+              OAuthToken token = await loginWithAccount();
               idToken = token.idToken;
             } catch (error) {
               rethrow;
@@ -64,7 +144,7 @@ class SignInKakao {
         } else {
           debugPrint('[SignInKakao] STEP loginWithKakaoAccount (no KakaoTalk)');
           try {
-            OAuthToken token = await UserApi.instance.loginWithKakaoAccount();
+            OAuthToken token = await loginWithAccount();
             idToken = token.idToken;
           } catch (error) {
             rethrow;
@@ -124,6 +204,8 @@ class SignInKakao {
         if (consentScopes.isNotEmpty) {
           // scope 목록을 전달하여 동의항목 추가 동의 요청
           // 지정된 동의항목에 대한 동의 화면을 거쳐 다시 카카오 로그인 수행
+          step = KakaoAuthStep.scopes;
+          stepWatch.reset();
           try {
             OAuthToken token = await UserApi.instance.loginWithNewScopes(
               consentScopes,
@@ -138,6 +220,8 @@ class SignInKakao {
         }
 
         if (idToken == null || idToken.isEmpty) {
+          step = KakaoAuthStep.idToken;
+          stepWatch.reset();
           throw StateError('KAKAO_ID_TOKEN_MISSING');
         }
         sendData['data'] = {
@@ -159,6 +243,16 @@ class SignInKakao {
           code,
           e.runtimeType.toString(),
           nativeSdkErrorCode: 'KAKAO_${safeCause.toUpperCase()}',
+          failureCause: kakaoFailureCause(step, e),
+          failureContext: {
+            'stepElapsedMs': stepWatch.elapsedMilliseconds,
+            'kakaoTalkInstalled': ?kakaoTalkInstalled,
+            'fallbackFromCause': ?fallbackFromCause,
+            'fallbackFromDetail': ?fallbackFromDetail,
+            'fallbackFromElapsedMs': ?fallbackFromElapsedMs,
+            'fallbackWaitMs': ?fallbackWaitMs,
+            'providerErrorDetail': ?kakaoErrorDetail(e),
+          },
         );
       }
     }
