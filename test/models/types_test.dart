@@ -10,6 +10,17 @@ void main() {
     );
   });
 
+  test('request app review event name round-trips', () {
+    expect(
+      WebViewBridgeFeatureType.requestAppReview.value,
+      'REQUEST_APP_REVIEW',
+    );
+    expect(
+      'REQUEST_APP_REVIEW'.webViewBridgeFeatureType,
+      WebViewBridgeFeatureType.requestAppReview,
+    );
+  });
+
   test('auth context protocol event names round-trip', () {
     const cases = {
       WebViewBridgeFeatureType.authContextStatus: 'AUTH_CONTEXT_STATUS',

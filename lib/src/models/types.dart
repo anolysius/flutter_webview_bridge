@@ -40,6 +40,7 @@ enum WebViewBridgeFeatureType {
   authContextMismatchClearAndRestart,
   serviceCountryQuery,
   serviceCountryChange,
+  requestAppReview,
 }
 
 extension WebViewBridgeFeatureTypeValue on WebViewBridgeFeatureType {
@@ -127,6 +128,8 @@ extension WebViewBridgeFeatureTypeValue on WebViewBridgeFeatureType {
         return 'SERVICE_COUNTRY_QUERY';
       case WebViewBridgeFeatureType.serviceCountryChange:
         return 'SERVICE_COUNTRY_CHANGE';
+      case WebViewBridgeFeatureType.requestAppReview:
+        return 'REQUEST_APP_REVIEW';
     }
   }
 }
@@ -216,6 +219,8 @@ extension WebViewBridgeFeatureTypeString on String {
         return WebViewBridgeFeatureType.serviceCountryQuery;
       case 'SERVICE_COUNTRY_CHANGE':
         return WebViewBridgeFeatureType.serviceCountryChange;
+      case 'REQUEST_APP_REVIEW':
+        return WebViewBridgeFeatureType.requestAppReview;
     }
     return null;
   }
