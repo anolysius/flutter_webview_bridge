@@ -1,5 +1,5 @@
 import 'dart:async' show TimeoutException;
-import 'dart:convert' show jsonDecode;
+import 'dart:convert' show jsonDecode, utf8;
 import 'dart:io' show SocketException;
 
 import 'package:flutter/services.dart' show PlatformException;
@@ -79,6 +79,45 @@ String appleFailureCause(Object error) => _compose(
       ? _upperSnake(error.code.name)
       : _commonReason(error),
 );
+
+/// 카카오 인증 오류의 설명 문구 — `providerErrorDetail` / `fallbackFromDetail`.
+///
+/// SDK 는 모르는 `error` 값을 `AuthErrorCause.unknown` 으로 바꾸며 원문을 버린다
+/// (kakao_flutter_sdk_auth 1.10.0 `_parseCode` → `KakaoAuthException.fromJson`). 남는 것은
+/// 카카오가 붙인 `errorDescription` 뿐이라 정제해서 남긴다. `KakaoAuthException` 이 아니면 null.
+String? kakaoErrorDetail(Object error) => error is KakaoAuthException
+    ? sanitizeProviderErrorDetail(error.errorDescription)
+    : null;
+
+/// 공급자 설명 문구 정제. 결과는 `NONE` · `HASH_{8hex}` · 허용 문자만의 80자 이하 문구 중 하나다.
+/// 웹 `/api/log` 는 이 세 형식만 통과시킨다 (재정제·해시 계산 없음).
+String sanitizeProviderErrorDetail(String? raw) {
+  final normalized = (raw ?? '').replaceAll(RegExp(r'\s+'), ' ').trim();
+  if (normalized.isEmpty) return 'NONE';
+  var masked = normalized
+      .replaceAll(RegExp(r'[^\s@]+@[^\s@]+'), '#')
+      .replaceAll(RegExp(r'[0-9]{5,}'), '#')
+      .replaceAll(RegExp(r'[A-Za-z0-9_-]{20,}'), '#');
+  if (masked.length > _maxDetailLength) {
+    masked = masked.substring(0, _maxDetailLength);
+  }
+  if (providerErrorDetailPattern.hasMatch(masked)) return masked;
+  final hash = _fnv1aBytes(utf8.encode(normalized));
+  return 'HASH_${hash.toRadixString(16).padLeft(8, '0')}';
+}
+
+const _maxDetailLength = 80;
+
+/// 정제 문구 허용 형식. `=`·`?`·`&` 가 없으므로 `key=value`·쿼리스트링은 HASH 가 된다.
+final providerErrorDetailPattern = RegExp(r"^[A-Za-z0-9가-힣 ._:/#,'()-]{1,80}$");
+
+int _fnv1aBytes(List<int> bytes) {
+  var h = 0x811c9dc5;
+  for (final b in bytes) {
+    h = ((h ^ b) * 0x01000193) & 0xffffffff;
+  }
+  return h;
+}
 
 String _kakaoReason(Object error) {
   if (error is KakaoClientException) {
@@ -219,6 +258,8 @@ const authFailureTraceStringKeys = [
   'failureCause',
   'serverErrorCode',
   'fallbackFromCause',
+  'providerErrorDetail',
+  'fallbackFromDetail',
   'appLifecycleState',
   'iosSceneActivationState',
   'osVersion',

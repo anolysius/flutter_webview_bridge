@@ -294,4 +294,69 @@ void main() {
       }
     });
   });
+
+  group(
+    'sanitizeProviderErrorDetail — 경계 케이스 표 (plan kakao-auth-error-detail)',
+    () {
+      // 웹 /api/log 테스트가 오른쪽 열을 '통과' 입력으로 그대로 쓴다.
+      final cases = <(String?, String)>[
+        (null, 'NONE'),
+        ('   ', 'NONE'),
+        ('User  denied   access', 'User denied access'),
+        ('사용자가 취소했습니다.', '사용자가 취소했습니다.'),
+        ('invalid user a.b@c.com', 'invalid user #'),
+        ('user 1234567 not found', 'user # not found'),
+        ('token abcdefghijklmnopqrstuvwxyz012 expired', 'token # expired'),
+        ('ab ' * 40, ('ab ' * 40).substring(0, 80)),
+        ('redirect_uri=kakao://oauth', 'HASH_4449b457'),
+        ('오류 🙁', 'HASH_ddf02510'),
+        (
+          'Invalid scope: (profile_nickname, account_email)',
+          'Invalid scope: (profile_nickname, account_email)',
+        ),
+      ];
+
+      for (final (input, expected) in cases) {
+        test('$input → $expected', () {
+          final out = sanitizeProviderErrorDetail(input);
+          expect(out, expected);
+          expect(
+            out == 'NONE' ||
+                RegExp(r'^HASH_[0-9a-f]{8}$').hasMatch(out) ||
+                providerErrorDetailPattern.hasMatch(out),
+            isTrue,
+          );
+        });
+      }
+    },
+  );
+
+  group('kakaoErrorDetail', () {
+    test('KakaoAuthException 만 설명 문구를 정제해 돌려준다', () {
+      expect(
+        kakaoErrorDetail(
+          KakaoAuthException(AuthErrorCause.unknown, 'User denied access'),
+        ),
+        'User denied access',
+      );
+      expect(
+        kakaoErrorDetail(KakaoAuthException(AuthErrorCause.unknown, null)),
+        'NONE',
+      );
+    });
+
+    test('다른 예외는 null — 필드를 싣지 않는다', () {
+      expect(
+        kakaoErrorDetail(
+          KakaoClientException(ClientErrorCause.cancelled, 'text'),
+        ),
+        isNull,
+      );
+      expect(
+        kakaoErrorDetail(KakaoApiException(ApiErrorCause.unknown, 'text')),
+        isNull,
+      );
+      expect(kakaoErrorDetail(PlatformException(code: 'CANCELED')), isNull);
+    });
+  });
 }

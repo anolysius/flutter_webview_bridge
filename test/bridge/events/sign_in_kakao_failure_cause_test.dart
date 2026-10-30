@@ -108,4 +108,68 @@ void main() {
     expect(error.failureContext['kakaoTalkInstalled'], isFalse);
     expect(error.failureContext.containsKey('fallbackFromCause'), isFalse);
   });
+
+  testWidgets('카카오톡 인증 오류(QA 실측 재현): 1차 오류 설명이 fallbackFromDetail 로 남는다', (
+    tester,
+  ) async {
+    kakao
+      ..talkInstalled = (() async => true)
+      ..loginWithTalk = (() async => throw KakaoAuthException(
+        AuthErrorCause.unknown,
+        'User  denied access a.b@c.com',
+      ))
+      ..loginWithAccount = (() async => throw _webAuth(3));
+
+    final error = await loginFailure(tester);
+
+    expect(error.failureCause, 'KAKAO_FALLBACK_WEBAUTH_3');
+    expect(
+      error.failureContext['fallbackFromCause'],
+      'KAKAO_TALK_AUTH_UNKNOWN',
+    );
+    expect(error.failureContext['fallbackFromDetail'], 'User denied access #');
+    // 최종 예외는 KakaoAuthException 이 아니므로 providerErrorDetail 은 없다.
+    expect(error.failureContext.containsKey('providerErrorDetail'), isFalse);
+    expect(error.code, AuthErrorCode.userCancelled);
+  });
+
+  testWidgets('설명 없는 카카오톡 인증 오류는 NONE 으로 남는다', (tester) async {
+    kakao
+      ..talkInstalled = (() async => true)
+      ..loginWithTalk = (() async =>
+          throw KakaoAuthException(AuthErrorCause.unknown, null))
+      ..loginWithAccount = (() async => throw _webAuth(3));
+
+    final error = await loginFailure(tester);
+
+    expect(error.failureContext['fallbackFromDetail'], 'NONE');
+  });
+
+  testWidgets('최종 실패가 카카오 인증 오류면 providerErrorDetail 이 남는다', (tester) async {
+    kakao
+      ..talkInstalled = (() async => false)
+      ..loginWithAccount = (() async => throw KakaoAuthException(
+        AuthErrorCause.invalidScope,
+        'Invalid scope',
+      ));
+
+    final error = await loginFailure(tester);
+
+    expect(error.failureCause, 'KAKAO_ACCOUNT_AUTH_INVALID_SCOPE');
+    expect(error.failureContext['providerErrorDetail'], 'Invalid scope');
+    expect(error.failureContext.containsKey('fallbackFromDetail'), isFalse);
+  });
+
+  testWidgets('카카오 인증 오류가 아닌 실패에는 두 필드가 없다', (tester) async {
+    kakao
+      ..talkInstalled = (() async => true)
+      ..loginWithTalk = (() async =>
+          throw KakaoClientException(ClientErrorCause.notSupported, 'x'))
+      ..loginWithAccount = (() async => throw _webAuth(1));
+
+    final error = await loginFailure(tester);
+
+    expect(error.failureContext.containsKey('fallbackFromDetail'), isFalse);
+    expect(error.failureContext.containsKey('providerErrorDetail'), isFalse);
+  });
 }

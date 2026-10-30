@@ -49,6 +49,7 @@ class SignInKakao {
       var step = KakaoAuthStep.account;
       final stepWatch = Stopwatch()..start();
       String? fallbackFromCause;
+      String? fallbackFromDetail;
       bool? kakaoTalkInstalled;
 
       try {
@@ -76,6 +77,7 @@ class SignInKakao {
             // 카카오톡에 연결된 카카오계정이 없는 경우, 카카오계정으로 로그인
             // 카카오톡이 왜 실패했는지는 fallback 실패 원인과 함께 남긴다 (1차 원인 보존).
             fallbackFromCause = kakaoFailureCause(KakaoAuthStep.talk, error);
+            fallbackFromDetail = kakaoErrorDetail(error);
             step = KakaoAuthStep.fallback;
             stepWatch.reset();
             try {
@@ -192,6 +194,8 @@ class SignInKakao {
             'stepElapsedMs': stepWatch.elapsedMilliseconds,
             'kakaoTalkInstalled': ?kakaoTalkInstalled,
             'fallbackFromCause': ?fallbackFromCause,
+            'fallbackFromDetail': ?fallbackFromDetail,
+            'providerErrorDetail': ?kakaoErrorDetail(e),
           },
         );
       }

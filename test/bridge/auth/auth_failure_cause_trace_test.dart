@@ -82,6 +82,7 @@ const _fallbackPresentationFailure = AuthError(
   failureCause: 'KAKAO_FALLBACK_WEBAUTH_3',
   failureContext: {
     'fallbackFromCause': 'KAKAO_TALK_AUTH_ACCESS_DENIED',
+    'fallbackFromDetail': 'User denied access',
     'stepElapsedMs': 1140,
     'kakaoTalkInstalled': true,
   },
@@ -151,6 +152,8 @@ void main() {
 
     expect(terminal['failureCause'], 'KAKAO_FALLBACK_WEBAUTH_3');
     expect(terminal['fallbackFromCause'], 'KAKAO_TALK_AUTH_ACCESS_DENIED');
+    expect(terminal['fallbackFromDetail'], 'User denied access');
+    expect(terminal.containsKey('providerErrorDetail'), isFalse);
     expect(terminal['stepElapsedMs'], 1140);
     expect(terminal['kakaoTalkInstalled'], isTrue);
     expect(terminal['appLifecycleState'], 'resumed');
@@ -172,6 +175,7 @@ void main() {
     expect(data['nativeSdkErrorCode'], 'KAKAO_USER_CANCELLED');
     expect(data['failureCause'], 'KAKAO_FALLBACK_WEBAUTH_3');
     expect(data['fallbackFromCause'], 'KAKAO_TALK_AUTH_ACCESS_DENIED');
+    expect(data['fallbackFromDetail'], 'User denied access');
   });
 
   scenario('진단 수집이 끝나지 않아도 AUTH_ERROR 는 즉시 나간다 (AC6c)', (tester) async {
