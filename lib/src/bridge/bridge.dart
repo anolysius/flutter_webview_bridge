@@ -27,6 +27,7 @@ import 'events/open_in_app_browser.dart';
 import 'events/photo_library_access.dart';
 import 'events/push_token.dart';
 import 'events/refresh_token.dart';
+import 'events/request_app_review.dart';
 import 'events/service_country.dart';
 import 'events/set_clipboard.dart';
 import 'events/sign_in_apple.dart';
@@ -2941,6 +2942,11 @@ class FlutterWebViewBridgeJavaScriptChannel {
             case WebViewBridgeFeatureType.setClipboard:
               sendData = await SetClipboardEvent().process(context, data);
               break;
+            case WebViewBridgeFeatureType.requestAppReview:
+              // web → native 단방향. 웹은 응답을 기다리지 않으므로 echo 없이 종료.
+              // Android 리뷰 플로우가 끝날 때까지 다른 메시지를 막지 않게 await 하지 않는다.
+              unawaited(RequestAppReviewEvent().process(data));
+              return;
             case WebViewBridgeFeatureType.getClipboard:
               sendData = await GetClipboardEvent().process(context);
               break;
