@@ -26,6 +26,42 @@ class SignInKakao {
   @visibleForTesting
   Future<OAuthToken> Function() loginWithAccount = () =>
       UserApi.instance.loginWithKakaoAccount();
+  @visibleForTesting
+  AppLifecycleState? Function() lifecycleState = () =>
+      WidgetsBinding.instance.lifecycleState;
+  @visibleForTesting
+  Future<void> Function(Duration timeout) waitForResumed = _waitForResumed;
+
+  /// 카카오톡 → 카카오계정 fallback 전 앱 활성 대기 상한.
+  static const fallbackResumeTimeout = Duration(milliseconds: 2000);
+
+  /// 이번 로그인의 카카오톡 실패 → 카카오계정 fallback 문맥. 성공한 시도에서도 원격 로그에
+  /// 싣기 위해(구제 수 측정) bridge 가 provider 완료 시점에 [takeFallbackContext] 로 가져간다.
+  Map<String, Object> _fallbackContext = const {};
+
+  /// fallback 문맥을 꺼내고 비운다. 한 번만 돌려주므로 다음 시도로 새지 않는다.
+  Map<String, Object> takeFallbackContext() {
+    final context = _fallbackContext;
+    _fallbackContext = const {};
+    return context;
+  }
+
+  static Future<void> _waitForResumed(Duration timeout) async {
+    final resumed = Completer<void>();
+    final listener = AppLifecycleListener(
+      onResume: () {
+        if (!resumed.isCompleted) resumed.complete();
+      },
+    );
+    try {
+      if (WidgetsBinding.instance.lifecycleState == AppLifecycleState.resumed) {
+        return;
+      }
+      await resumed.future.timeout(timeout, onTimeout: () {});
+    } finally {
+      listener.dispose();
+    }
+  }
 
   void initialize({required String? nativeAppKey, String? javaScriptAppKey}) {
     if (_isInitialized) return;
@@ -50,7 +86,10 @@ class SignInKakao {
       final stepWatch = Stopwatch()..start();
       String? fallbackFromCause;
       String? fallbackFromDetail;
+      int? fallbackFromElapsedMs;
+      int? fallbackWaitMs;
       bool? kakaoTalkInstalled;
+      _fallbackContext = const {};
 
       try {
         String? idToken;
@@ -74,10 +113,25 @@ class SignInKakao {
             if (error is PlatformException && error.code == 'CANCELED') {
               rethrow;
             }
-            // 카카오톡에 연결된 카카오계정이 없는 경우, 카카오계정으로 로그인
-            // 카카오톡이 왜 실패했는지는 fallback 실패 원인과 함께 남긴다 (1차 원인 보존).
+            // 그 외 카카오톡 실패(카카오톡의 사용자 취소 error=cancelled 포함)는 카카오계정으로 로그인
+            // — 카카오 공식 구현 예제. 카카오톡이 왜 실패했는지는 1차 원인으로 함께 남긴다.
             fallbackFromCause = kakaoFailureCause(KakaoAuthStep.talk, error);
             fallbackFromDetail = kakaoErrorDetail(error);
+            fallbackFromElapsedMs = stepWatch.elapsedMilliseconds;
+            // 카카오톡에서 막 돌아온 순간은 앱이 아직 비활성이라 iOS 가 카카오계정 창
+            // (ASWebAuthenticationSession)을 즉시 거부한다(오류 3, 2026-10-30 실측 8ms).
+            // 활성화될 때까지 기다린 뒤 띄운다. 상한을 넘기면 그대로 진행한다.
+            final waitWatch = Stopwatch()..start();
+            if (lifecycleState() != AppLifecycleState.resumed) {
+              await waitForResumed(fallbackResumeTimeout);
+            }
+            fallbackWaitMs = waitWatch.elapsedMilliseconds;
+            _fallbackContext = {
+              'fallbackFromCause': fallbackFromCause,
+              'fallbackFromDetail': ?fallbackFromDetail,
+              'fallbackFromElapsedMs': fallbackFromElapsedMs,
+              'fallbackWaitMs': fallbackWaitMs,
+            };
             step = KakaoAuthStep.fallback;
             stepWatch.reset();
             try {
@@ -195,6 +249,8 @@ class SignInKakao {
             'kakaoTalkInstalled': ?kakaoTalkInstalled,
             'fallbackFromCause': ?fallbackFromCause,
             'fallbackFromDetail': ?fallbackFromDetail,
+            'fallbackFromElapsedMs': ?fallbackFromElapsedMs,
+            'fallbackWaitMs': ?fallbackWaitMs,
             'providerErrorDetail': ?kakaoErrorDetail(e),
           },
         );

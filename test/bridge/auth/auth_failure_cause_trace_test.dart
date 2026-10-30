@@ -7,6 +7,8 @@ import 'package:flutter_webview_bridge/flutter_webview_bridge.dart';
 import 'package:flutter_webview_bridge/src/bridge/auth/process_auth_attempt_coordinator.dart';
 import 'package:flutter_webview_bridge/src/bridge/events/auth_error.dart';
 import 'package:flutter_webview_bridge/src/bridge/events/auth_error_mapper.dart';
+import 'package:flutter_webview_bridge/src/bridge/events/sign_in_kakao.dart';
+import 'package:kakao_flutter_sdk/kakao_flutter_sdk.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:webview_flutter/webview_flutter.dart';
 import 'package:webview_flutter_platform_interface/webview_flutter_platform_interface.dart';
@@ -247,6 +249,119 @@ void main() {
       ),
     );
     expect(terminalOf(run.traces)['resultCode'], 'user_cancelled');
+  });
+
+  scenario('카카오톡 실패 → 카카오계정 성공: provider 완료 뒤 terminal 에 fallback 문맥 (AC4b)', (
+    tester,
+  ) async {
+    final kakao = SignInKakao.shared;
+    final originals = (
+      kakao.talkInstalled,
+      kakao.loginWithTalk,
+      kakao.loginWithAccount,
+      kakao.lifecycleState,
+    );
+    addTearDown(() {
+      kakao
+        ..talkInstalled = originals.$1
+        ..loginWithTalk = originals.$2
+        ..loginWithAccount = originals.$3
+        ..lifecycleState = originals.$4;
+    });
+    var talkFails = true;
+    kakao
+      ..talkInstalled = (() async => true)
+      ..lifecycleState = (() => AppLifecycleState.resumed)
+      ..loginWithTalk = (() async {
+        if (talkFails) {
+          throw KakaoAuthException(
+            AuthErrorCause.unknown,
+            'The%20User%20Cancelled%20Your%20Request',
+          );
+        }
+        return OAuthToken(
+          'a',
+          DateTime(2100),
+          'r',
+          DateTime(2100),
+          const [],
+          idToken: 'id-talk',
+        );
+      })
+      ..loginWithAccount = (() async => OAuthToken(
+        'a',
+        DateTime(2100),
+        'r',
+        DateTime(2100),
+        const [],
+        idToken: 'id-account',
+      ));
+
+    Future<List<Map<String, Object?>>> runAttempt() async {
+      final context = await _mountedContext(tester);
+      final traces = <Map<String, Object?>>[];
+      final channel = FlutterWebViewBridgeJavaScriptChannel(
+        context: context,
+        webViewController: WebViewController.fromPlatform(_WebView()),
+        googleServerClientId: null,
+        kakaoNativeAppKey: null,
+        serviceCountry: 'KR',
+        apiBaseUrl: null,
+        onAuthTrace: traces.add,
+        testAuthProviderOperation: (_, ctx, _) =>
+            SignInKakao.shared.process(ctx, action: 'login'),
+      );
+      addTearDown(() {
+        channel.resetAuthStateForServiceCountrySwitch('test-cleanup');
+        channel.dispose();
+      });
+      unawaited(channel.onMessageReceived(_kakaoLogin(++_attemptSeq)));
+      await _pumpUntil(
+        tester,
+        () => traces.any((t) => t['event'] == 'auth.terminal'),
+      );
+      // me() 재시도 지연(100ms + 500ms) 뒤 provider 완료 → 교환 단계 terminal.
+      // me() 재시도 지연(100ms + 500ms) 뒤 provider 완료.
+      for (
+        var i = 0;
+        i < 40 && !traces.any((t) => t['event'] == 'auth.provider.completed');
+        i++
+      ) {
+        await tester.pump(const Duration(milliseconds: 100));
+      }
+      // 성공 terminal 은 웹 UI 확인(AUTH_UI_COMMITTED)까지 필요해 여기서는 시도를 다른 방식으로
+      // 끝낸다. fallback 문맥은 provider 완료 시점에 잡혀 _emitAuthTerminal 이 모든 terminal 에
+      // 같은 방식으로 싣는다 — 어떤 terminal 이든 같은 경로다.
+      channel.resetAuthStateForServiceCountrySwitch('test-end-attempt');
+      await _pumpUntil(
+        tester,
+        () => traces.any((t) => t['event'] == 'auth.terminal'),
+      );
+      return traces;
+    }
+
+    final rescued = await runAttempt();
+    final completed = rescued.where(
+      (t) => t['event'] == 'auth.provider.completed',
+    );
+    expect(completed, hasLength(1));
+    final terminal = terminalOf(rescued);
+    expect(terminal['fallbackFromCause'], 'KAKAO_TALK_AUTH_CANCELLED');
+    expect(terminal['fallbackFromDetail'], 'The User Cancelled Your Request');
+    expect(terminal['fallbackFromElapsedMs'], isA<int>());
+    expect(terminal['fallbackWaitMs'], isA<int>());
+    expect(
+      terminal.containsKey('failureCause') ? terminal['failureCause'] : null,
+      isNot('KAKAO_FALLBACK_WEBAUTH_3'),
+    );
+
+    // 카카오톡이 바로 성공한 다음 시도에는 fallback 문맥이 없다.
+    talkFails = false;
+    ProcessAuthAttemptCoordinator.shared.resetForAuthBoundary();
+    final direct = await runAttempt();
+    final next = terminalOf(direct);
+    expect(next.containsKey('fallbackFromCause'), isFalse);
+    expect(next.containsKey('fallbackWaitMs'), isFalse);
   });
 
   testWidgets('로그인 실패 원인 trace 시나리오', (tester) async {

@@ -1,5 +1,5 @@
 import 'dart:async' show TimeoutException;
-import 'dart:convert' show jsonDecode, utf8;
+import 'dart:convert' show jsonDecode;
 import 'dart:io' show SocketException;
 
 import 'package:flutter/services.dart' show PlatformException;
@@ -7,6 +7,7 @@ import 'package:google_sign_in/google_sign_in.dart' show GoogleSignInException;
 import 'package:http/http.dart' as http show ClientException;
 import 'package:kakao_flutter_sdk/kakao_flutter_sdk.dart'
     show
+        AuthErrorCause,
         KakaoApiException,
         KakaoAppsException,
         KakaoAuthException,
@@ -89,41 +90,67 @@ String? kakaoErrorDetail(Object error) => error is KakaoAuthException
     ? sanitizeProviderErrorDetail(error.errorDescription)
     : null;
 
-/// 공급자 설명 문구 정제. 결과는 `NONE` · `HASH_{8hex}` · 허용 문자만의 80자 이하 문구 중 하나다.
-/// 웹 `/api/log` 는 이 세 형식만 통과시킨다 (재정제·해시 계산 없음).
+/// 공급자 설명 문구 정제. 결과는 `NONE` 또는 허용 문자만의 80자 이하 문구다 — 항상 사람이 읽을 수 있다.
+///
+/// 카카오톡은 설명을 이중 인코딩해 보내므로(`The%2520User…`, SDK 가 한 번 풀어 `%20` 이 남음)
+/// `%XX` 가 남아 있으면 최대 2회 더 푼다. 계정·전화·토큰은 `#` 로 가리고, 허용 밖 문자는 `_` 로
+/// 바꾼다. 웹 `/api/log` 는 이 형식(과 옛 앱의 `HASH_`)만 통과시킨다.
 String sanitizeProviderErrorDetail(String? raw) {
-  final normalized = (raw ?? '').replaceAll(RegExp(r'\s+'), ' ').trim();
-  if (normalized.isEmpty) return 'NONE';
+  final normalized = _decodePercentEscapes(
+    raw ?? '',
+  ).replaceAll(RegExp(r'\s+'), ' ').trim();
   var masked = normalized
       .replaceAll(RegExp(r'[^\s@]+@[^\s@]+'), '#')
       .replaceAll(RegExp(r'[0-9]{5,}'), '#')
-      .replaceAll(RegExp(r'[A-Za-z0-9_-]{20,}'), '#');
+      .replaceAll(RegExp(r'[A-Za-z0-9_-]{20,}'), '#')
+      .replaceAll(_disallowedDetailChars, '_')
+      .replaceAll(RegExp('_{2,}'), '_');
   if (masked.length > _maxDetailLength) {
     masked = masked.substring(0, _maxDetailLength);
   }
-  if (providerErrorDetailPattern.hasMatch(masked)) return masked;
-  final hash = _fnv1aBytes(utf8.encode(normalized));
-  return 'HASH_${hash.toRadixString(16).padLeft(8, '0')}';
+  masked = masked.trim();
+  return masked.isEmpty ? 'NONE' : masked;
 }
 
 const _maxDetailLength = 80;
 
-/// 정제 문구 허용 형식. `=`·`?`·`&` 가 없으므로 `key=value`·쿼리스트링은 HASH 가 된다.
+final _disallowedDetailChars = RegExp(r"[^A-Za-z0-9가-힣 ._:/#,'()-]+");
+
+/// 정제 문구 허용 형식. `=`·`?`·`&` 는 `_` 로 바뀌어 `key=value`·쿼리스트링이 값째 남지 않는다.
 final providerErrorDetailPattern = RegExp(r"^[A-Za-z0-9가-힣 ._:/#,'()-]{1,80}$");
 
-int _fnv1aBytes(List<int> bytes) {
-  var h = 0x811c9dc5;
-  for (final b in bytes) {
-    h = ((h ^ b) * 0x01000193) & 0xffffffff;
+final _percentEscape = RegExp('%[0-9A-Fa-f]{2}');
+
+String _decodePercentEscapes(String text) {
+  var out = text;
+  for (var i = 0; i < 2 && _percentEscape.hasMatch(out); i++) {
+    try {
+      out = Uri.decodeComponent(out);
+    } on ArgumentError {
+      break;
+    }
   }
-  return h;
+  return out;
 }
+
+/// 카카오톡이 돌려준 사용자 취소 — `error=cancelled`.
+///
+/// SDK 1.10.0 `AuthErrorCause` 에 `cancelled` 가 없어 `unknown` 이 되고 원문이 버려지므로, 남아
+/// 있는 설명(`The User Cancelled Your Request`, 이중 인코딩)으로 판별한다. 원인 코드는
+/// `AUTH_CANCELLED` — SDK 가 나중에 `cancelled` enum 을 추가해도 같은 이름이 된다.
+bool isKakaoAuthCancel(Object error) =>
+    error is KakaoAuthException &&
+    error.error == AuthErrorCause.unknown &&
+    _decodePercentEscapes(
+      error.errorDescription ?? '',
+    ).toLowerCase().contains('cancel');
 
 String _kakaoReason(Object error) {
   if (error is KakaoClientException) {
     return 'CLIENT_${_upperSnake(error.reason.name)}';
   }
   if (error is KakaoAuthException) {
+    if (isKakaoAuthCancel(error)) return 'AUTH_CANCELLED';
     return 'AUTH_${_upperSnake(error.error.name)}';
   }
   if (error is KakaoApiException) return 'API_${_upperSnake(error.code.name)}';
@@ -172,6 +199,8 @@ final _userCancelled = [
   RegExp(r'^KAKAO_[A-Z]+_WEBAUTH_1$'),
   RegExp(r'^KAKAO_[A-Z]+_CLIENT_CANCELLED$'),
   RegExp(r'^KAKAO_[A-Z]+_AUTH_ACCESS_DENIED$'),
+  // 카카오톡의 사용자 취소 (`error=cancelled`, isKakaoAuthCancel).
+  RegExp(r'^KAKAO_[A-Z]+_AUTH_CANCELLED$'),
   // 카카오톡 기기 권한 요청 화면에서 뒤로 가기 (sign_in_kakao.dart 의 rethrow 분기).
   RegExp(r'^KAKAO_TALK_PLATFORM_CANCELED$'),
   RegExp(r'^GOOGLE_SIGN_IN_CANCELED$'),
@@ -265,5 +294,9 @@ const authFailureTraceStringKeys = [
   'osVersion',
   'deviceModel',
 ];
-const authFailureTraceIntKeys = ['stepElapsedMs'];
+const authFailureTraceIntKeys = [
+  'stepElapsedMs',
+  'fallbackFromElapsedMs',
+  'fallbackWaitMs',
+];
 const authFailureTraceBoolKeys = ['kakaoTalkInstalled', 'iosKeyWindowPresent'];

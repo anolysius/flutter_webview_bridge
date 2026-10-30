@@ -651,6 +651,10 @@ class FlutterWebViewBridgeJavaScriptChannel {
   ProcessAuthAttemptLease? _processAuthLease;
   final Stopwatch _authTotalElapsed = Stopwatch();
   int? _activeProviderElapsedMs;
+
+  /// 카카오톡 실패 → 카카오계정 fallback 문맥 (`SignInKakao.takeFallbackContext`). 실패뿐 아니라
+  /// 성공 terminal 에도 실어 fallback 으로 구제된 시도를 셀 수 있게 한다. 시도 시작 때 비운다.
+  Map<String, Object> _activeProviderContext = const {};
   final AuthRecoveryGate _authRecoveryGate = AuthRecoveryGate();
 
   bool get _ownsActiveInteractiveLease {
@@ -1029,6 +1033,9 @@ class FlutterWebViewBridgeJavaScriptChannel {
         'journey': _activeAuthJourney,
       if (_activeProviderElapsedMs != null)
         'providerElapsedMs': _activeProviderElapsedMs,
+      for (final entry in _activeProviderContext.entries)
+        if (!(data is Map && data.containsKey(entry.key)))
+          entry.key: entry.value,
       if (convergenceElapsedMs != null)
         'convergenceElapsedMs': convergenceElapsedMs,
       if (_authTotalElapsed.isRunning ||
@@ -1122,9 +1129,16 @@ class FlutterWebViewBridgeJavaScriptChannel {
     _autoAuthAttempt.clearActiveAttempt();
   }
 
+  void _resetProviderContext() {
+    _activeProviderContext = const {};
+    // 이전 시도가 provider 완료 전에 끝나 남긴 문맥이 이번 시도로 새지 않게 비운다.
+    SignInKakao.shared.takeFallbackContext();
+  }
+
   void _markProviderCompleted(dynamic data) {
     if (_activeProviderElapsedMs != null) return;
     _activeProviderElapsedMs = _authTotalElapsed.elapsedMilliseconds;
+    _activeProviderContext = SignInKakao.shared.takeFallbackContext();
     _emitAuthTrace('auth.provider.completed', data: data);
   }
 
@@ -1532,6 +1546,7 @@ class FlutterWebViewBridgeJavaScriptChannel {
         ..reset()
         ..start();
       _activeProviderElapsedMs = null;
+      _resetProviderContext();
       _rememberActiveAuthCorrelation(attemptId: attemptId);
       _activeAuthAbortCompleter = null;
       // refresh 교환 중에는 network/provider 응답을 기다리므로 짧은 UI deadline을
@@ -1714,6 +1729,7 @@ class FlutterWebViewBridgeJavaScriptChannel {
       ..reset()
       ..start();
     _activeProviderElapsedMs = null;
+    _resetProviderContext();
     final nextRevision = await const AuthRevisionStore().nextIfCurrent(
       serviceCountry: serviceCountry,
       isCurrent: () =>

@@ -20,13 +20,26 @@ void main() {
     kakao.talkInstalled,
     kakao.loginWithTalk,
     kakao.loginWithAccount,
+    kakao.lifecycleState,
+    kakao.waitForResumed,
   );
+  final waits = <Duration>[];
+
+  setUp(() {
+    waits.clear();
+    kakao
+      ..lifecycleState = (() => AppLifecycleState.resumed)
+      ..waitForResumed = ((timeout) async => waits.add(timeout));
+  });
 
   tearDown(() {
     kakao
       ..talkInstalled = originals.$1
       ..loginWithTalk = originals.$2
-      ..loginWithAccount = originals.$3;
+      ..loginWithAccount = originals.$3
+      ..lifecycleState = originals.$4
+      ..waitForResumed = originals.$5;
+    kakao.takeFallbackContext();
   });
 
   Future<AuthError> loginFailure(WidgetTester tester) async {
@@ -171,5 +184,114 @@ void main() {
 
     expect(error.failureContext.containsKey('fallbackFromDetail'), isFalse);
     expect(error.failureContext.containsKey('providerErrorDetail'), isFalse);
+  });
+
+  group('카카오톡 실패 → 활성 대기 → 카카오계정 (kakao-talk-cancel-fallback)', () {
+    KakaoAuthException talkCancel() => KakaoAuthException(
+      AuthErrorCause.unknown,
+      'The%20User%20Cancelled%20Your%20Request',
+    );
+
+    testWidgets('카카오톡 취소도 카카오계정으로 이어 가고, 비활성이면 활성까지 기다린다', (tester) async {
+      var accountCalls = 0;
+      kakao
+        ..talkInstalled = (() async => true)
+        ..loginWithTalk = (() async => throw talkCancel())
+        ..lifecycleState = (() => AppLifecycleState.inactive)
+        ..loginWithAccount = (() async {
+          accountCalls++;
+          throw _webAuth(1);
+        });
+
+      final error = await loginFailure(tester);
+
+      expect(accountCalls, 1);
+      expect(waits, [SignInKakao.fallbackResumeTimeout]);
+      expect(error.failureCause, 'KAKAO_FALLBACK_WEBAUTH_1');
+      expect(
+        error.failureContext['fallbackFromCause'],
+        'KAKAO_TALK_AUTH_CANCELLED',
+      );
+      expect(
+        error.failureContext['fallbackFromDetail'],
+        'The User Cancelled Your Request',
+      );
+      expect(error.failureContext['fallbackFromElapsedMs'], isA<int>());
+      expect(error.failureContext['fallbackWaitMs'], isA<int>());
+      expect(error.code, AuthErrorCode.userCancelled);
+    });
+
+    testWidgets('이미 활성이면 기다리지 않는다', (tester) async {
+      kakao
+        ..talkInstalled = (() async => true)
+        ..loginWithTalk = (() async => throw talkCancel())
+        ..loginWithAccount = (() async => throw _webAuth(1));
+
+      final error = await loginFailure(tester);
+
+      expect(waits, isEmpty);
+      expect(error.failureContext['fallbackWaitMs'], isA<int>());
+    });
+
+    testWidgets('기기 권한 화면 뒤로 가기(PlatformException CANCELED)는 카카오계정으로 가지 않는다', (
+      tester,
+    ) async {
+      var accountCalls = 0;
+      kakao
+        ..talkInstalled = (() async => true)
+        ..loginWithTalk = (() async =>
+            throw PlatformException(code: 'CANCELED'))
+        ..lifecycleState = (() => AppLifecycleState.inactive)
+        ..loginWithAccount = (() async {
+          accountCalls++;
+          throw _webAuth(1);
+        });
+
+      final error = await loginFailure(tester);
+
+      expect(accountCalls, 0);
+      expect(waits, isEmpty);
+      expect(error.failureCause, 'KAKAO_TALK_PLATFORM_CANCELED');
+      expect(error.failureContext.containsKey('fallbackFromCause'), isFalse);
+    });
+
+    testWidgets('카카오톡 미설치는 앱 전환이 없어 기다리지 않는다', (tester) async {
+      kakao
+        ..talkInstalled = (() async => false)
+        ..lifecycleState = (() => AppLifecycleState.inactive)
+        ..loginWithAccount = (() async => throw _webAuth(1));
+
+      final error = await loginFailure(tester);
+
+      expect(waits, isEmpty);
+      expect(error.failureCause, 'KAKAO_ACCOUNT_WEBAUTH_1');
+      expect(error.failureContext.containsKey('fallbackWaitMs'), isFalse);
+    });
+
+    testWidgets('fallback 문맥은 한 번만 꺼내지고, 다음 로그인 시작 때 비워진다', (tester) async {
+      kakao
+        ..talkInstalled = (() async => true)
+        ..loginWithTalk = (() async => throw talkCancel())
+        ..loginWithAccount = (() async => throw _webAuth(1));
+      await loginFailure(tester);
+
+      // 실패한 시도의 문맥이 남아도 다음 카카오 로그인 시작 때 비워진다.
+      kakao
+        ..talkInstalled = (() async => false)
+        ..loginWithAccount = (() async => throw _webAuth(1));
+      await loginFailure(tester);
+      expect(kakao.takeFallbackContext(), isEmpty);
+
+      kakao
+        ..talkInstalled = (() async => true)
+        ..loginWithTalk = (() async => throw talkCancel())
+        ..loginWithAccount = (() async => throw _webAuth(1));
+      await loginFailure(tester);
+      final context = kakao.takeFallbackContext();
+      expect(context['fallbackFromCause'], 'KAKAO_TALK_AUTH_CANCELLED');
+      expect(context['fallbackFromElapsedMs'], isA<int>());
+      expect(context['fallbackWaitMs'], isA<int>());
+      expect(kakao.takeFallbackContext(), isEmpty);
+    });
   });
 }

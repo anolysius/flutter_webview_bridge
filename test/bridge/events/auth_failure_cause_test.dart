@@ -308,8 +308,18 @@ void main() {
         ('user 1234567 not found', 'user # not found'),
         ('token abcdefghijklmnopqrstuvwxyz012 expired', 'token # expired'),
         ('ab ' * 40, ('ab ' * 40).substring(0, 80)),
-        ('redirect_uri=kakao://oauth', 'HASH_4449b457'),
-        ('오류 🙁', 'HASH_ddf02510'),
+        ('redirect_uri=kakao://oauth', 'redirect_uri_kakao://oauth'),
+        ('오류 🙁', '오류 _'),
+        // 2026-10-30 QA 실측: 카카오톡 error_description 이중 인코딩 (SDK 가 한 번 푼 상태)
+        (
+          'The%20User%20Cancelled%20Your%20Request',
+          'The User Cancelled Your Request',
+        ),
+        (
+          'The%2520User%2520Cancelled%2520Your%2520Request',
+          'The User Cancelled Your Request',
+        ),
+        ('100% sure', '100_ sure'),
         (
           'Invalid scope: (profile_nickname, account_email)',
           'Invalid scope: (profile_nickname, account_email)',
@@ -321,11 +331,10 @@ void main() {
           final out = sanitizeProviderErrorDetail(input);
           expect(out, expected);
           expect(
-            out == 'NONE' ||
-                RegExp(r'^HASH_[0-9a-f]{8}$').hasMatch(out) ||
-                providerErrorDetailPattern.hasMatch(out),
+            out == 'NONE' || providerErrorDetailPattern.hasMatch(out),
             isTrue,
           );
+          expect(out, isNot(startsWith('HASH_')));
         });
       }
     },
@@ -357,6 +366,43 @@ void main() {
         isNull,
       );
       expect(kakaoErrorDetail(PlatformException(code: 'CANCELED')), isNull);
+    });
+  });
+
+  group('isKakaoAuthCancel — 카카오톡 error=cancelled (SDK unknown)', () {
+    test('취소 설명이 있는 unknown 은 카카오톡 취소 원인으로 분리한다', () {
+      final error = KakaoAuthException(
+        AuthErrorCause.unknown,
+        'The%20User%20Cancelled%20Your%20Request',
+      );
+      expect(isKakaoAuthCancel(error), isTrue);
+      expect(
+        kakaoFailureCause(KakaoAuthStep.talk, error),
+        'KAKAO_TALK_AUTH_CANCELLED',
+      );
+      expect(
+        resultCodeForFailureCause('KAKAO_TALK_AUTH_CANCELLED'),
+        'user_cancelled',
+      );
+    });
+
+    test('취소 설명이 없는 unknown·다른 원인은 그대로 둔다', () {
+      final unknown = KakaoAuthException(AuthErrorCause.unknown, 'boom');
+      expect(isKakaoAuthCancel(unknown), isFalse);
+      expect(
+        kakaoFailureCause(KakaoAuthStep.talk, unknown),
+        'KAKAO_TALK_AUTH_UNKNOWN',
+      );
+      expect(
+        isKakaoAuthCancel(
+          KakaoAuthException(AuthErrorCause.invalidScope, 'cancel'),
+        ),
+        isFalse,
+      );
+      expect(
+        isKakaoAuthCancel(KakaoAuthException(AuthErrorCause.unknown, null)),
+        isFalse,
+      );
     });
   });
 }
