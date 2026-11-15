@@ -1117,6 +1117,12 @@ class FlutterWebViewBridgeJavaScriptChannel {
     if (_isDisposed || !identical(_processAuthLease, lease)) return;
     final supersededData = _activeAuthProtocolData();
     _emitAuthTerminal('user_superseded', data: supersededData);
+    // 다른 bridge 가 새 시도로 선점해도 이 bridge 의 메시지 큐가 끝나지 않는 provider
+    // future 에 묶여 있지 않게 대기를 끊는다(`_releaseStalledProviderBeforeSerial`).
+    final abortCompleter = _activeAuthAbortCompleter;
+    if (abortCompleter != null && !abortCompleter.isCompleted) {
+      abortCompleter.complete();
+    }
     _authEpoch += 1;
     _autoAuthAttempt.clearActiveAttempt();
     _clearSsoTransientState('process-auth-superseded');
@@ -2529,6 +2535,7 @@ class FlutterWebViewBridgeJavaScriptChannel {
     )) {
       return;
     }
+    _releaseStalledProviderBeforeSerial(message);
     final completion = _BridgeMessageCompletion();
     await _enqueueBridgeMessage(
       message,
@@ -2597,6 +2604,68 @@ class FlutterWebViewBridgeJavaScriptChannel {
       data: data,
     );
     return true;
+  }
+
+  /// provider SDK 가 결과를 돌려주지 않아 메시지 직렬 큐가 막힌 시도를 풀어 준다.
+  ///
+  /// 로그인 메시지는 `_messageSerial` 안에서 provider 결과를 기다린다. 계정 선택·동의
+  /// 화면은 사람 입력이라 deadline 이 없고, 기다림을 끊는 abort 는 새 요청이 큐를
+  /// 통과해야 일어나므로 SDK future 가 끝나지 않으면 이후 로그인 요청은 접수 ACK 도
+  /// 못 받고 앱 재시작까지 막힌다(2026-11-15 KR Android 1.5.2 실측 — 카카오 시도가
+  /// 16분간 미종결, 그 사이 새 시도 2건이 `BRIDGE_HANDLER_UNAVAILABLE`).
+  ///
+  /// 사용자가 앱 화면에서 다른 시도로 새 로그인 요청을 보냈다는 것은 이전 provider
+  /// 화면을 떠났다는 뜻이다. 중복 window 안의 재클릭은 기존처럼 보존하고, window 가
+  /// 지났거나 web 이 ACK timeout 재시도를 명시하면 이전 provider 대기만 끊는다.
+  /// 이전 시도의 terminal(`user_superseded`)과 새 시도 시작은 큐 안의 기존 선점 경로
+  /// (`tryBeginInteractive`)가 그대로 처리한다.
+  void _releaseStalledProviderBeforeSerial(JavaScriptMessage message) {
+    final abort = _activeAuthAbortCompleter;
+    final lease = _processAuthLease;
+    if (_isDisposed ||
+        abort == null ||
+        abort.isCompleted ||
+        lease == null ||
+        !_ownsActiveInteractiveLease ||
+        _authAttemptPhase.phase != AuthAttemptPhase.providerInteraction) {
+      return;
+    }
+
+    dynamic decoded;
+    try {
+      decoded = jsonDecode(message.message);
+    } catch (_) {
+      return;
+    }
+    if (decoded is! Map) return;
+    final type = decoded['type'];
+    final data = decoded['data'];
+    if (type is! String) return;
+    final featureType = type.webViewBridgeFeatureType;
+    if (featureType == null || !_isSsoLogin(featureType)) return;
+
+    final incomingAttemptId = _authSessionIdOf(data);
+    if (incomingAttemptId == null || incomingAttemptId == lease.attemptId) {
+      return;
+    }
+    final elapsed = DateTime.now().difference(lease.startedAt);
+    final retryAfterTimeout = data is Map && data['retryAfterTimeout'] == true;
+    if (!retryAfterTimeout &&
+        (elapsed.isNegative ||
+            elapsed < _processAuthCoordinator.interactiveDuplicateWindow)) {
+      return;
+    }
+
+    _emitAuthTrace(
+      'auth.attempt.stalled_provider_released',
+      resultCode: retryAfterTimeout ? 'retry_after_timeout' : 'new_attempt',
+      data: {
+        ..._activeAuthProtocolData(),
+        if (_activeAuthProvider != null) 'provider': _activeAuthProvider,
+        'stepElapsedMs': elapsed.inMilliseconds,
+      },
+    );
+    abort.complete();
   }
 
   Future<void> _enqueueBridgeMessage(
