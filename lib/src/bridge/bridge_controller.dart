@@ -160,6 +160,8 @@ class WebViewBridgeController {
     bool? isNotificationPermissionGranted,
     String? permissionStatus,
     String? tokenStatus,
+    String? deviceModel,
+    String? osVersion,
   }) async {
     if (_isTerminated) return;
     WebViewToken.update(
@@ -167,6 +169,8 @@ class WebViewBridgeController {
       permissionGranted: isNotificationPermissionGranted,
       permission: permissionStatus,
       status: tokenStatus,
+      deviceModel: deviceModel,
+      osVersion: osVersion,
     );
     final revision = WebViewToken.revision;
     return _executeOrQueue(
