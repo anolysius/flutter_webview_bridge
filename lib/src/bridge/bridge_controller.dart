@@ -49,6 +49,10 @@ class WebViewBridgeController {
     AuthContextStatusCallback? onAuthContextStatus,
     AuthContextRestartCallback? onAuthContextRestart,
     WebAuthContextCapabilityCallback? onWebAuthContextCapability,
+    // B3 알림 권한 기능. 채널을 처음 만들 때만 적용된다(재 init 은 컨트롤러만 교체).
+    PushPermissionCallback? onPushPermissionRequest,
+    PushPermissionCallback? onPushPermissionStatus,
+    PushPermissionCallback? onOpenNotificationSettings,
   }) {
     _isTerminated = false;
     validateServiceAuthContextPair(
@@ -103,6 +107,9 @@ class WebViewBridgeController {
       onAuthContextStatus: onAuthContextStatus,
       onAuthContextRestart: onAuthContextRestart,
       onWebAuthContextCapability: onWebAuthContextCapability,
+      onPushPermissionRequest: onPushPermissionRequest,
+      onPushPermissionStatus: onPushPermissionStatus,
+      onOpenNotificationSettings: onOpenNotificationSettings,
       webDocumentNavigationGeneration: _webDocumentNavigationGeneration,
     );
     _channel!.updateAppLifecycleState(_appLifecycleState);
@@ -162,6 +169,7 @@ class WebViewBridgeController {
     String? tokenStatus,
     String? deviceModel,
     String? osVersion,
+    bool? canRequestPermission,
   }) async {
     if (_isTerminated) return;
     WebViewToken.update(
@@ -171,6 +179,7 @@ class WebViewBridgeController {
       status: tokenStatus,
       deviceModel: deviceModel,
       osVersion: osVersion,
+      canRequestPermission: canRequestPermission,
     );
     final revision = WebViewToken.revision;
     return _executeOrQueue(

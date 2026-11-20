@@ -41,6 +41,9 @@ enum WebViewBridgeFeatureType {
   serviceCountryQuery,
   serviceCountryChange,
   requestAppReview,
+  pushPermissionRequest,
+  pushPermissionStatus,
+  openNotificationSettings,
 }
 
 extension WebViewBridgeFeatureTypeValue on WebViewBridgeFeatureType {
@@ -130,6 +133,12 @@ extension WebViewBridgeFeatureTypeValue on WebViewBridgeFeatureType {
         return 'SERVICE_COUNTRY_CHANGE';
       case WebViewBridgeFeatureType.requestAppReview:
         return 'REQUEST_APP_REVIEW';
+      case WebViewBridgeFeatureType.pushPermissionRequest:
+        return 'PUSH_PERMISSION_REQUEST';
+      case WebViewBridgeFeatureType.pushPermissionStatus:
+        return 'PUSH_PERMISSION_STATUS';
+      case WebViewBridgeFeatureType.openNotificationSettings:
+        return 'OPEN_NOTIFICATION_SETTINGS';
     }
   }
 }
@@ -221,6 +230,12 @@ extension WebViewBridgeFeatureTypeString on String {
         return WebViewBridgeFeatureType.serviceCountryChange;
       case 'REQUEST_APP_REVIEW':
         return WebViewBridgeFeatureType.requestAppReview;
+      case 'PUSH_PERMISSION_REQUEST':
+        return WebViewBridgeFeatureType.pushPermissionRequest;
+      case 'PUSH_PERMISSION_STATUS':
+        return WebViewBridgeFeatureType.pushPermissionStatus;
+      case 'OPEN_NOTIFICATION_SETTINGS':
+        return WebViewBridgeFeatureType.openNotificationSettings;
     }
     return null;
   }
