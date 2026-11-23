@@ -22,6 +22,8 @@ void main() {
     kakao.loginWithAccount,
     kakao.lifecycleState,
     kakao.waitForResumed,
+    kakao.fetchMe,
+    kakao.loginWithNewScopes,
   );
   final waits = <Duration>[];
 
@@ -38,7 +40,9 @@ void main() {
       ..loginWithTalk = originals.$2
       ..loginWithAccount = originals.$3
       ..lifecycleState = originals.$4
-      ..waitForResumed = originals.$5;
+      ..waitForResumed = originals.$5
+      ..fetchMe = originals.$6
+      ..loginWithNewScopes = originals.$7;
     kakao.takeFallbackContext();
   });
 
@@ -292,6 +296,131 @@ void main() {
       expect(context['fallbackFromElapsedMs'], isA<int>());
       expect(context['fallbackWaitMs'], isA<int>());
       expect(kakao.takeFallbackContext(), isEmpty);
+    });
+  });
+
+  group('카카오톡 성공 → 활성 대기 → 추가 동의 (kakao-scopes-resume-wait)', () {
+    OAuthToken token({String? idToken}) => OAuthToken(
+      'access',
+      DateTime(2100),
+      'refresh',
+      DateTime(2100),
+      const ['openid'],
+      idToken: idToken,
+    );
+    User needsPhone() => User.fromJson({
+      'id': 1,
+      'kakao_account': {'phone_number_needs_agreement': true},
+    });
+
+    testWidgets('카카오톡에서 막 돌아와 비활성이면 활성까지 기다린 뒤 추가 동의 창을 띄운다', (tester) async {
+      final order = <String>[];
+      var state = AppLifecycleState.inactive;
+      List<String>? requested;
+      kakao
+        ..talkInstalled = (() async => true)
+        ..loginWithTalk = (() async => token(idToken: 'talk'))
+        ..fetchMe = (() async => needsPhone())
+        ..lifecycleState = (() => state)
+        ..waitForResumed = ((timeout) async {
+          waits.add(timeout);
+          order.add('wait');
+          state = AppLifecycleState.resumed;
+        })
+        ..loginWithNewScopes = ((scopes) async {
+          order.add('scopes:$state');
+          requested = scopes;
+          return token(idToken: 'reissued');
+        });
+
+      await tester.pumpWidget(
+        Builder(
+          builder: (c) {
+            context = c;
+            return const SizedBox();
+          },
+        ),
+      );
+      final result = (await tester.runAsync(
+        () => kakao.process(context, action: 'login'),
+      ))!;
+
+      expect(waits, [SignInKakao.fallbackResumeTimeout]);
+      expect(order, ['wait', 'scopes:${AppLifecycleState.resumed}']);
+      expect(requested, ['phone_number', 'openid']);
+      expect((result['data'] as Map)['idToken'], 'reissued');
+    });
+
+    testWidgets('이미 활성이면 기다리지 않는다', (tester) async {
+      kakao
+        ..talkInstalled = (() async => true)
+        ..loginWithTalk = (() async => token(idToken: 'talk'))
+        ..fetchMe = (() async => needsPhone())
+        ..loginWithNewScopes = ((_) async => token(idToken: 'reissued'));
+
+      await tester.pumpWidget(
+        Builder(
+          builder: (c) {
+            context = c;
+            return const SizedBox();
+          },
+        ),
+      );
+      await tester.runAsync(() => kakao.process(context, action: 'login'));
+      expect(waits, isEmpty);
+    });
+
+    testWidgets('추가 동의가 필요 없으면 기다리지도 창을 띄우지도 않는다', (tester) async {
+      var scopesCalls = 0;
+      kakao
+        ..talkInstalled = (() async => true)
+        ..loginWithTalk = (() async => token(idToken: 'talk'))
+        ..fetchMe = (() async => User.fromJson({'id': 1}))
+        ..lifecycleState = (() => AppLifecycleState.inactive)
+        ..loginWithNewScopes = ((_) async {
+          scopesCalls++;
+          return token();
+        });
+
+      await tester.pumpWidget(
+        Builder(
+          builder: (c) {
+            context = c;
+            return const SizedBox();
+          },
+        ),
+      );
+      await tester.runAsync(() => kakao.process(context, action: 'login'));
+      expect(waits, isEmpty);
+      expect(scopesCalls, 0);
+    });
+
+    testWidgets('기다려도 창이 거부되면 SCOPES 단계 WEBAUTH_3 로 남는다', (tester) async {
+      kakao
+        ..talkInstalled = (() async => true)
+        ..loginWithTalk = (() async => token(idToken: 'talk'))
+        ..fetchMe = (() async => needsPhone())
+        ..lifecycleState = (() => AppLifecycleState.inactive)
+        ..loginWithNewScopes = ((_) async => throw _webAuth(3));
+
+      await tester.pumpWidget(
+        Builder(
+          builder: (c) {
+            context = c;
+            return const SizedBox();
+          },
+        ),
+      );
+      final error = await tester.runAsync(() async {
+        try {
+          await kakao.process(context, action: 'login');
+        } on AuthError catch (e) {
+          return e;
+        }
+        return null;
+      });
+      expect(waits, [SignInKakao.fallbackResumeTimeout]);
+      expect(error?.failureCause, 'KAKAO_SCOPES_WEBAUTH_3');
     });
   });
 }
