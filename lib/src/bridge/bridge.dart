@@ -27,6 +27,7 @@ import 'events/open_external_browser.dart';
 import 'events/open_in_app_browser.dart';
 import 'events/photo_library_access.dart';
 import '../models/token.dart';
+import 'events/haptic_feedback.dart';
 import 'events/push_permission.dart';
 import 'events/push_token.dart';
 import 'events/refresh_token.dart';
@@ -178,6 +179,13 @@ class FlutterWebViewBridgeJavaScriptChannel {
   /// B3 알림 권한 기능(PUSH_PERMISSION_REQUEST / STATUS, OPEN_NOTIFICATION_SETTINGS).
   /// 콜백은 채널을 처음 만들 때만 들어간다. 재 init 은 컨트롤러만 교체한다.
   late final PushPermissionEvents _pushPermissionEvents;
+  final HapticFeedbackEvent _hapticFeedback = HapticFeedbackEvent();
+
+  /// 웹이 기능 지원 여부를 판단할 이름 목록 (PUSH_TOKEN · DEVICE_INFO 응답에 실린다).
+  List<String> get _capabilities => [
+    ..._pushPermissionEvents.capabilities,
+    HapticFeedbackCapability.feedback,
+  ];
   int _webDocumentNavigationGeneration;
   @visibleForTesting
   final AuthProviderOperation? testAuthProviderOperation;
@@ -255,7 +263,7 @@ class FlutterWebViewBridgeJavaScriptChannel {
       onStatus: onPushPermissionStatus,
       onOpenNotificationSettings: onOpenNotificationSettings,
     );
-    WebViewToken.capabilities = _pushPermissionEvents.capabilities;
+    WebViewToken.capabilities = _capabilities;
     validateServiceAuthContextPair(
       serviceCountry: serviceCountry,
       apiBaseUrl: apiBaseUrl,
@@ -3071,8 +3079,7 @@ class FlutterWebViewBridgeJavaScriptChannel {
                 responseData['appsFlyerAnalyticsV1'] =
                     appsFlyerAnalyticsEnabled;
                 responseData['airbridgeAnalyticsV1'] = true;
-                responseData['capabilities'] =
-                    _pushPermissionEvents.capabilities;
+                responseData['capabilities'] = _capabilities;
                 responseData.addAll(authProtocolCapabilityResponse(data));
                 if (negotiateAuthProtocolCapabilities(
                   data,
@@ -3118,6 +3125,10 @@ class FlutterWebViewBridgeJavaScriptChannel {
               // OS 권한 창 응답을 기다리는 동안 다른 메시지(인증 포함)가 막히지 않게
               // 직렬 큐 밖에서 처리하고, 결과는 끝난 뒤 따로 보낸다.
               unawaited(_respondPushPermission(webViewBridgeFeatureType, data));
+              return;
+            case WebViewBridgeFeatureType.hapticFeedback:
+              // web → native 단방향. 응답 없이 울리고, 다른 메시지를 막지 않게 기다리지 않는다.
+              unawaited(_hapticFeedback.process(data));
               return;
             case WebViewBridgeFeatureType.requestAppReview:
               // web → native 단방향. 웹은 응답을 기다리지 않으므로 echo 없이 종료.

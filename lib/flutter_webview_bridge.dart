@@ -4,6 +4,8 @@ export 'src/bridge/auth/service_auth_context.dart'
 export 'src/bridge/bridge_controller.dart';
 export 'src/bridge/events/apps_flyer_analytics.dart';
 export 'src/bridge/events/airbridge_analytics.dart';
+export 'src/bridge/events/haptic_feedback.dart'
+    show HapticFeedbackCapability, HapticStyle;
 export 'src/bridge/events/push_permission.dart'
     show PushPermissionCallback, PushPermissionCapability;
 export 'src/models/token.dart';

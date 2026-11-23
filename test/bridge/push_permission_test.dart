@@ -144,6 +144,7 @@ void main() {
       expect(WebViewToken.capabilities, [
         'pushPermissionStatus',
         'openNotificationSettings',
+        'hapticFeedback',
       ]);
 
       FlutterWebViewBridgeJavaScriptChannel(
@@ -159,6 +160,7 @@ void main() {
         'pushPermissionRequest',
         'pushPermissionStatus',
         'openNotificationSettings',
+        'hapticFeedback',
       ]);
     });
   });
@@ -186,6 +188,7 @@ void main() {
       'pushPermissionRequest',
       'pushPermissionStatus',
       'openNotificationSettings',
+      'hapticFeedback',
     ]);
   });
 

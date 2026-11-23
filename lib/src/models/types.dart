@@ -44,6 +44,7 @@ enum WebViewBridgeFeatureType {
   pushPermissionRequest,
   pushPermissionStatus,
   openNotificationSettings,
+  hapticFeedback,
 }
 
 extension WebViewBridgeFeatureTypeValue on WebViewBridgeFeatureType {
@@ -139,6 +140,8 @@ extension WebViewBridgeFeatureTypeValue on WebViewBridgeFeatureType {
         return 'PUSH_PERMISSION_STATUS';
       case WebViewBridgeFeatureType.openNotificationSettings:
         return 'OPEN_NOTIFICATION_SETTINGS';
+      case WebViewBridgeFeatureType.hapticFeedback:
+        return 'HAPTIC_FEEDBACK';
     }
   }
 }
@@ -236,6 +239,8 @@ extension WebViewBridgeFeatureTypeString on String {
         return WebViewBridgeFeatureType.pushPermissionStatus;
       case 'OPEN_NOTIFICATION_SETTINGS':
         return WebViewBridgeFeatureType.openNotificationSettings;
+      case 'HAPTIC_FEEDBACK':
+        return WebViewBridgeFeatureType.hapticFeedback;
     }
     return null;
   }
