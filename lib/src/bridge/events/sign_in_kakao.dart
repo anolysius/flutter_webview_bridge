@@ -31,8 +31,13 @@ class SignInKakao {
       WidgetsBinding.instance.lifecycleState;
   @visibleForTesting
   Future<void> Function(Duration timeout) waitForResumed = _waitForResumed;
+  @visibleForTesting
+  Future<User> Function() fetchMe = () => UserApi.instance.me();
+  @visibleForTesting
+  Future<OAuthToken> Function(List<String> scopes) loginWithNewScopes =
+      (scopes) => UserApi.instance.loginWithNewScopes(scopes);
 
-  /// 카카오톡 → 카카오계정 fallback 전 앱 활성 대기 상한.
+  /// 시스템 로그인 창(카카오톡 → 카카오계정 fallback, 추가 동의)을 띄우기 전 앱 활성 대기 상한.
   static const fallbackResumeTimeout = Duration(milliseconds: 2000);
 
   /// 이번 로그인의 카카오톡 실패 → 카카오계정 fallback 문맥. 성공한 시도에서도 원격 로그에
@@ -158,7 +163,7 @@ class SignInKakao {
 
         User? user;
         try {
-          user = await UserApi.instance.me();
+          user = await fetchMe();
           debugPrint('[SignInKakao] me() OK first attempt');
         } catch (error) {
           debugPrint(
@@ -168,7 +173,7 @@ class SignInKakao {
           // 1회 retry — SDK token 적용 추가 대기 후
           await Future.delayed(const Duration(milliseconds: 500));
           try {
-            user = await UserApi.instance.me();
+            user = await fetchMe();
             debugPrint('[SignInKakao] me() OK retry');
           } catch (error2) {
             debugPrint('[SignInKakao] me() FAIL retry: ${error2.runtimeType}');
@@ -205,11 +210,15 @@ class SignInKakao {
           // scope 목록을 전달하여 동의항목 추가 동의 요청
           // 지정된 동의항목에 대한 동의 화면을 거쳐 다시 카카오 로그인 수행
           step = KakaoAuthStep.scopes;
+          // 추가 동의 창도 시스템 로그인 창(ASWebAuthenticationSession)이다. 카카오톡에서 막 돌아온
+          // 순간은 앱이 아직 비활성이라 iOS 가 즉시 거부한다(오류 3, 운영 2026-11-16~23 iOS
+          // KAKAO_SCOPES_WEBAUTH_3 3,161건·p50 31ms·대부분 inactive). fallback 과 같이 활성까지 기다린다.
+          if (lifecycleState() != AppLifecycleState.resumed) {
+            await waitForResumed(fallbackResumeTimeout);
+          }
           stepWatch.reset();
           try {
-            OAuthToken token = await UserApi.instance.loginWithNewScopes(
-              consentScopes,
-            );
+            OAuthToken token = await loginWithNewScopes(consentScopes);
             idToken = selectKakaoIdToken(
               current: idToken,
               reissued: token.idToken,
