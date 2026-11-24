@@ -1007,6 +1007,8 @@ class FlutterWebViewBridgeJavaScriptChannel {
     if (attemptId == null) return false;
     final markerKey =
         'sazo_webview_auth_ui_commit_v2:${Uri.encodeComponent(attemptId)}:$revision';
+    // 자동 복구를 시작한 딥링크 첫 화면이면 홈이 아니어도 marker 를 인정한다(인증 화면 제외).
+    final allowDocument = _isAutoRefreshCommitAttemptDocument(data);
     try {
       final result = await webViewController
           .runJavaScriptReturningResult('''
@@ -1018,7 +1020,13 @@ class FlutterWebViewBridgeJavaScriptChannel {
                   ? path.slice(0, -1)
                   : path;
                 var isHome = ['/', '/ko', '/en', '/ja'].includes(normalizedPath);
-                if (!isHome) return false;
+                var stripped =
+                  normalizedPath.replace(/^\\/(ko|ja|en)(?=\\/|\$)/, '') || '/';
+                var isAuthRoute =
+                  stripped === '/auth' || stripped.indexOf('/auth/') === 0;
+                if (!isHome && !(${allowDocument ? 'true' : 'false'} && !isAuthRoute)) {
+                  return false;
+                }
                 var raw = window.localStorage.getItem(${jsonEncode(markerKey)});
                 if (!raw) return false;
                 var marker = JSON.parse(raw);
@@ -1473,6 +1481,37 @@ class FlutterWebViewBridgeJavaScriptChannel {
       _boolFieldOf(data, 'isHomeDocument') ||
       _isHomePath(_stringFieldOf(data, 'pathname')) ||
       _isHomePath(_stringFieldOf(data, 'webPathname'));
+
+  /// 웹이 [autoRefreshDocumentCommitCapability] 를 알린 자동 복구(auto_refresh)에서,
+  /// 자동 복구를 시작한 그 문서가 홈이 아니어도 완료를 인정할 수 있는가.
+  ///
+  /// 콜드 스타트 첫 화면이 푸시·딥링크 목적지일 때 홈으로 되돌리지 않기 위한 것이다.
+  /// 직접 로그인·회원가입·웹 세션 가져오기(`_activeAuthJourney` 가 다름), capability 를 알리지
+  /// 않은 웹, 다른 문서, 인증 화면(`/auth/*`)은 모두 false — 기존 홈 판정만 남는다.
+  bool _isAutoRefreshCommitDocument(dynamic data) {
+    if (!_isAutoRefreshCommitAttemptDocument(data)) return false;
+    final pathname =
+        _stringFieldOf(data, 'pathname') ?? _stringFieldOf(data, 'webPathname');
+    return pathname != null && !_isAuthRoutePath(pathname);
+  }
+
+  /// [_isAutoRefreshCommitDocument] 에서 경로 검사를 뺀 것(같은 자동 복구 시도·같은 문서).
+  /// 경로를 웹에서 직접 읽는 marker 확인이 쓴다.
+  bool _isAutoRefreshCommitAttemptDocument(dynamic data) {
+    if (_activeAuthJourney != 'auto_refresh') return false;
+    if (!_activeAuthCapabilities.contains(
+      autoRefreshDocumentCommitCapability,
+    )) {
+      return false;
+    }
+    final documentId = _stringFieldOf(data, 'documentId');
+    return documentId != null && documentId == _activeDocumentId;
+  }
+
+  bool _isAuthRoutePath(String value) {
+    final path = _authCommitPath(value);
+    return path == '/auth' || path.startsWith('/auth/');
+  }
 
   String _confirmDebugOf(dynamic data) {
     if (data is! Map) return 'legacy-string';
@@ -3357,7 +3396,10 @@ class FlutterWebViewBridgeJavaScriptChannel {
               if (_activeProtocolVersion >= 2) {
                 // v2에서는 token persist가 아니라 visible home의 AUTH_UI_COMMITTED만 terminal success다.
                 _emitAuthTrace('auth.state.persisted', data: data);
-                if (_isHomeDocumentConfirm(data)) {
+                // 자동 복구를 시작한 딥링크 첫 화면의 confirm 도 홈 confirm 과 같다
+                // (웹이 capability 를 알렸을 때만 — [_isAutoRefreshCommitDocument]).
+                if (_isHomeDocumentConfirm(data) ||
+                    _isAutoRefreshCommitDocument(data)) {
                   _authRecoveryGate.confirmHomeTokenBind();
                   _pendingSsoRecovery = false;
                   _pendingConvergenceSoftRecovery = false;
@@ -4056,17 +4098,25 @@ class FlutterWebViewBridgeJavaScriptChannel {
         );
         return;
       }
+      // 자동 복구를 시작한 딥링크 첫 화면: 앱이 보는 화면과 웹 경로가 같을 때만 목적지로 인정한다.
+      final webPathname = _stringFieldOf(data, 'pathname');
+      final autoRefreshDocument =
+          currentUrl != null &&
+          webPathname != null &&
+          _isAutoRefreshCommitDocument(data) &&
+          _authCommitPath(currentUrl) == _authCommitPath(webPathname);
       final decision = validateAuthUiCommit(
         data: data,
         // process generation으로 동일 attempt임을 이미 검증했다. observer home
         // bridge의 local active attempt는 비어 있거나 이전 document 값일 수 있다.
         activeAuthSessionId: workSnapshot.attemptId,
         activeAuthRevision: _activeAuthRevision,
-        nativeIsHome: _matchesAuthCommitDestination(currentUrl, native: true),
-        webIsHome: _matchesAuthCommitDestination(
-          _stringFieldOf(data, 'pathname'),
-          native: false,
-        ),
+        nativeIsHome:
+            autoRefreshDocument ||
+            _matchesAuthCommitDestination(currentUrl, native: true),
+        webIsHome:
+            autoRefreshDocument ||
+            _matchesAuthCommitDestination(webPathname, native: false),
       );
       if (!decision.isAccepted) {
         _emitAuthTrace(
