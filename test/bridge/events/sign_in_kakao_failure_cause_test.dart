@@ -421,6 +421,35 @@ void main() {
       });
       expect(waits, [SignInKakao.fallbackResumeTimeout]);
       expect(error?.failureCause, 'KAKAO_SCOPES_WEBAUTH_3');
+      // 대기 효과를 운영에서 가르도록 대기 전 상태·대기 시간을 남긴다.
+      expect(error?.failureContext['scopesLifecycleBefore'], 'inactive');
+      expect(error?.failureContext['scopesWaitMs'], isA<int>());
+    });
+
+    testWidgets('추가 동의 성공 문맥에도 대기 전 상태·대기 시간을 싣는다', (tester) async {
+      var state = AppLifecycleState.inactive;
+      kakao
+        ..talkInstalled = (() async => true)
+        ..loginWithTalk = (() async => token(idToken: 'talk'))
+        ..fetchMe = (() async => needsPhone())
+        ..lifecycleState = (() => state)
+        ..waitForResumed = ((timeout) async {
+          state = AppLifecycleState.resumed;
+        })
+        ..loginWithNewScopes = ((_) async => token(idToken: 'reissued'));
+
+      await tester.pumpWidget(
+        Builder(
+          builder: (c) {
+            context = c;
+            return const SizedBox();
+          },
+        ),
+      );
+      await tester.runAsync(() => kakao.process(context, action: 'login'));
+      final success = kakao.takeFallbackContext();
+      expect(success['scopesLifecycleBefore'], 'inactive');
+      expect(success['scopesWaitMs'], isA<int>());
     });
   });
 }

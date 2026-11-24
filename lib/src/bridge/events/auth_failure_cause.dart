@@ -293,10 +293,12 @@ const authFailureTraceStringKeys = [
   'iosSceneActivationState',
   'osVersion',
   'deviceModel',
+  'scopesLifecycleBefore',
 ];
 const authFailureTraceIntKeys = [
   'stepElapsedMs',
   'fallbackFromElapsedMs',
   'fallbackWaitMs',
+  'scopesWaitMs',
 ];
 const authFailureTraceBoolKeys = ['kakaoTalkInstalled', 'iosKeyWindowPresent'];

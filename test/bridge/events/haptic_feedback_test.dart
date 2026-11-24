@@ -46,6 +46,15 @@ void main() {
     expect(performed, [HapticStyle.light, HapticStyle.medium]);
   });
 
+  test('기기 시계가 뒤로 가도 이후 요청을 버리지 않는다', () async {
+    await event.process({'style': 'light'});
+    clock = clock.subtract(const Duration(hours: 1));
+    await event.process({'style': 'heavy'});
+    tick(const Duration(milliseconds: 10));
+    await event.process({'style': 'medium'});
+    expect(performed, [HapticStyle.light, HapticStyle.heavy]);
+  });
+
   test('모르는 style 은 간격 계산에 들어가지 않는다', () async {
     await event.process({'style': 'nope'});
     await event.process({'style': 'light'});
