@@ -50,7 +50,11 @@ class HapticFeedbackEvent {
     }
     final now = _now();
     final last = _lastAt;
-    if (last != null && now.difference(last) < minInterval) return;
+    // 시계가 뒤로 가면(수동 변경·NTP 보정) 차이가 음수라 계속 억제된다 — 음수는 억제하지 않는다.
+    if (last != null) {
+      final gap = now.difference(last);
+      if (!gap.isNegative && gap < minInterval) return;
+    }
     _lastAt = now;
     try {
       await _perform(style);

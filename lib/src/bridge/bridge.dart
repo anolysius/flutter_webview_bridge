@@ -1486,7 +1486,9 @@ class FlutterWebViewBridgeJavaScriptChannel {
       _isHomePath(_stringFieldOf(data, 'webPathname'));
 
   /// 웹이 [autoRefreshDocumentCommitCapability] 를 알린 자동 복구(auto_refresh)에서,
-  /// 자동 복구를 시작한 그 문서가 홈이 아니어도 완료를 인정할 수 있는가.
+  /// 이 시도의 토큰을 마지막으로 읽은 문서(`_activeDocumentId`, REFRESH_TOKEN_READ 마다 갱신)가
+  /// 홈이 아니어도 완료를 인정할 수 있는가. 콜드 스타트면 첫 문서이고, 같은 시도를 다른 문서가
+  /// 다시 읽으면(전체 로드·세션 replay) 그 문서다. 웹도 그 문서의 부트스트랩 READ 를 기록해 판정한다.
   ///
   /// 콜드 스타트 첫 화면이 푸시·딥링크 목적지일 때 홈으로 되돌리지 않기 위한 것이다.
   /// 직접 로그인·회원가입·웹 세션 가져오기(`_activeAuthJourney` 가 다름), capability 를 알리지
@@ -1498,7 +1500,7 @@ class FlutterWebViewBridgeJavaScriptChannel {
     return pathname != null && !_isAuthRoutePath(pathname);
   }
 
-  /// [_isAutoRefreshCommitDocument] 에서 경로 검사를 뺀 것(같은 자동 복구 시도·같은 문서).
+  /// [_isAutoRefreshCommitDocument] 에서 경로 검사를 뺀 것(같은 자동 복구 시도·토큰을 읽은 문서).
   /// 경로를 웹에서 직접 읽는 marker 확인이 쓴다.
   bool _isAutoRefreshCommitAttemptDocument(dynamic data) {
     if (_activeAuthJourney != 'auto_refresh') return false;
@@ -2163,6 +2165,13 @@ class FlutterWebViewBridgeJavaScriptChannel {
   }
 
   Future<void> _runConvergenceSoftRecovery() async {
+    // 이미 끝난 시도(성공·실패)에는 홈 복구를 하지 않는다. soft deadline 직후 앱이 잠깐
+    // 비활성이라 보류(_pendingConvergenceSoftRecovery)된 사이 AUTH_UI_COMMITTED 로 성공하면,
+    // 복귀 때 보류분이 목적지를 홈으로 덮어쓰기 때문이다. soft deadline 은 v3 수렴 추적에만 있다.
+    if (!_authAttemptPhase.shouldRunTerminalDeadline) {
+      _pendingConvergenceSoftRecovery = false;
+      return;
+    }
     if (!_canRunLifecycleSensitiveWebViewWork) {
       _pendingConvergenceSoftRecovery = !_isDisposed && context.mounted;
       return;
@@ -4145,6 +4154,7 @@ class FlutterWebViewBridgeJavaScriptChannel {
       // 여기부터는 사용자가 보는 UI 성공이 검증됐다. SharedPreferences 조회/쓰기 중
       // watchdog이 끼어들어 같은 시도를 timeout으로 먼저 종결하지 못하게 즉시 정지한다.
       _settleAuthTerminalTracking();
+      _pendingConvergenceSoftRecovery = false;
       cancelSsoWatchdog('authUiCommitted:validated');
 
       final hasCompletedTerminal = await _hasCompletedAuthTerminal(data);

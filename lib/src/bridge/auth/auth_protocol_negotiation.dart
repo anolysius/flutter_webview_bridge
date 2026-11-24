@@ -5,7 +5,7 @@ const String webSessionImportCapability = 'webSessionImport';
 
 /// 콜드 스타트 자동 복구(auto_refresh)를 홈이 아닌 첫 화면(푸시·딥링크)에서도 끝낼 수 있다.
 ///
-/// 웹이 이 값을 알리면, 자동 복구를 시작한 그 문서(같은 `documentId`, 인증 화면 제외)에서 온
+/// 웹이 이 값을 알리면, 자동 복구 토큰을 읽은 그 문서(같은 `documentId`, 인증 화면 제외)에서 온
 /// 확인(`REFRESH_TOKEN_WRITE`)과 최종 완료(`AUTH_UI_COMMITTED`)를 홈에서 온 것과 같이 받는다.
 /// 알리지 않은 웹에는 지금처럼 홈만 인정한다. 직접 로그인·회원가입·웹 세션 가져오기는 해당 없음.
 const String autoRefreshDocumentCommitCapability = 'autoRefreshDocumentCommit';

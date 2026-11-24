@@ -93,6 +93,8 @@ class SignInKakao {
       String? fallbackFromDetail;
       int? fallbackFromElapsedMs;
       int? fallbackWaitMs;
+      int? scopesWaitMs;
+      String? scopesLifecycleBefore;
       bool? kakaoTalkInstalled;
       _fallbackContext = const {};
 
@@ -213,9 +215,19 @@ class SignInKakao {
           // 추가 동의 창도 시스템 로그인 창(ASWebAuthenticationSession)이다. 카카오톡에서 막 돌아온
           // 순간은 앱이 아직 비활성이라 iOS 가 즉시 거부한다(오류 3, 운영 2026-11-16~23 iOS
           // KAKAO_SCOPES_WEBAUTH_3 3,161건·p50 31ms·대부분 inactive). fallback 과 같이 활성까지 기다린다.
-          if (lifecycleState() != AppLifecycleState.resumed) {
+          // 대기 효과를 운영에서 가르도록(KPI: KAKAO_SCOPES_WEBAUTH_3) 대기 전 상태·대기 시간을 남긴다.
+          final lifecycleBefore = lifecycleState();
+          scopesLifecycleBefore = lifecycleBefore?.name ?? 'unknown';
+          final waitWatch = Stopwatch()..start();
+          if (lifecycleBefore != AppLifecycleState.resumed) {
             await waitForResumed(fallbackResumeTimeout);
           }
+          scopesWaitMs = waitWatch.elapsedMilliseconds;
+          _fallbackContext = {
+            ..._fallbackContext,
+            'scopesWaitMs': scopesWaitMs,
+            'scopesLifecycleBefore': scopesLifecycleBefore,
+          };
           stepWatch.reset();
           try {
             OAuthToken token = await loginWithNewScopes(consentScopes);
@@ -260,6 +272,8 @@ class SignInKakao {
             'fallbackFromDetail': ?fallbackFromDetail,
             'fallbackFromElapsedMs': ?fallbackFromElapsedMs,
             'fallbackWaitMs': ?fallbackWaitMs,
+            'scopesWaitMs': ?scopesWaitMs,
+            'scopesLifecycleBefore': ?scopesLifecycleBefore,
             'providerErrorDetail': ?kakaoErrorDetail(e),
           },
         );
