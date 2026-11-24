@@ -3110,6 +3110,13 @@ class FlutterWebViewBridgeJavaScriptChannel {
               sendData = await AppStateChangeEvent().process(context);
               break;
             case WebViewBridgeFeatureType.pushToken:
+              // 권한 창이 떠 있는 동안의 요청(창이 닫히며 생긴 resume·visibility)은 결과가 캐시에
+              // 반영된 뒤 답한다. 큐에서 기다리면 인증 메시지까지 막히므로 따로 보낸다.
+              final permissionSettled = _pushPermissionEvents.requestSettled;
+              if (permissionSettled != null) {
+                _replyPushTokenAfter(permissionSettled);
+                return;
+              }
               sendData = await PushTokenEvent().process(context);
               break;
             case WebViewBridgeFeatureType.clearBadge:
@@ -4913,6 +4920,27 @@ class FlutterWebViewBridgeJavaScriptChannel {
 
   Future<void> runJavaScriptPostMessage(String jsonData) async {
     await _runJavaScriptPostMessageWithReceipt(jsonData);
+  }
+
+  bool _pushTokenReplyDeferred = false;
+
+  /// 권한 요청이 끝난 뒤 PUSH_TOKEN 캐시로 한 번 답한다(그동안 온 요청은 하나로 합친다).
+  void _replyPushTokenAfter(Future<void> settled) {
+    if (_pushTokenReplyDeferred) return;
+    _pushTokenReplyDeferred = true;
+    unawaited(
+      settled.whenComplete(() async {
+        _pushTokenReplyDeferred = false;
+        if (_isDisposed || !context.mounted) return;
+        try {
+          final sendData = await PushTokenEvent().process(context);
+          if (_isDisposed) return;
+          await _runJavaScriptPostMessageWithReceipt(jsonEncode(sendData));
+        } catch (error) {
+          debugPrint('[Bridge] deferred PUSH_TOKEN failed: $error');
+        }
+      }),
+    );
   }
 
   Future<void> _respondPushPermission(
