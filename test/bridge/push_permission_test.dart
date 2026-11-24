@@ -221,6 +221,10 @@ void main() {
       expect(received, {'requestId': 'r1'});
       final response = platform.posted.single;
       expect(response['type'], 'PUSH_PERMISSION_REQUEST');
+      expect(
+        (response['data'] as Map).remove('pushStateRevision'),
+        WebViewToken.revision,
+      );
       expect(response['data'], {
         'result': 'granted',
         'promptShown': true,
@@ -355,6 +359,143 @@ void main() {
     });
   });
 
+  group('권한 요청 결과와 PUSH_TOKEN 캐시를 맞춘다', () {
+    FlutterWebViewBridgeJavaScriptChannel channelWith(
+      BuildContext context,
+      _FakePlatformWebViewController platform,
+      PushPermissionCallback onRequest, {
+      Future<void> Function()? onClearBadge,
+    }) => FlutterWebViewBridgeJavaScriptChannel(
+      context: context,
+      webViewController: WebViewController.fromPlatform(platform),
+      googleServerClientId: null,
+      kakaoNativeAppKey: null,
+      onPushPermissionRequest: onRequest,
+      onClearBadge: onClearBadge,
+    );
+
+    void seedSettingsOff() => WebViewToken.update(
+      token: null,
+      permission: 'denied',
+      permissionGranted: false,
+      canRequestPermission: true,
+    );
+
+    testWidgets('결과를 캐시에 먼저 반영해, 이후 PUSH_TOKEN 요청도 결과와 같은 값으로 답한다', (
+      tester,
+    ) async {
+      seedSettingsOff();
+      final context = await _mountedContext(tester);
+      final platform = _FakePlatformWebViewController();
+      final channel = channelWith(
+        context,
+        platform,
+        (_) async => {
+          'result': 'denied',
+          'promptShown': true,
+          'permissionStatus': 'denied',
+          'canRequestPermission': false,
+        },
+      );
+
+      await channel.onMessageReceived(
+        _message('PUSH_PERMISSION_REQUEST', {'requestId': 'r'}),
+      );
+      await tester.pump();
+      // 앱의 새 상태가 오기 전에 웹이 resume 으로 PUSH_TOKEN 을 요청한다.
+      await channel.onMessageReceived(_message('PUSH_TOKEN', null));
+      await tester.pump();
+
+      final response = platform.posted.firstWhere(
+        (m) => m['type'] == 'PUSH_PERMISSION_REQUEST',
+      );
+      final token = platform.posted.lastWhere((m) => m['type'] == 'PUSH_TOKEN');
+      expect(response['data']['canRequestPermission'], isFalse);
+      expect(token['data']['canRequestPermission'], isFalse);
+      expect(token['data']['permissionStatus'], 'denied');
+      expect(
+        token['data']['pushStateRevision'],
+        response['data']['pushStateRevision'],
+      );
+    });
+
+    testWidgets('창이 떠 있는 동안 온 PUSH_TOKEN 요청은 결과 반영 뒤 한 번 답하고 다른 메시지는 막지 않는다', (
+      tester,
+    ) async {
+      seedSettingsOff();
+      final context = await _mountedContext(tester);
+      final platform = _FakePlatformWebViewController();
+      final release = Completer<Map<String, Object?>>();
+      var badgeCleared = false;
+      final channel = channelWith(
+        context,
+        platform,
+        (_) => release.future,
+        onClearBadge: () async => badgeCleared = true,
+      );
+
+      await channel.onMessageReceived(
+        _message('PUSH_PERMISSION_REQUEST', {'requestId': 'r'}),
+      );
+      await channel.onMessageReceived(_message('PUSH_TOKEN', null));
+      await channel.onMessageReceived(_message('PUSH_TOKEN', null));
+      await channel.onMessageReceived(_message('CLEAR_BADGE', null));
+      expect(badgeCleared, isTrue);
+      expect(platform.posted, isEmpty, reason: '요청 전 값으로 답하지 않는다');
+
+      release.complete({
+        'result': 'denied',
+        'promptShown': true,
+        'permissionStatus': 'denied',
+        'canRequestPermission': false,
+      });
+      await tester.pump();
+      await tester.pump();
+
+      final tokens = platform.posted.where((m) => m['type'] == 'PUSH_TOKEN');
+      expect(tokens, hasLength(1));
+      expect(tokens.single['data']['canRequestPermission'], isFalse);
+    });
+
+    testWidgets('허용이면 허용으로 반영하고, busy·unavailable 은 캐시를 바꾸지 않는다', (
+      tester,
+    ) async {
+      seedSettingsOff();
+      final context = await _mountedContext(tester);
+      final platform = _FakePlatformWebViewController();
+      var next = <String, Object?>{
+        'result': 'unavailable',
+        'promptShown': false,
+      };
+      final channel = channelWith(context, platform, (_) async => next);
+
+      await channel.onMessageReceived(_message('PUSH_PERMISSION_REQUEST', {}));
+      await tester.pump();
+      expect(WebViewToken.canRequestPermission, isTrue);
+      expect(WebViewToken.permissionStatus, 'denied');
+
+      next = {
+        'result': 'granted',
+        'promptShown': true,
+        'permissionStatus': 'authorized',
+        'canRequestPermission': false,
+      };
+      await channel.onMessageReceived(_message('PUSH_PERMISSION_REQUEST', {}));
+      await tester.pump();
+      expect(WebViewToken.permissionStatus, 'authorized');
+      expect(WebViewToken.isNotificationPermissionGranted, isTrue);
+      expect(WebViewToken.canRequestPermission, isFalse);
+      expect(WebViewToken.tokenStatus, 'pending', reason: '토큰은 앱 수집이 채운다');
+    });
+
+    test('PUSH_TOKEN payload 에 상태 순번을 싣는다', () {
+      final before = WebViewToken.revision;
+      WebViewToken.update(token: 't', permission: 'authorized');
+      final data = WebViewToken.payload(platform: 'ios', isRefresh: false);
+      expect(data['pushStateRevision'], before + 1);
+    });
+  });
+
   group('PUSH_PERMISSION_STATUS', () {
     testWidgets('앱 콜백이 없으면 캐시 상태와 capabilities 를 돌려준다', (tester) async {
       final context = await _mountedContext(tester);
@@ -377,7 +518,9 @@ void main() {
       );
       await tester.pump();
 
-      expect(platform.posted.single['data'], {
+      final data = platform.posted.single['data'] as Map;
+      expect(data.remove('pushStateRevision'), WebViewToken.revision);
+      expect(data, {
         'permissionStatus': 'denied',
         'canRequestPermission': true,
         'capabilities': ['pushPermissionStatus', 'openNotificationSettings'],

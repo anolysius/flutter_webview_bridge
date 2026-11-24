@@ -48,6 +48,12 @@ class PushPermissionEvents {
   static const requestTimeout = Duration(seconds: 60);
 
   bool _requestInFlight = false;
+  Completer<void>? _requestSettled;
+
+  /// 권한 요청이 진행 중이면 끝날 때(결과가 캐시에 반영된 뒤) 완료되는 Future, 아니면 null.
+  /// 브릿지는 그동안 온 PUSH_TOKEN 요청을 큐에서 기다리지 않고 이 뒤에 답한다.
+  Future<void>? get requestSettled =>
+      _requestInFlight ? _requestSettled?.future : null;
 
   List<String> get capabilities =>
       PushPermissionCapability.of(canRequest: onRequest != null);
@@ -76,7 +82,13 @@ class PushPermissionEvents {
     final requestId = requestIdOf(data);
     return {
       'type': type.value,
-      'data': {...body, if (requestId != null) 'requestId': requestId},
+      'data': {
+        ...body,
+        // 권한 상태를 실은 응답에만 상태 순번을 붙인다(busy·unavailable·설정 열기는 그대로).
+        if (body['permissionStatus'] is String)
+          'pushStateRevision': WebViewToken.revision,
+        if (requestId != null) 'requestId': requestId,
+      },
     };
   }
 
@@ -93,8 +105,11 @@ class PushPermissionEvents {
     if (callback == null) return _unavailable();
     if (_requestInFlight) return {'result': 'busy', 'promptShown': false};
     _requestInFlight = true;
+    final settled = _requestSettled = Completer<void>();
     try {
-      return await callback(data).timeout(requestTimeout);
+      final body = await callback(data).timeout(requestTimeout);
+      _applyToCache(body);
+      return body;
     } on TimeoutException {
       return _unavailable();
     } catch (error) {
@@ -102,6 +117,7 @@ class PushPermissionEvents {
       return _unavailable();
     } finally {
       _requestInFlight = false;
+      if (!settled.isCompleted) settled.complete();
     }
   }
 
@@ -128,6 +144,17 @@ class PushPermissionEvents {
       debugPrint('[PushPermission] open settings failed: $error');
       return {'opened': 'failed'};
     }
+  }
+
+  /// 결과에 권한 상태가 있을 때만 캐시에 반영한다(busy·unavailable 은 상태가 없어 그대로 둔다).
+  static void _applyToCache(Map<String, Object?> body) {
+    final permission = body['permissionStatus'];
+    if (permission is! String) return;
+    final canRequest = body['canRequestPermission'];
+    WebViewToken.applyPermissionOutcome(
+      permission: permission,
+      canRequestPermission: canRequest is bool ? canRequest : null,
+    );
   }
 
   static Map<String, Object?> _cachedStatus() => {

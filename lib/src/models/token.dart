@@ -51,6 +51,28 @@ class WebViewToken {
     revision++;
   }
 
+  /// 웹 권한 요청(PUSH_PERMISSION_REQUEST) 결과를 캐시에 바로 반영한다.
+  ///
+  /// 앱의 새 상태는 수집을 마친 뒤(수~수십 ms 뒤) 온다. 그 사이 웹이 resume·visibility 로
+  /// PUSH_TOKEN 을 요청하면 캐시가 요청 전 값(예: canRequestPermission=true)으로 답해, 응답과 다른
+  /// 상태가 웹에 갔다(QA 실기기 2026-11-23). 결과를 먼저 반영해 응답과 이후 캐시 응답을 맞춘다.
+  /// 거부면 토큰을 비우고, 허용이면 기존 토큰을 유지한다(새 토큰은 앱 수집이 채운다).
+  static void applyPermissionOutcome({
+    required String permission,
+    bool? canRequestPermission,
+  }) {
+    final granted = permission == 'authorized' || permission == 'provisional';
+    update(
+      token: _fcmToken,
+      permissionGranted: granted
+          ? true
+          : (permission == 'denied' ? false : null),
+      permission: permission,
+      status: granted && _fcmToken != null ? 'ready' : null,
+      canRequestPermission: canRequestPermission,
+    );
+  }
+
   static Map<String, Object?> payload({
     required String platform,
     required bool isRefresh,
@@ -68,6 +90,8 @@ class WebViewToken {
     if (canRequestPermission != null)
       'canRequestPermission': canRequestPermission,
     'capabilities': capabilities,
+    // 상태 순번. 웹은 이미 받은 것보다 작은 순번의 상태를 버릴 수 있다(옛 웹은 무시).
+    'pushStateRevision': revision,
   };
 
   /// Clears every cached value (tests only — the app never needs to forget the device).
