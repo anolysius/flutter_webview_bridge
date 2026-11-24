@@ -254,7 +254,11 @@ class FlutterWebViewBridgeJavaScriptChannel {
     this.testDeviceInfoOperation,
     this.testSsoExchangeFactory,
     this.testDeviceHeaders,
-  }) : _webDocumentNavigationGeneration = webDocumentNavigationGeneration,
+    @visibleForTesting
+    AuthConvergenceDeadlineController? testAuthConvergenceDeadline,
+  }) : _authConvergenceDeadline =
+           testAuthConvergenceDeadline ?? AuthConvergenceDeadlineController(),
+       _webDocumentNavigationGeneration = webDocumentNavigationGeneration,
        _apiBaseUrl = apiBaseUrl,
        _webOrigin = _canonicalHttpOrigin(webOrigin),
        _serviceCountry = normalizeServiceCountry(serviceCountry) {
@@ -628,8 +632,7 @@ class FlutterWebViewBridgeJavaScriptChannel {
   Timer? _attemptTerminalTimer;
   final AuthAttemptPhaseController _authAttemptPhase =
       AuthAttemptPhaseController();
-  final AuthConvergenceDeadlineController _authConvergenceDeadline =
-      AuthConvergenceDeadlineController();
+  final AuthConvergenceDeadlineController _authConvergenceDeadline;
   bool get _awaitingAuthTerminal => _authAttemptPhase.isAwaitingTerminal;
   Completer<void>? _activeAuthAbortCompleter;
   // B2 watchdog 여부 — timeout 시 raw 재전송(B1) 대신 reload→세션 replay(B2) 로 복구.
@@ -3396,10 +3399,7 @@ class FlutterWebViewBridgeJavaScriptChannel {
               if (_activeProtocolVersion >= 2) {
                 // v2에서는 token persist가 아니라 visible home의 AUTH_UI_COMMITTED만 terminal success다.
                 _emitAuthTrace('auth.state.persisted', data: data);
-                // 자동 복구를 시작한 딥링크 첫 화면의 confirm 도 홈 confirm 과 같다
-                // (웹이 capability 를 알렸을 때만 — [_isAutoRefreshCommitDocument]).
-                if (_isHomeDocumentConfirm(data) ||
-                    _isAutoRefreshCommitDocument(data)) {
+                if (_isHomeDocumentConfirm(data)) {
                   _authRecoveryGate.confirmHomeTokenBind();
                   _pendingSsoRecovery = false;
                   _pendingConvergenceSoftRecovery = false;
@@ -3410,6 +3410,20 @@ class FlutterWebViewBridgeJavaScriptChannel {
                   print(
                     '[Watchdog] home confirm accepted; '
                     'wait AUTH_UI_COMMITTED ${_confirmDebugOf(data)}',
+                  );
+                } else if (_isAutoRefreshCommitDocument(data)) {
+                  // 자동 복구를 시작한 딥링크 첫 화면의 confirm (웹이 capability 를 알렸을 때만).
+                  // 8초 watchdog 만 끄고 홈 바인딩 확인으로는 표시하지 않는다 — 웹이 이 화면에서
+                  // AUTH_UI_COMMITTED 를 못 보내면 soft deadline(15초)이 기존 홈 복구를 그대로 실행해
+                  // hard deadline(AUTH_TERMINAL_TIMEOUT)까지 가지 않는다.
+                  _pendingSsoRecovery = false;
+                  if (_ssoWatchdogB2) {
+                    cancelSsoWatchdog('refreshTokenWrite:document');
+                  }
+                  // ignore: avoid_print
+                  print(
+                    '[Watchdog] document confirm accepted; wait AUTH_UI_COMMITTED '
+                    '(soft deadline → home recovery) ${_confirmDebugOf(data)}',
                   );
                 } else if (_ssoWatchdogB2 &&
                     (_ssoWatchdog?.isActive ?? false)) {

@@ -5,6 +5,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:flutter_webview_bridge/flutter_webview_bridge.dart';
 import 'package:flutter_webview_bridge/src/auth/sso_exchange.dart';
+import 'package:flutter_webview_bridge/src/bridge/auth/auth_convergence_deadline.dart';
 import 'package:flutter_webview_bridge/src/bridge/auth/auth_protocol_negotiation.dart';
 import 'package:flutter_webview_bridge/src/bridge/auth/auth_terminal_store.dart';
 import 'package:flutter_webview_bridge/src/bridge/auth/pending_auth_attempt_store.dart';
@@ -23,13 +24,24 @@ class _WebView extends PlatformWebViewController {
   _WebView()
     : super.implementation(const PlatformWebViewControllerCreationParams());
   final messages = <Map<String, dynamic>>[];
+  final loads = <Uri>[];
   String url = 'https://qa2.m.sazo.shop/ja';
+
+  /// 웹이 UI 완료 marker 를 남겼는가 (hard deadline 확인용). 기본은 없음.
+  bool uiMarker = false;
 
   @override
   Future<String?> currentUrl() async => url;
 
   @override
+  Future<void> loadRequest(LoadRequestParams params) async {
+    loads.add(params.uri);
+    url = params.uri.toString();
+  }
+
+  @override
   Future<Object> runJavaScriptReturningResult(String script) async {
+    if (script.contains('sazo_webview_auth_ui_commit_v2')) return uiMarker;
     final encoded = RegExp(r'var payload = (.*);').firstMatch(script)?.group(1);
     if (encoded != null) {
       messages.add(
@@ -74,6 +86,7 @@ class _Harness {
   static Future<_Harness> create(
     WidgetTester tester, {
     http.Client? refreshClient,
+    AuthConvergenceDeadlineController? deadline,
   }) async {
     late BuildContext context;
     await tester.pumpWidget(
@@ -109,6 +122,7 @@ class _Harness {
           'type': 'DEVICE_INFO',
           'data': <String, Object?>{},
         },
+        testAuthConvergenceDeadline: deadline,
       ),
     ))!;
     addTearDown(channel.dispose);
@@ -151,6 +165,10 @@ class _Harness {
 
   bool get confirmAccepted =>
       prints.any((p) => p.contains('home confirm accepted'));
+  bool get documentConfirmAccepted =>
+      prints.any((p) => p.contains('document confirm accepted'));
+  bool get authErrorSent => web.messages.any((m) => m['type'] == 'AUTH_ERROR');
+  bool get homeLoaded => web.loads.any((u) => u.path == '/');
   bool get confirmKept =>
       prints.any((p) => p.contains('keep B2 watchdog — non-home confirm'));
 }
@@ -205,9 +223,14 @@ Future<_Harness> _coldStartAutoRefresh(
   WidgetTester tester, {
   required String url,
   required bool documentCommit,
+  AuthConvergenceDeadlineController? deadline,
 }) async {
   await _seedLoggedIn(tester);
-  final h = await _Harness.create(tester, refreshClient: _refreshClient());
+  final h = await _Harness.create(
+    tester,
+    refreshClient: _refreshClient(),
+    deadline: deadline,
+  );
   h.web.url = url;
   await h.send('REFRESH_TOKEN_READ', {
     ..._offer(documentCommit: documentCommit),
@@ -337,7 +360,8 @@ void main() {
         'REFRESH_TOKEN_WRITE',
         _confirm(h, pathname: '/ja/account/orders'),
       );
-      expect(h.confirmAccepted, isTrue);
+      expect(h.documentConfirmAccepted, isTrue);
+      expect(h.confirmAccepted, isFalse);
       expect(h.confirmKept, isFalse);
       expect(h.prints.any((p) => p.contains('load home')), isFalse);
 
@@ -360,6 +384,88 @@ void main() {
       await h.send('AUTH_UI_COMMITTED', _uiCommit(h, pathname: '/ja'));
       expect(await tester.runAsync(() => _terminalSucceeded(h)), isTrue);
       await h.dispose();
+    });
+
+    group('안전장치: 첫 화면 확인 뒤 완료가 안 와도 로그인을 끊지 않는다', () {
+      // soft 0.3초 / hard 1.5초로 줄인다 (운영 15초 / 60초).
+      AuthConvergenceDeadlineController shortDeadline() =>
+          AuthConvergenceDeadlineController(
+            softDeadline: const Duration(milliseconds: 300),
+            hardDeadline: const Duration(milliseconds: 1500),
+          );
+
+      testWidgets('완료가 없으면 soft deadline 에 기존 홈 복구를 하고 AUTH_ERROR 를 보내지 않는다', (
+        tester,
+      ) async {
+        final h = await _coldStartAutoRefresh(
+          tester,
+          url: orders,
+          documentCommit: true,
+          deadline: shortDeadline(),
+        );
+        await h.send(
+          'REFRESH_TOKEN_WRITE',
+          _confirm(h, pathname: '/ja/account/orders'),
+        );
+        expect(h.documentConfirmAccepted, isTrue);
+        await tester.runAsync(
+          () => Future<void>.delayed(const Duration(milliseconds: 700)),
+        );
+        expect(h.homeLoaded, isTrue, reason: 'soft deadline 홈 복구');
+        expect(h.authErrorSent, isFalse);
+        expect(await tester.runAsync(() => _terminalSucceeded(h)), isFalse);
+        await h.dispose();
+      });
+
+      testWidgets('완료가 오면 홈 복구도 AUTH_ERROR 도 없다 (hard deadline 지나도)', (
+        tester,
+      ) async {
+        final h = await _coldStartAutoRefresh(
+          tester,
+          url: orders,
+          documentCommit: true,
+          deadline: shortDeadline(),
+        );
+        await h.send(
+          'REFRESH_TOKEN_WRITE',
+          _confirm(h, pathname: '/ja/account/orders'),
+        );
+        await h.send(
+          'AUTH_UI_COMMITTED',
+          _uiCommit(h, pathname: '/ja/account/orders'),
+        );
+        expect(await tester.runAsync(() => _terminalSucceeded(h)), isTrue);
+        await tester.runAsync(
+          () => Future<void>.delayed(const Duration(milliseconds: 2000)),
+        );
+        expect(h.homeLoaded, isFalse);
+        expect(h.authErrorSent, isFalse);
+        expect(h.web.url, orders);
+        await h.dispose();
+      });
+
+      testWidgets('홈 첫 화면 확인 뒤 완료가 없으면 지금처럼 홈 복구를 건너뛴다 (기존 동작)', (
+        tester,
+      ) async {
+        final h = await _coldStartAutoRefresh(
+          tester,
+          url: 'https://qa2.m.sazo.shop/ja',
+          documentCommit: true,
+          deadline: shortDeadline(),
+        );
+        await h.send('REFRESH_TOKEN_WRITE', _confirm(h, pathname: '/ja'));
+        expect(h.confirmAccepted, isTrue);
+        await tester.runAsync(
+          () => Future<void>.delayed(const Duration(milliseconds: 700)),
+        );
+        expect(h.homeLoaded, isFalse);
+        expect(
+          h.prints.any((p) => p.contains('load home')),
+          isFalse,
+          reason: '홈 확인 뒤에는 기존처럼 awaiting_ui_commit 으로 복구를 건너뛴다',
+        );
+        await h.dispose();
+      });
     });
 
     testWidgets('다른 문서에서 온 확인·완료는 받지 않는다', (tester) async {
